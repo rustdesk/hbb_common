@@ -1,4 +1,5 @@
 use crate::{
+    config::keys::OPTION_RELAY_SERVER,
     config::{use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT},
     protobuf::Message,
     socket_client::split_host_port,
@@ -214,7 +215,7 @@ pub fn check_ws(endpoint: &str) -> String {
     };
 
     let custom_rendezvous_server = Config::get_rendezvous_server();
-    let relay_server = Config::get_option("relay-server");
+    let relay_server = Config::get_option(OPTION_RELAY_SERVER);
     let rendezvous_port = split_host_port(&custom_rendezvous_server)
         .map(|(_, p)| p)
         .unwrap_or(RENDEZVOUS_PORT);
