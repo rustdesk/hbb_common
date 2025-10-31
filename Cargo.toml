@@ -48,30 +48,24 @@ url = "2.5"
 sha2 = "0.10"
 whoami = "1.5"
 
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-mac_address = "1.1"
-default_net = { git = "https://github.com/rustdesk-org/default_net" }
-machine-uid = { git = "https://github.com/rustdesk-org/machine-uid" }
-
-[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 tokio-rustls = { version = "0.26", features = [
     "logging",
     "tls12",
     "ring",
 ], default-features = false }
+tokio-native-tls = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["native-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.26", features = ["native-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+rustls-platform-verifier = "0.6"
 rustls-pki-types = "1.11"
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
 rustls-native-certs = "0.8"
 webpki-roots = "1.0"
+async-recursion = "1.1"
 
-[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-rustls-platform-verifier = "0.6"
-
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-tokio-native-tls = "0.3"
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
-tungstenite = { version = "0.26", features = ["native-tls"] }
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+mac_address = "1.1"
+default_net = { git = "https://github.com/rustdesk-org/default_net" }
+machine-uid = { git = "https://github.com/rustdesk-org/machine-uid" }
 
 [build-dependencies]
 protobuf-codegen = { version = "3.7" }

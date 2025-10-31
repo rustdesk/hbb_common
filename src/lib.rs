@@ -63,8 +63,9 @@ pub mod websocket;
 pub use rustls_platform_verifier;
 pub use stream::Stream;
 pub use whoami;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub mod tls;
 pub mod verifier;
+pub use async_recursion;
 
 pub type SessionID = uuid::Uuid;
 
