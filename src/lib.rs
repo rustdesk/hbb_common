@@ -59,6 +59,8 @@ pub mod fingerprint;
 pub use flexi_logger;
 pub mod stream;
 pub mod websocket;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub use rustls_platform_verifier;
 pub use stream::Stream;
