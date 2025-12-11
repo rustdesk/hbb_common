@@ -30,7 +30,27 @@ message PunchHoleRequest {
   bytes socket_addr_v6 = 10;
 }
 
-message PunchHole { 
+message ControllingStrategy {
+  enum Switch {
+    NONE = 0;
+    DISABLE = 1;
+  }
+
+  Switch keyboard = 1;
+  Switch remote_printer = 2;
+  Switch clipboard = 3;
+  Switch file = 4;
+  Switch audio = 5;
+  Switch camera = 6;
+  Switch terminal = 7;
+  Switch tunnel = 8;
+  Switch restart = 9;
+  Switch recording = 10;
+  Switch block_input = 11;
+  Switch remote_modify = 12;
+}
+
+message PunchHole {
   bytes socket_addr = 1;
   string relay_server = 2;
   NatType nat_type = 3;
@@ -38,6 +58,7 @@ message PunchHole {
   bool force_relay = 5;
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
+  ControllingStrategy controlling_strategy = 8;
 }
 
 message TestNatRequest {
@@ -124,6 +145,7 @@ message RequestRelay {
   string licence_key = 6;
   ConnType conn_type = 7;
   string token = 8;
+  ControllingStrategy controlling_strategy = 9;
 }
 
 message RelayResponse {
@@ -147,10 +169,11 @@ message SoftwareUpdate { string url = 1; }
 // even some router has below connection error if we connect itself,
 //  { kind: Other, error: "could not resolve to any address" },
 // so we request local address to connect.
-message FetchLocalAddr { 
-  bytes socket_addr = 1; 
+message FetchLocalAddr {
+  bytes socket_addr = 1;
   string relay_server = 2;
   bytes socket_addr_v6 = 3;
+  ControllingStrategy controlling_strategy = 4;
 }
 
 message LocalAddr {
