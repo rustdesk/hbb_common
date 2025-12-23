@@ -164,7 +164,7 @@ pub fn decrypt_vec_or_original(v: &[u8], current_version: &str) -> (Vec<u8>, boo
     (v.to_owned(), false, !v.is_empty())
 }
 
-fn encrypt(v: &[u8]) -> Result<String, ()> {
+pub fn encrypt(v: &[u8]) -> Result<String, ()> {
     if !v.is_empty() {
         symmetric_crypt(v, true).map(|v| base64::encode(v, base64::Variant::Original))
     } else {
@@ -172,7 +172,7 @@ fn encrypt(v: &[u8]) -> Result<String, ()> {
     }
 }
 
-fn decrypt(v: &[u8]) -> Result<Vec<u8>, ()> {
+pub fn decrypt(v: &[u8]) -> Result<Vec<u8>, ()> {
     if !v.is_empty() {
         base64::decode(v, base64::Variant::Original).and_then(|v| symmetric_crypt(&v, false))
     } else {

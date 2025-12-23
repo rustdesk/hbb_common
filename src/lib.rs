@@ -58,9 +58,9 @@ pub use uuid;
 pub mod fingerprint;
 pub use flexi_logger;
 pub mod stream;
-pub mod websocket;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
+pub mod websocket;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub use rustls_platform_verifier;
 pub use stream::Stream;
@@ -70,6 +70,30 @@ pub mod verifier;
 pub use async_recursion;
 #[cfg(target_os = "linux")]
 pub use users;
+
+const HOST_APP_NAME: &str = "RustDesk-Host";
+const CLIENT_APP_NAME: &str = "RustDesk-Client";
+const SOS_APP_NAME: &str = "RustDesk-SOS";
+
+pub fn is_standard() -> bool {
+    let app_name = config::APP_NAME.read().unwrap().clone();
+    app_name != HOST_APP_NAME && app_name != SOS_APP_NAME && app_name != CLIENT_APP_NAME
+}
+
+pub fn is_host() -> bool {
+    let app_name = config::APP_NAME.read().unwrap().clone();
+    app_name == HOST_APP_NAME
+}
+
+pub fn is_client() -> bool {
+    let app_name = config::APP_NAME.read().unwrap().clone();
+    app_name == CLIENT_APP_NAME
+}
+
+pub fn is_sos() -> bool {
+    let app_name = config::APP_NAME.read().unwrap().clone();
+    app_name == SOS_APP_NAME
+}
 
 pub type SessionID = uuid::Uuid;
 
@@ -374,7 +398,10 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
         #[cfg(debug_assertions)]
         {
             use env_logger::*;
-            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"));
+            init_from_env(Env::default().filter_or(
+                DEFAULT_FILTER_ENV,
+                "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn",
+            ));
         }
         #[cfg(not(debug_assertions))]
         {
@@ -389,7 +416,9 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 path.push(_name);
             }
             use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn") {
+            if let Ok(x) = Logger::try_with_env_or_str(
+                "debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn",
+            ) {
                 logger_holder = x
                     .log_to_file(FileSpec::default().directory(path))
                     .write_mode(if _is_async {
