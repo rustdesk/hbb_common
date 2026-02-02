@@ -2484,6 +2484,11 @@ pub fn is_disable_installation() -> bool {
     is_some_hard_opton("disable-installation")
 }
 
+#[inline]
+pub fn is_allow_easy_access() -> bool {
+    is_some_hard_opton("allow-easy-access")
+}
+
 // This function must be kept the same as the one in flutter and sciter code.
 // flutter: flutter/lib/common.dart -> option2bool()
 // sciter: Does not have the function, but it should be kept the same.
