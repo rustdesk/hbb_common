@@ -909,12 +909,18 @@ message CloseTerminal {
   int32 terminal_id = 1;
 }
 
+message RequestTerminalBuffer {
+  int32 terminal_id = 1;
+  uint32 max_bytes = 2;  // Optional, server uses 8192 if not specified
+}
+
 message TerminalAction {
   oneof union {
     OpenTerminal open = 1;
     TerminalData data = 2;
     ResizeTerminal resize = 3;
     CloseTerminal close = 4;
+    RequestTerminalBuffer request_buffer = 5;
   }
 }
 
@@ -925,6 +931,7 @@ message TerminalOpened {
   uint32 pid = 4;
   string service_id = 5;  // Service ID for persistent sessions
   repeated int32 persistent_sessions = 6; // Used to restore the persistent sessions.
+  bool reconnected = 7;  // True if reconnecting to an existing persistent session
 }
 
 message TerminalClosed {
