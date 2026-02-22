@@ -924,7 +924,8 @@ message TerminalOpened {
   string message = 3;
   uint32 pid = 4;
   string service_id = 5;  // Service ID for persistent sessions
-  repeated int32 persistent_sessions = 6; // Used to restore the persistent sessions.
+  repeated int32 persistent_sessions = 6; // Used to restore the persistent sessions (exclude `terminal_id`).
+  bool reconnected = 7;  // True if reconnecting to an existing persistent session
 }
 
 message TerminalClosed {
