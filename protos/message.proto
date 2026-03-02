@@ -87,7 +87,7 @@ message LoginRequest {
   OSLogin os_login = 12;
   string my_platform = 13;
   bytes hwid = 14;
-  string avatar = 15;
+  string avatar = 17;
 }
 
 message Terminal {
