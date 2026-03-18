@@ -28,6 +28,7 @@ message PunchHoleRequest {
   bool force_relay = 8;
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
+  bytes request_id = 11;
 }
 
 // Data passed from server to controlled device (via PunchHole / FetchLocalAddr / RequestRelay)
@@ -60,6 +61,7 @@ message PunchHole {
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
   ControlledConfig conn_config = 8;
+  bytes request_id = 9;
 }
 
 message TestNatRequest {
@@ -86,6 +88,7 @@ message PunchHoleSent {
   string version = 5;
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
+  bytes request_id = 8;
 }
 
 message RegisterPk {
@@ -153,6 +156,7 @@ message RequestRelay {
   ConnType conn_type = 7;
   string token = 8;
   ControlledConfig conn_config = 9;
+  bytes request_id = 10;
 }
 
 message RelayResponse {
@@ -169,6 +173,7 @@ message RelayResponse {
   bytes socket_addr_v6 = 10;
   int32 upnp_port = 11;
   ControllerConfig controller_config = 12;
+  bytes request_id = 13;
 }
 
 message SoftwareUpdate { string url = 1; }
@@ -182,6 +187,7 @@ message FetchLocalAddr {
   string relay_server = 2;
   bytes socket_addr_v6 = 3;
   ControlledConfig conn_config = 4;
+  bytes request_id = 5;
 }
 
 message LocalAddr {
@@ -191,6 +197,7 @@ message LocalAddr {
   string id = 4;
   string version = 5;
   bytes socket_addr_v6 = 6;
+  bytes request_id = 7;
 }
 
 message PeerDiscovery {
