@@ -28,7 +28,6 @@ message PunchHoleRequest {
   bool force_relay = 8;
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
-  bytes request_id = 11;
 }
 
 // Data passed from server to controlled device (via PunchHole / FetchLocalAddr / RequestRelay)
@@ -60,7 +59,7 @@ message PunchHole {
   bool force_relay = 5;
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
-  ControlledConfig conn_config = 8;
+  ControlledConfig controlled_config = 8;
   bytes request_id = 9;
 }
 
@@ -155,7 +154,7 @@ message RequestRelay {
   string licence_key = 6;
   ConnType conn_type = 7;
   string token = 8;
-  ControlledConfig conn_config = 9;
+  ControlledConfig controlled_config = 9;
   bytes request_id = 10;
 }
 
@@ -186,7 +185,7 @@ message FetchLocalAddr {
   bytes socket_addr = 1;
   string relay_server = 2;
   bytes socket_addr_v6 = 3;
-  ControlledConfig conn_config = 4;
+  ControlledConfig controlled_config = 4;
   bytes request_id = 5;
 }
 
