@@ -457,6 +457,92 @@ fn is_compressed_file(name: &str) -> bool {
     compressed_exts.contains(&ext)
 }
 
+#[inline]
+fn validate_file_name_no_traversal(name: &str) -> ResultType<()> {
+    if name.bytes().any(|b| b == 0) {
+        bail!("file name contains null bytes");
+    }
+    #[cfg(windows)]
+    if name
+        .split(|c| c == '/' || c == '\\')
+        .filter(|s| !s.is_empty())
+        .any(|component| component == "..")
+    {
+        bail!("path traversal detected in file name");
+    }
+    #[cfg(not(windows))]
+    if name
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .any(|component| component == "..")
+    {
+        bail!("path traversal detected in file name");
+    }
+    #[cfg(windows)]
+    {
+        if name.len() >= 2 {
+            let bytes = name.as_bytes();
+            if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                bail!("absolute path detected in file name");
+            }
+        }
+        if name.starts_with('/') || name.starts_with('\\') {
+            bail!("absolute path detected in file name");
+        }
+    }
+    #[cfg(not(windows))]
+    if name.starts_with('/') {
+        bail!("absolute path detected in file name");
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_transfer_file_names(files: &[FileEntry]) -> ResultType<()> {
+    if files.len() == 1 && files.first().map_or(false, |f| f.name.is_empty()) {
+        return Ok(());
+    }
+    for file in files {
+        if file.name.is_empty() {
+            bail!("empty file name in multi-file transfer");
+        }
+        validate_file_name_no_traversal(&file.name)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn validate_no_symlink_components(base: &PathBuf, name: &str) -> ResultType<()> {
+    if name.is_empty() {
+        return Ok(());
+    }
+    let mut current = base.clone();
+    for component in Path::new(name).components() {
+        match component {
+            std::path::Component::Normal(seg) => {
+                current.push(seg);
+                if let Ok(meta) = std::fs::symlink_metadata(&current) {
+                    if meta.file_type().is_symlink() {
+                        bail!("symlink path component is not allowed");
+                    }
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => {
+                bail!("invalid file name component");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn join_validated_path(base: &PathBuf, name: &str) -> ResultType<PathBuf> {
+    validate_file_name_no_traversal(name)?;
+    validate_no_symlink_components(base, name)?;
+    Ok(TransferJob::join(base, name))
+}
+
 impl TransferJob {
     #[allow(clippy::too_many_arguments)]
     pub fn new_write(
@@ -538,8 +624,15 @@ impl TransferJob {
     }
 
     #[inline]
-    pub fn set_files(&mut self, files: Vec<FileEntry>) {
+    pub fn set_files(&mut self, files: Vec<FileEntry>) -> ResultType<()> {
+        validate_transfer_file_names(&files)?;
+        if let DataSource::FilePath(base) = &self.data_source {
+            for file in &files {
+                validate_no_symlink_components(base, &file.name)?;
+            }
+        }
         self.files = files;
+        Ok(())
     }
 
     #[inline]
@@ -581,7 +674,17 @@ impl TransferJob {
             let file_num = self.file_num as usize;
             if file_num < self.files.len() {
                 let entry = &self.files[file_num];
-                let path = Self::join(p, &entry.name);
+                let path = if self.r#type == JobType::Generic {
+                    match join_validated_path(p, &entry.name) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            log::error!("Invalid file name in transfer job {}: {}", self.id, err);
+                            return;
+                        }
+                    }
+                } else {
+                    Self::join(p, &entry.name)
+                };
                 let download_path = format!("{}.download", get_string(&path));
                 let digest_path = format!("{}.digest", get_string(&path));
                 std::fs::remove_file(digest_path).ok();
@@ -603,7 +706,17 @@ impl TransferJob {
             let file_num = self.file_num as usize;
             if file_num < self.files.len() {
                 let entry = &self.files[file_num];
-                let path = Self::join(p, &entry.name);
+                let path = if self.r#type == JobType::Generic {
+                    match join_validated_path(p, &entry.name) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            log::error!("Invalid file name in transfer job {}: {}", self.id, err);
+                            return;
+                        }
+                    }
+                } else {
+                    Self::join(p, &entry.name)
+                };
                 let download_path = format!("{}.download", get_string(&path));
                 let digest_path = format!("{}.digest", get_string(&path));
                 std::fs::remove_file(download_path).ok();
@@ -645,7 +758,7 @@ impl TransferJob {
                     let (path, digest_path) = if self.r#type == JobType::Printer {
                         (p.to_string_lossy().to_string(), None)
                     } else {
-                        let path = Self::join(p, &entry.name);
+                        let path = join_validated_path(p, &entry.name)?;
                         if let Some(pp) = path.parent() {
                             std::fs::create_dir_all(pp).ok();
                         }
@@ -969,7 +1082,17 @@ impl TransferJob {
     async fn set_stream_offset(&mut self, file_num: usize, offset: u64) {
         if let DataSource::FilePath(p) = &self.data_source {
             let entry = &self.files[file_num];
-            let path = Self::join(p, &entry.name);
+            let path = if self.r#type == JobType::Generic {
+                match join_validated_path(p, &entry.name) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        log::error!("Invalid file name in transfer job {}: {}", self.id, err);
+                        return;
+                    }
+                }
+            } else {
+                Self::join(p, &entry.name)
+            };
             let file_path = get_string(&path);
             let download_path = format!("{}.download", &file_path);
             let digest_path = format!("{}.digest", &file_path);
@@ -1377,4 +1500,258 @@ pub fn serialize_transfer_job(job: &TransferJob, done: bool, cancel: bool, error
     value["cancel"] = json!(cancel);
     value["error"] = json!(error);
     serde_json::to_string(&value).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), timestamp))
+    }
+
+    fn new_file_entry(name: &str) -> FileEntry {
+        let mut entry = FileEntry::new();
+        entry.name = name.to_string();
+        entry
+    }
+
+    fn new_validation_job(id: i32) -> TransferJob {
+        TransferJob::new_write(
+            id,
+            JobType::Generic,
+            "/fake/remote".to_string(),
+            DataSource::FilePath(std::env::temp_dir().join(format!("rustdesk_validation_{id}"))),
+            0,
+            false,
+            true,
+            Vec::new(),
+            false,
+        )
+    }
+
+    fn new_write_job(id: i32, download_dir: PathBuf, name: &str) -> TransferJob {
+        TransferJob::new_write(
+            id,
+            JobType::Generic,
+            "/fake/remote".to_string(),
+            DataSource::FilePath(download_dir),
+            0,
+            false,
+            true,
+            vec![new_file_entry(name)],
+            false,
+        )
+    }
+
+    fn make_test_block(id: i32, payload: &[u8]) -> FileTransferBlock {
+        let mut block = FileTransferBlock::new();
+        block.id = id;
+        block.file_num = 0;
+        block.data = payload.to_vec().into();
+        block
+    }
+
+    fn assert_err_contains(err: anyhow::Error, expected: &str) {
+        assert!(
+            err.to_string().contains(expected),
+            "expected error containing '{}', got: {}",
+            expected,
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn path_traversal_e2e_write_rejects_relative_escape() {
+        let tmp_root = unique_temp_dir("rustdesk_e2e_relative");
+        let downloads = tmp_root.join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads dir");
+
+        let mut job = new_write_job(1, downloads, "../traversal_proof.txt");
+        let block = make_test_block(1, b"malicious payload");
+        let err = job
+            .write(block)
+            .await
+            .expect_err("relative path traversal must be rejected");
+        assert_err_contains(err, "path traversal");
+        assert!(!tmp_root.join("traversal_proof.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn path_traversal_e2e_write_rejects_absolute_path() {
+        let tmp_root = unique_temp_dir("rustdesk_e2e_absolute");
+        let downloads = tmp_root.join("downloads");
+        let absolute_target = tmp_root.join("fake_ssh").join("authorized_keys");
+        std::fs::create_dir_all(&downloads).expect("create downloads dir");
+
+        let mut job = new_write_job(2, downloads, &absolute_target.to_string_lossy());
+        let block = make_test_block(2, b"ssh key payload");
+        let err = job
+            .write(block)
+            .await
+            .expect_err("absolute path must be rejected");
+        assert_err_contains(err, "absolute path");
+        assert!(!absolute_target.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn path_traversal_e2e_write_rejects_symlink_escape() {
+        let tmp_root = unique_temp_dir("rustdesk_e2e_symlink");
+        let downloads = tmp_root.join("downloads");
+        let outside = tmp_root.join("outside");
+        let escaped_target = outside.join("escape.txt");
+        std::fs::create_dir_all(&downloads).expect("create downloads dir");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+
+        let symlink_path = downloads.join("link");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            if let Err(err) = symlink(&outside, &symlink_path) {
+                eprintln!("Skipping symlink test: failed to create symlink: {err}");
+                let _ = std::fs::remove_dir_all(&tmp_root);
+                return;
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::symlink_dir;
+            if let Err(err) = symlink_dir(&outside, &symlink_path) {
+                eprintln!(
+                    "Skipping symlink test: failed to create directory symlink (requires privileges): {err}"
+                );
+                let _ = std::fs::remove_dir_all(&tmp_root);
+                return;
+            }
+        }
+
+        let mut job = new_write_job(3, downloads, "link/escape.txt");
+        let block = make_test_block(3, b"symlink escape payload");
+        let err = job
+            .write(block)
+            .await
+            .expect_err("symlink traversal must be rejected");
+        assert_err_contains(err, "symlink");
+        assert!(!escaped_target.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn set_files_allows_single_empty_name_for_single_file_transfer() {
+        let mut job = new_validation_job(101);
+        assert!(job.set_files(vec![new_file_entry("")]).is_ok());
+    }
+
+    #[test]
+    fn set_files_rejects_empty_name_in_multi_file_transfer() {
+        let mut job = new_validation_job(102);
+        let err = job
+            .set_files(vec![new_file_entry(""), new_file_entry("ok.txt")])
+            .expect_err("empty name in multi-file transfer must be rejected");
+        assert_err_contains(err, "empty file name");
+    }
+
+    #[test]
+    fn set_files_rejects_null_byte_name() {
+        let mut job = new_validation_job(103);
+        let err = job
+            .set_files(vec![new_file_entry("bad\0name.txt")])
+            .expect_err("null byte in file name must be rejected");
+        assert_err_contains(err, "null bytes");
+    }
+
+    #[test]
+    fn set_files_rejects_mixed_entries_when_one_is_traversal() {
+        let mut job = new_validation_job(104);
+        let err = job
+            .set_files(vec![
+                new_file_entry("safe/file.txt"),
+                new_file_entry("../../escape.txt"),
+            ])
+            .expect_err("any traversal entry must reject the full file list");
+        assert_err_contains(err, "path traversal");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn set_files_rejects_unc_absolute_path() {
+        let mut job = new_validation_job(105);
+        let err = job
+            .set_files(vec![new_file_entry("\\\\server\\share\\payload.txt")])
+            .expect_err("UNC absolute path must be rejected");
+        assert_err_contains(err, "absolute path");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn set_files_allows_backslash_prefixed_name_on_unix() {
+        let mut job = new_validation_job(105);
+        assert!(job
+            .set_files(vec![new_file_entry("\\\\server\\share\\payload.txt")])
+            .is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn set_files_rejects_windows_drive_absolute_path() {
+        let mut job = new_validation_job(106);
+        let err = job
+            .set_files(vec![new_file_entry("C:\\Windows\\Temp\\payload.txt")])
+            .expect_err("drive-letter absolute path must be rejected");
+        assert_err_contains(err, "absolute path");
+    }
+
+    #[test]
+    fn set_files_rejects_symlink_path_component() {
+        let tmp_root = unique_temp_dir("rustdesk_set_files_symlink");
+        let downloads = tmp_root.join("downloads");
+        let outside = tmp_root.join("outside");
+        std::fs::create_dir_all(&downloads).expect("create downloads dir");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+
+        let symlink_path = downloads.join("link");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            if symlink(&outside, &symlink_path).is_err() {
+                let _ = std::fs::remove_dir_all(&tmp_root);
+                return;
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::symlink_dir;
+            if symlink_dir(&outside, &symlink_path).is_err() {
+                let _ = std::fs::remove_dir_all(&tmp_root);
+                return;
+            }
+        }
+
+        let mut job = TransferJob::new_write(
+            107,
+            JobType::Generic,
+            "/fake/remote".to_string(),
+            DataSource::FilePath(downloads),
+            0,
+            false,
+            true,
+            Vec::new(),
+            false,
+        );
+        let err = job
+            .set_files(vec![new_file_entry("link/escape.txt")])
+            .expect_err("symlink component must be rejected");
+        assert_err_contains(err, "symlink");
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
 }
