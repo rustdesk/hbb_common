@@ -1252,8 +1252,19 @@ impl Config {
 
     pub fn set_options(mut v: HashMap<String, String>) {
         Self::purify_options(&mut v);
+        let previous_options = CONFIG2.read().unwrap().options.clone();
+        let mut rejected_keys = Vec::new();
         for (key, value) in v.iter_mut() {
-            Self::maybe_encrypt_option_value(key, value);
+            if !Self::maybe_encrypt_option_value(key, value) {
+                rejected_keys.push(key.clone());
+            }
+        }
+        for key in rejected_keys {
+            if let Some(old) = previous_options.get(&key) {
+                v.insert(key, old.clone());
+            } else {
+                v.remove(&key);
+            }
         }
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
@@ -1289,7 +1300,9 @@ impl Config {
         }
         let mut config = CONFIG2.write().unwrap();
         let mut stored = v;
-        Self::maybe_encrypt_option_value(&k, &mut stored);
+        if !Self::maybe_encrypt_option_value(&k, &mut stored) {
+            return;
+        }
         let v2 = if stored.is_empty() {
             None
         } else {
@@ -1320,11 +1333,30 @@ impl Config {
         *v = plain;
     }
 
-    fn maybe_encrypt_option_value(k: &str, v: &mut String) {
+    fn maybe_encrypt_option_value(k: &str, v: &mut String) -> bool {
         if !Self::is_encrypted_option(k) || v.is_empty() {
-            return;
+            return true;
         }
-        *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let plain_len = v.chars().count();
+        if plain_len > ENCRYPT_MAX_LEN {
+            log::error!(
+                "Refusing to store encrypted option {} because it exceeds ENCRYPT_MAX_LEN ({} > {})",
+                k,
+                plain_len,
+                ENCRYPT_MAX_LEN
+            );
+            return false;
+        }
+        let encrypted = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        if encrypted.is_empty() {
+            log::error!(
+                "Failed to encrypt option {} before storing it; keeping the previous value",
+                k
+            );
+            return false;
+        }
+        *v = encrypted;
+        true
     }
 
     pub fn update_id() {
@@ -3598,6 +3630,48 @@ mod tests {
         Config::set_bootstrap_config_for_test(saved_bootstrap);
         *EXE_RENDEZVOUS_SERVER.write().unwrap() = saved_exe;
         *PROD_RENDEZVOUS_SERVER.write().unwrap() = saved_prod;
+        *CONFIG2.write().unwrap() = saved_config2;
+    }
+
+    #[test]
+    fn test_encrypted_option_rejects_oversized_value_in_set_option() {
+        let saved_config2 = CONFIG2.read().unwrap().clone();
+        let key = keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned();
+        let original = "secret-passphrase".to_owned();
+
+        {
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.options.clear();
+        }
+
+        Config::set_option(key.clone(), original.clone());
+        assert_eq!(Config::get_option(&key), original);
+
+        Config::set_option(key.clone(), "x".repeat(ENCRYPT_MAX_LEN + 1));
+        assert_eq!(Config::get_option(&key), original);
+
+        *CONFIG2.write().unwrap() = saved_config2;
+    }
+
+    #[test]
+    fn test_encrypted_option_rejects_oversized_value_in_set_options() {
+        let saved_config2 = CONFIG2.read().unwrap().clone();
+        let key = keys::OPTION_PEER_PAIRING_PASSPHRASE.to_owned();
+        let original = "peer-secret-passphrase".to_owned();
+
+        {
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.options.clear();
+        }
+
+        Config::set_option(key.clone(), original.clone());
+        assert_eq!(Config::get_option(&key), original);
+
+        let mut options = HashMap::new();
+        options.insert(key.clone(), "x".repeat(ENCRYPT_MAX_LEN + 1));
+        Config::set_options(options);
+        assert_eq!(Config::get_option(&key), original);
+
         *CONFIG2.write().unwrap() = saved_config2;
     }
 
