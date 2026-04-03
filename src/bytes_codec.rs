@@ -2,6 +2,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
 
+const DEFAULT_MAX_PACKET_LENGTH: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct BytesCodec {
     state: DecodeState,
@@ -26,7 +28,7 @@ impl BytesCodec {
         Self {
             state: DecodeState::Head,
             raw: false,
-            max_packet_length: usize::MAX,
+            max_packet_length: DEFAULT_MAX_PACKET_LENGTH,
         }
     }
 
@@ -137,6 +139,25 @@ impl Encoder<Bytes> for BytesCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_head_only(len: usize) -> BytesMut {
+        let mut buf = BytesMut::new();
+        if len <= 0x3F {
+            buf.put_u8((len << 2) as u8);
+        } else if len <= 0x3FFF {
+            buf.put_u16_le((len << 2) as u16 | 0x1);
+        } else if len <= 0x3FFFFF {
+            let h = (len << 2) as u32 | 0x2;
+            buf.put_u16_le((h & 0xFFFF) as u16);
+            buf.put_u8((h >> 16) as u8);
+        } else if len <= 0x3FFFFFFF {
+            buf.put_u32_le((len << 2) as u32 | 0x3);
+        } else {
+            panic!("test packet length overflow");
+        }
+        buf
+    }
+
     #[test]
     fn test_codec1() {
         let mut codec = BytesCodec::new();
@@ -276,5 +297,20 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn test_codec_rejects_packet_above_default_limit() {
+        let mut codec = BytesCodec::new();
+        let mut buf = encode_head_only(DEFAULT_MAX_PACKET_LENGTH + 1);
+        assert!(codec.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_codec_rejects_packet_above_custom_limit() {
+        let mut codec = BytesCodec::new();
+        codec.set_max_packet_length(16);
+        let mut buf = encode_head_only(17);
+        assert!(codec.decode(&mut buf).is_err());
     }
 }

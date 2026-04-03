@@ -102,6 +102,7 @@ type KeyPair = (Vec<u8>, Vec<u8>);
 lazy_static::lazy_static! {
     static ref CONFIG: RwLock<Config> = RwLock::new(Config::load());
     static ref CONFIG2: RwLock<Config2> = RwLock::new(Config2::load());
+    static ref BOOTSTRAP_CONFIG: RwLock<BootstrapConfig> = RwLock::new(BootstrapConfig::load());
     static ref LOCAL_CONFIG: RwLock<LocalConfig> = RwLock::new(LocalConfig::load());
     static ref STATUS: RwLock<Status> = RwLock::new(Status::load());
     static ref TRUSTED_DEVICES: RwLock<(Vec<TrustedDevice>, bool)> = Default::default();
@@ -155,9 +156,6 @@ const CHARS: &[char] = &[
     '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k',
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
-
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
@@ -274,6 +272,42 @@ pub struct Config2 {
     // the other scalar value must before this
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     pub options: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+pub struct BootstrapConfig {
+    #[serde(
+        rename = "rendezvous-server",
+        default,
+        deserialize_with = "deserialize_string"
+    )]
+    rendezvous_server: String,
+    #[serde(
+        rename = "rendezvous-servers",
+        default,
+        deserialize_with = "deserialize_vec_string"
+    )]
+    rendezvous_servers: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    key: String,
+    #[serde(
+        rename = "api-server",
+        default,
+        deserialize_with = "deserialize_string"
+    )]
+    api_server: String,
+    #[serde(
+        rename = "update-server",
+        default,
+        deserialize_with = "deserialize_string"
+    )]
+    update_server: String,
+    #[serde(
+        rename = "trusted-peers",
+        default,
+        deserialize_with = "deserialize_hashmap_string_string"
+    )]
+    trusted_peers: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
@@ -557,6 +591,32 @@ impl Config2 {
     }
 }
 
+impl BootstrapConfig {
+    fn load() -> BootstrapConfig {
+        Config::load_::<BootstrapConfig>("-bootstrap")
+    }
+
+    pub fn file() -> PathBuf {
+        Config::file_("-bootstrap")
+    }
+
+    fn get_rendezvous_servers(&self) -> Vec<String> {
+        if !self.rendezvous_servers.is_empty() {
+            return self
+                .rendezvous_servers
+                .iter()
+                .filter(|server| !server.is_empty())
+                .cloned()
+                .collect();
+        }
+        if self.rendezvous_server.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.rendezvous_server.clone()]
+        }
+    }
+}
+
 pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
     file: PathBuf,
 ) -> T {
@@ -698,6 +758,10 @@ impl Config {
 
     pub fn file() -> PathBuf {
         Self::file_("")
+    }
+
+    pub fn bootstrap_file() -> PathBuf {
+        BootstrapConfig::file()
     }
 
     fn file_(suffix: &str) -> PathBuf {
@@ -850,21 +914,15 @@ impl Config {
     pub fn get_rendezvous_server() -> String {
         let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
         if rendezvous_server.is_empty() {
-            rendezvous_server = Self::get_option("custom-rendezvous-server");
-        }
-        if rendezvous_server.is_empty() {
-            rendezvous_server = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
-        }
-        if rendezvous_server.is_empty() {
-            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();
-        }
-        if rendezvous_server.is_empty() {
-            rendezvous_server = Self::get_rendezvous_servers()
-                .drain(..)
+            rendezvous_server = Self::get_bootstrap_rendezvous_servers()
+                .into_iter()
                 .next()
                 .unwrap_or_default();
         }
-        if !rendezvous_server.contains(':') {
+        if rendezvous_server.is_empty() {
+            rendezvous_server = Self::get_option("custom-rendezvous-server");
+        }
+        if !rendezvous_server.is_empty() && !rendezvous_server.contains(':') {
             rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
         }
         rendezvous_server
@@ -875,26 +933,46 @@ impl Config {
         if !s.is_empty() {
             return vec![s];
         }
+        let ss = Self::get_bootstrap_rendezvous_servers();
+        if !ss.is_empty() {
+            return ss;
+        }
         let s = Self::get_option("custom-rendezvous-server");
         if !s.is_empty() {
             return vec![s];
         }
-        let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
-        if !s.is_empty() {
-            return vec![s];
-        }
-        let serial_obsolute = CONFIG2.read().unwrap().serial > SERIAL;
-        if serial_obsolute {
-            let ss: Vec<String> = Self::get_option("rendezvous-servers")
-                .split(',')
-                .filter(|x| x.contains('.'))
-                .map(|x| x.to_owned())
-                .collect();
-            if !ss.is_empty() {
-                return ss;
-            }
-        }
-        return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect();
+        Vec::new()
+    }
+
+    pub fn get_bootstrap_rendezvous_servers() -> Vec<String> {
+        BOOTSTRAP_CONFIG.read().unwrap().get_rendezvous_servers()
+    }
+
+    pub fn get_bootstrap_key() -> String {
+        BOOTSTRAP_CONFIG.read().unwrap().key.clone()
+    }
+
+    pub fn get_bootstrap_api_server() -> String {
+        BOOTSTRAP_CONFIG.read().unwrap().api_server.clone()
+    }
+
+    pub fn get_bootstrap_update_server() -> String {
+        BOOTSTRAP_CONFIG.read().unwrap().update_server.clone()
+    }
+
+    pub fn get_bootstrap_trusted_peer_key(peer_id: &str) -> String {
+        BOOTSTRAP_CONFIG
+            .read()
+            .unwrap()
+            .trusted_peers
+            .get(peer_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn set_bootstrap_config_for_test(config: BootstrapConfig) {
+        *BOOTSTRAP_CONFIG.write().unwrap() = config;
     }
 
     pub fn reset_online() {
@@ -1161,6 +1239,9 @@ impl Config {
         let mut res = DEFAULT_SETTINGS.read().unwrap().clone();
         res.extend(CONFIG2.read().unwrap().options.clone());
         res.extend(OVERWRITE_SETTINGS.read().unwrap().clone());
+        for (key, value) in res.iter_mut() {
+            Self::maybe_decrypt_option_value(key, value);
+        }
         res
     }
 
@@ -1171,6 +1252,20 @@ impl Config {
 
     pub fn set_options(mut v: HashMap<String, String>) {
         Self::purify_options(&mut v);
+        let previous_options = CONFIG2.read().unwrap().options.clone();
+        let mut rejected_keys = Vec::new();
+        for (key, value) in v.iter_mut() {
+            if !Self::maybe_encrypt_option_value(key, value) {
+                rejected_keys.push(key.clone());
+            }
+        }
+        for key in rejected_keys {
+            if let Some(old) = previous_options.get(&key) {
+                v.insert(key, old.clone());
+            } else {
+                v.remove(&key);
+            }
+        }
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
             return;
@@ -1180,13 +1275,15 @@ impl Config {
     }
 
     pub fn get_option(k: &str) -> String {
-        get_or(
+        let mut value = get_or(
             &OVERWRITE_SETTINGS,
             &CONFIG2.read().unwrap().options,
             &DEFAULT_SETTINGS,
             k,
         )
-        .unwrap_or_default()
+        .unwrap_or_default();
+        Self::maybe_decrypt_option_value(k, &mut value);
+        value
     }
 
     pub fn get_bool_option(k: &str) -> bool {
@@ -1202,15 +1299,64 @@ impl Config {
             return;
         }
         let mut config = CONFIG2.write().unwrap();
-        let v2 = if v.is_empty() { None } else { Some(&v) };
-        if v2 != config.options.get(&k) {
+        let mut stored = v;
+        if !Self::maybe_encrypt_option_value(&k, &mut stored) {
+            return;
+        }
+        let v2 = if stored.is_empty() {
+            None
+        } else {
+            Some(stored.as_str())
+        };
+        if v2 != config.options.get(&k).map(|value| value.as_str()) {
             if v2.is_none() {
                 config.options.remove(&k);
             } else {
-                config.options.insert(k, v);
+                config.options.insert(k, stored);
             }
             config.store();
         }
+    }
+
+    fn is_encrypted_option(k: &str) -> bool {
+        matches!(
+            k,
+            keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE | keys::OPTION_PEER_PAIRING_PASSPHRASE
+        )
+    }
+
+    fn maybe_decrypt_option_value(k: &str, v: &mut String) {
+        if !Self::is_encrypted_option(k) || v.is_empty() {
+            return;
+        }
+        let (plain, _, _) = decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
+        *v = plain;
+    }
+
+    fn maybe_encrypt_option_value(k: &str, v: &mut String) -> bool {
+        if !Self::is_encrypted_option(k) || v.is_empty() {
+            return true;
+        }
+        let plain_len = v.chars().count();
+        if plain_len > ENCRYPT_MAX_LEN {
+            log::error!(
+                "Refusing to store encrypted option {} because it exceeds ENCRYPT_MAX_LEN ({} > {})",
+                k,
+                plain_len,
+                ENCRYPT_MAX_LEN
+            );
+            return false;
+        }
+        let encrypted = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        if encrypted.is_empty() {
+            log::error!(
+                "Failed to encrypt option {} before storing it; keeping the previous value",
+                k
+            );
+            return false;
+        }
+        *v = encrypted;
+        true
     }
 
     pub fn update_id() {
@@ -2178,6 +2324,8 @@ pub struct DiscoveryPeer {
     #[serde(default, deserialize_with = "deserialize_string")]
     pub id: String,
     #[serde(default, deserialize_with = "deserialize_string")]
+    pub sign_pk: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
     pub username: String,
     #[serde(default, deserialize_with = "deserialize_string")]
     pub hostname: String,
@@ -2809,6 +2957,10 @@ pub mod keys {
     pub const OPTION_ENABLE_LAN_DISCOVERY: &str = "enable-lan-discovery";
     pub const OPTION_DIRECT_SERVER: &str = "direct-server";
     pub const OPTION_DIRECT_ACCESS_PORT: &str = "direct-access-port";
+    pub const OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE: &str = "direct-access-pairing-passphrase";
+    pub const OPTION_PEER_PAIRING_PASSPHRASE: &str = "peer-pairing-passphrase";
+    pub const OPTION_ALLOW_UNVERIFIED_PEER_TRUST: &str = "allow-unverified-peer-trust";
+    pub const OPTION_LAN_DISCOVERY_MODE: &str = "lan-discovery-mode";
     pub const OPTION_WHITELIST: &str = "whitelist";
     pub const OPTION_ALLOW_AUTO_DISCONNECT: &str = "allow-auto-disconnect";
     pub const OPTION_AUTO_DISCONNECT_TIMEOUT: &str = "auto-disconnect-timeout";
@@ -3035,6 +3187,10 @@ pub mod keys {
         OPTION_ENABLE_LAN_DISCOVERY,
         OPTION_DIRECT_SERVER,
         OPTION_DIRECT_ACCESS_PORT,
+        OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE,
+        OPTION_PEER_PAIRING_PASSPHRASE,
+        OPTION_ALLOW_UNVERIFIED_PEER_TRUST,
+        OPTION_LAN_DISCOVERY_MODE,
         OPTION_WHITELIST,
         OPTION_ALLOW_AUTO_DISCONNECT,
         OPTION_AUTO_DISCONNECT_TIMEOUT,
@@ -3399,6 +3555,124 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn test_bootstrap_rendezvous_resolution() {
+        let saved_bootstrap = BOOTSTRAP_CONFIG.read().unwrap().clone();
+        let saved_exe = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+        let saved_prod = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+        let saved_config2 = CONFIG2.read().unwrap().clone();
+
+        Config::set_bootstrap_config_for_test(BootstrapConfig::default());
+        *EXE_RENDEZVOUS_SERVER.write().unwrap() = "".to_owned();
+        *PROD_RENDEZVOUS_SERVER.write().unwrap() = "".to_owned();
+        {
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.rendezvous_server.clear();
+            config2.serial = 0;
+            config2.options.clear();
+        }
+
+        assert_eq!(Config::get_rendezvous_server(), "");
+        assert!(Config::get_rendezvous_servers().is_empty());
+
+        let bootstrap = BootstrapConfig {
+            rendezvous_servers: vec!["lan-only.example".to_owned(), "vpn-only.example".to_owned()],
+            key: "bootstrap-key".to_owned(),
+            api_server: "http://lan-only.example:21114".to_owned(),
+            update_server: "http://updates.example/version/latest".to_owned(),
+            trusted_peers: HashMap::from([(
+                "peer-1".to_owned(),
+                "peer-1-base64-signing-key".to_owned(),
+            )]),
+            ..Default::default()
+        };
+        Config::set_bootstrap_config_for_test(bootstrap);
+        {
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.rendezvous_server = "cached.example".to_owned();
+            config2.options.insert(
+                "custom-rendezvous-server".to_owned(),
+                "mutable.example".to_owned(),
+            );
+            config2.options.insert(
+                "rendezvous-servers".to_owned(),
+                "server-pushed.example,ignored.example".to_owned(),
+            );
+            config2.serial = SERIAL + 1;
+        }
+
+        assert_eq!(
+            Config::get_rendezvous_server(),
+            format!("lan-only.example:{RENDEZVOUS_PORT}")
+        );
+        assert_eq!(
+            Config::get_rendezvous_servers(),
+            vec!["lan-only.example".to_owned(), "vpn-only.example".to_owned()]
+        );
+        assert_ne!(Config::get_rendezvous_server(), "cached.example:21116");
+        assert_eq!(Config::get_bootstrap_key(), "bootstrap-key");
+        assert_eq!(
+            Config::get_bootstrap_api_server(),
+            "http://lan-only.example:21114"
+        );
+        assert_eq!(
+            Config::get_bootstrap_update_server(),
+            "http://updates.example/version/latest"
+        );
+        assert_eq!(
+            Config::get_bootstrap_trusted_peer_key("peer-1"),
+            "peer-1-base64-signing-key"
+        );
+        assert_eq!(Config::get_bootstrap_trusted_peer_key("missing"), "");
+
+        Config::set_bootstrap_config_for_test(saved_bootstrap);
+        *EXE_RENDEZVOUS_SERVER.write().unwrap() = saved_exe;
+        *PROD_RENDEZVOUS_SERVER.write().unwrap() = saved_prod;
+        *CONFIG2.write().unwrap() = saved_config2;
+    }
+
+    #[test]
+    fn test_encrypted_option_rejects_oversized_value_in_set_option() {
+        let saved_config2 = CONFIG2.read().unwrap().clone();
+        let key = keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned();
+        let original = "secret-passphrase".to_owned();
+
+        {
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.options.clear();
+        }
+
+        Config::set_option(key.clone(), original.clone());
+        assert_eq!(Config::get_option(&key), original);
+
+        Config::set_option(key.clone(), "x".repeat(ENCRYPT_MAX_LEN + 1));
+        assert_eq!(Config::get_option(&key), original);
+
+        *CONFIG2.write().unwrap() = saved_config2;
+    }
+
+    #[test]
+    fn test_encrypted_option_rejects_oversized_value_in_set_options() {
+        let saved_config2 = CONFIG2.read().unwrap().clone();
+        let key = keys::OPTION_PEER_PAIRING_PASSPHRASE.to_owned();
+        let original = "peer-secret-passphrase".to_owned();
+
+        {
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.options.clear();
+        }
+
+        Config::set_option(key.clone(), original.clone());
+        assert_eq!(Config::get_option(&key), original);
+
+        let mut options = HashMap::new();
+        options.insert(key.clone(), "x".repeat(ENCRYPT_MAX_LEN + 1));
+        Config::set_options(options);
+        assert_eq!(Config::get_option(&key), original);
+
+        *CONFIG2.write().unwrap() = saved_config2;
     }
 
     #[test]
