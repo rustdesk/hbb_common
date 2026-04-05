@@ -15,6 +15,24 @@ enum ConnType {
   TERMINAL = 5;
 }
 
+message EasyAccessTargetBinding {
+  bytes challenge = 1; // opaque controller challenge
+  bytes target_uuid = 2; // controlled device uuid
+  bytes target_pk = 3; // controlled device ed25519 public key
+}
+
+message EasyAccessManagerApproval {
+  EasyAccessTargetBinding target_binding = 1;
+  bytes manager_signing_pk = 2; // manager ed25519 public key
+  bytes manager_approval_signature = 3; // signature over serialized EasyAccessTargetBinding
+}
+
+message EasyAccessGrant {
+  uint32 version = 1;
+  bytes server_approval_signature = 2; // signature over serialized EasyAccessManagerApproval
+  bytes device_bound_proof = 3; // box(serialized manager approval, derived nonce, server_box_sk, target_box_pk)
+}
+
 message RegisterPeerResponse { bool request_pk = 2; }
 
 message PunchHoleRequest { 
@@ -47,8 +65,7 @@ message ControlledConfig {
     remote_modify = 11;
   }
   uint64 control_permissions = 1;
-  bytes easy_access_signature = 2; // server signature for easy access challenge
-  bytes manager_id = 3; // user manager uuid
+  EasyAccessGrant easy_access_grant = 2;
 }
 
 message PunchHole {
