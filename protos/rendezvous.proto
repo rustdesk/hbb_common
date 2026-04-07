@@ -19,6 +19,7 @@ message EasyAccessTargetBinding {
   bytes challenge = 1; // opaque controller challenge
   bytes target_uuid = 2; // controlled device uuid
   bytes target_pk = 3; // controlled device ed25519 public key
+  bytes grant_id = 4; // one-time server-issued grant id
 }
 
 message EasyAccessManagerApproval {
