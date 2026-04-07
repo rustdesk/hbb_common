@@ -1,5 +1,8 @@
+use crate::secret_store::{SecretStoreError, SecretStoreResult};
 use std::{
     collections::VecDeque,
+    convert::TryInto,
+    fs,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -19,6 +22,13 @@ use winapi::{
             HANDLE, OSVERSIONINFOEXW, VER_BUILDNUMBER, VER_GREATER_EQUAL, VER_MAJORVERSION,
             VER_MINORVERSION, VER_SERVICEPACKMAJOR, VER_SERVICEPACKMINOR,
         },
+    },
+};
+use windows::{
+    core::PCWSTR,
+    Win32::{
+        Foundation::{LocalFree, HLOCAL},
+        Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB},
     },
 };
 
@@ -195,4 +205,65 @@ pub fn is_windows_version_or_greater(
     };
 
     result == TRUE
+}
+
+pub(crate) fn dpapi_encrypt_bytes(data: &[u8]) -> SecretStoreResult<Vec<u8>> {
+    // https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata
+    let in_blob = CRYPT_INTEGER_BLOB {
+        cbData: data.len().try_into().map_err(|_| {
+            SecretStoreError::backend_message(
+                "failed to prepare Windows DPAPI plaintext blob",
+                "input is too large for CRYPT_INTEGER_BLOB",
+            )
+        })?,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut out_blob = CRYPT_INTEGER_BLOB::default();
+    unsafe { CryptProtectData(&in_blob, PCWSTR::null(), None, None, None, 0, &mut out_blob) }
+        .map_err(|err| SecretStoreError::backend("failed to encrypt Windows DPAPI payload", err))?;
+    let encrypted = blob_to_vec(&out_blob)?;
+    free_local_buffer(out_blob.pbData);
+    Ok(encrypted)
+}
+
+pub(crate) fn dpapi_decrypt_bytes(data: &[u8]) -> SecretStoreResult<Vec<u8>> {
+    // https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptunprotectdata
+    let in_blob = CRYPT_INTEGER_BLOB {
+        cbData: data.len().try_into().map_err(|_| {
+            SecretStoreError::backend_message(
+                "failed to prepare Windows DPAPI ciphertext blob",
+                "input is too large for CRYPT_INTEGER_BLOB",
+            )
+        })?,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut out_blob = CRYPT_INTEGER_BLOB::default();
+    unsafe { CryptUnprotectData(&in_blob, None, None, None, None, 0, &mut out_blob) }
+        .map_err(|err| SecretStoreError::backend("failed to decrypt Windows DPAPI payload", err))?;
+    let decrypted = blob_to_vec(&out_blob)?;
+    free_local_buffer(out_blob.pbData);
+    Ok(decrypted)
+}
+
+fn blob_to_vec(blob: &CRYPT_INTEGER_BLOB) -> SecretStoreResult<Vec<u8>> {
+    if blob.cbData == 0 {
+        return Ok(Vec::new());
+    }
+    if blob.pbData.is_null() {
+        Err(SecretStoreError::backend_message(
+            "failed to read Windows blob",
+            "blob pointer was null",
+        ))
+    } else {
+        Ok(unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize).to_vec() })
+    }
+}
+
+fn free_local_buffer(buffer: *mut u8) {
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-localfree
+    if !buffer.is_null() {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(buffer.cast())));
+        }
+    }
 }

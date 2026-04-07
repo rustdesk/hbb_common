@@ -1,8 +1,20 @@
+use crate::secret_store::{SecretStoreError, SecretStoreResult};
 use crate::ResultType;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use dbus_secret_service::{EncryptionType, Item, SecretService};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    os::fd::AsFd,
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::{sync_channel, RecvTimeoutError},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixStream,
 };
 use users::{get_current_uid, get_user_by_uid, os::unix::UserExt};
 
@@ -495,6 +507,200 @@ pub fn get_home_dir_trusted() -> Option<PathBuf> {
             None
         }
     }
+}
+
+const FLATPAK_SECRET_DERIVE_INFO: &[u8] = b"hbb-common-flatpak-secret-v1";
+const FLATPAK_PORTAL_TIMEOUT_MS: u64 = 3_000;
+const FLATPAK_PORTAL_RESULT_TIMEOUT_MS: u64 = FLATPAK_PORTAL_TIMEOUT_MS + 1_000;
+
+#[inline]
+fn is_flatpak() -> bool {
+    PathBuf::from("/.flatpak-info").exists()
+}
+
+// Keep the Linux secret-store API synchronous even though the portal client is async.
+fn run_flatpak_portal_task<T, F, Fut>(task: F) -> SecretStoreResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = SecretStoreResult<T>> + 'static,
+{
+    let (tx, rx) = sync_channel(1);
+    std::thread::spawn(move || {
+        let result = run_flatpak_portal_task_async(task);
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(Duration::from_millis(FLATPAK_PORTAL_RESULT_TIMEOUT_MS)) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(SecretStoreError::backend_message(
+            "timed out waiting for xdg-desktop-portal secret",
+            format!(
+                "portal worker did not finish within {} ms",
+                FLATPAK_PORTAL_RESULT_TIMEOUT_MS
+            ),
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(SecretStoreError::backend_message(
+            "failed to receive xdg-desktop-portal secret worker result",
+            "portal worker exited without sending a result",
+        )),
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn run_flatpak_portal_task_async<T, F, Fut>(task: F) -> SecretStoreResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = SecretStoreResult<T>> + 'static,
+{
+    match crate::timeout(FLATPAK_PORTAL_TIMEOUT_MS, task()).await {
+        Ok(result) => result,
+        Err(_) => Err(SecretStoreError::backend_message(
+            "timed out waiting for xdg-desktop-portal secret",
+            format!("portal request exceeded {} ms", FLATPAK_PORTAL_TIMEOUT_MS),
+        )),
+    }
+}
+
+fn retrieve_flatpak_portal_secret() -> SecretStoreResult<Vec<u8>> {
+    run_flatpak_portal_task(|| async {
+        // https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Secret.html
+        ashpd::desktop::secret::retrieve().await.map_err(|err| {
+            SecretStoreError::backend("failed to retrieve xdg-desktop-portal secret", err)
+        })
+    })
+}
+
+// Flatpak uses a stable per-app secret from the portal.
+// Derive a 32-byte app key instead of persisting extra data.
+fn derive_flatpak_secret(portal_secret: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(FLATPAK_SECRET_DERIVE_INFO);
+    hasher.update(portal_secret);
+    hasher.finalize().to_vec()
+}
+
+fn load_flatpak_secret_store_key() -> SecretStoreResult<Vec<u8>> {
+    let portal_secret = retrieve_flatpak_portal_secret()?;
+    Ok(derive_flatpak_secret(&portal_secret))
+}
+
+fn store_flatpak_secret_store_key(secret: &[u8]) -> SecretStoreResult<()> {
+    let expected = load_flatpak_secret_store_key()?;
+    if secret == expected.as_slice() {
+        Ok(())
+    } else {
+        Err(SecretStoreError::backend_message(
+            "Flatpak secret backend is read-only",
+            "requested secret does not match the portal-derived secret",
+        ))
+    }
+}
+
+// KWallet requires UTF-8, so encode secrets as base64.
+fn encode_secret_service_secret(secret: &[u8]) -> Vec<u8> {
+    BASE64_STANDARD.encode(secret).into_bytes()
+}
+
+fn decode_secret_service_secret(secret: Vec<u8>) -> SecretStoreResult<Vec<u8>> {
+    BASE64_STANDARD.decode(secret).map_err(|err| {
+        SecretStoreError::invalid(
+            "failed to decode Linux Secret Service base64 secret",
+            err.to_string(),
+        )
+    })
+}
+
+pub fn load_secret_store_key(service: &str, account: &str) -> SecretStoreResult<Vec<u8>> {
+    // https://specifications.freedesktop.org/secret-service/latest/
+    let attrs = HashMap::from([("service", service), ("account", account)]);
+    let ss = SecretService::connect(EncryptionType::Dh).map_err(|err| {
+        SecretStoreError::backend("failed to connect to Linux Secret Service", err)
+    })?;
+    let search = ss.search_items(attrs).map_err(|err| {
+        SecretStoreError::backend("failed to search Linux Secret Service items", err)
+    })?;
+    if !search.locked.is_empty() {
+        let item_refs: Vec<&Item> = search.locked.iter().collect();
+        ss.unlock_all(item_refs.as_slice()).map_err(|err| {
+            SecretStoreError::backend("failed to unlock Linux Secret Service items", err)
+        })?;
+    }
+
+    let mut saw_item = false;
+    let mut last_invalid = None;
+    let mut last_error = None;
+    for item in search.unlocked.iter().chain(search.locked.iter()) {
+        saw_item = true;
+        match item.get_secret() {
+            Ok(secret) => match decode_secret_service_secret(secret) {
+                Ok(secret) => return Ok(secret),
+                Err(err) => last_invalid = Some(err),
+            },
+            Err(err) => last_error = Some(err.to_string()),
+        }
+    }
+
+    if let Some(err) = last_invalid {
+        Err(err)
+    } else if saw_item {
+        Err(SecretStoreError::backend_message(
+            "failed to read secret from Linux Secret Service",
+            last_error.unwrap_or_else(|| "unknown secret read error".to_owned()),
+        ))
+    } else {
+        Err(SecretStoreError::NotFound)
+    }
+}
+
+pub fn store_secret_store_key(
+    service: &str,
+    account: &str,
+    secret: &[u8],
+) -> SecretStoreResult<()> {
+    // https://specifications.freedesktop.org/secret-service/latest/
+    let attrs = HashMap::from([("service", service), ("account", account)]);
+    let ss = SecretService::connect(EncryptionType::Dh).map_err(|err| {
+        SecretStoreError::backend("failed to connect to Linux Secret Service", err)
+    })?;
+    let collection = ss.get_default_collection().map_err(|err| {
+        SecretStoreError::backend("failed to get Linux Secret Service collection", err)
+    })?;
+    if collection.is_locked().map_err(|err| {
+        SecretStoreError::backend("failed to query Linux Secret Service lock state", err)
+    })? {
+        collection.unlock().map_err(|err| {
+            SecretStoreError::backend("failed to unlock Linux Secret Service collection", err)
+        })?;
+    }
+    let label = format!("{service} {account}");
+    let encoded_secret = encode_secret_service_secret(secret);
+    collection
+        .create_item(&label, attrs, &encoded_secret, true, "text/plain")
+        .map_err(|err| {
+            SecretStoreError::backend("failed to create Linux Secret Service item", err)
+        })?;
+    Ok(())
+}
+
+/// Use Secret Service as the Linux secret backend outside Flatpak.
+///
+/// Do not use the kernel keyutils persistent keyring for RustDesk's master key:
+/// it is not durable and can disappear, causing previously encrypted config to become unreadable.
+pub fn load_secret(service: &str, account: &str) -> SecretStoreResult<Vec<u8>> {
+    if is_flatpak() {
+        let _ = (service, account);
+        return load_flatpak_secret_store_key();
+    }
+    load_secret_store_key(service, account)
+}
+
+pub fn store_secret(service: &str, account: &str, secret: &[u8]) -> SecretStoreResult<()> {
+    if is_flatpak() {
+        let _ = (service, account);
+        return store_flatpak_secret_store_key(secret);
+    }
+    store_secret_store_key(service, account, secret)
 }
 
 #[cfg(test)]

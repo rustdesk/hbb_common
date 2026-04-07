@@ -1,11 +1,30 @@
+#[cfg(target_os = "android")]
+pub mod android;
+#[cfg(target_os = "android")]
+pub(crate) use android::*;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod apple;
+
+#[cfg(target_os = "ios")]
+pub mod ios;
+#[cfg(target_os = "ios")]
+pub(crate) use ios::*;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::*;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::*;
 
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "windows")]
+pub(crate) use windows::*;
 
 #[cfg(not(debug_assertions))]
 use crate::{config::Config, log};

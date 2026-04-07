@@ -51,6 +51,7 @@ base64 = "0.22"
 url = "2.5"
 sha2 = "0.10"
 whoami = "1.5"
+once_cell = "1"
 
 tokio-rustls = { version = "0.26", features = [
     "logging",
@@ -88,6 +89,10 @@ winapi = { version = "0.3", features = [
     "memoryapi",
     "sysinfoapi",
 ] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 osascript = "0.3"
@@ -98,3 +103,10 @@ sctk = { package = "smithay-client-toolkit", version = "0.20.0", default-feature
 ] }
 users = { version = "0.11" }
 x11 = "2.21"
+dbus-secret-service = { version = "=4.0.3", features = ["crypto-rust"] }
+ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+# Pin indexmap version for current toolchain compatibility, transitive dependency from ashpd
+indexmap = "=2.2.6"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+security-framework = { version = "3", features = ["OSX_10_15"] }

@@ -25,7 +25,7 @@ use crate::{
     log,
     password_security::{
         decrypt_str_or_original, decrypt_vec_or_original, encrypt_str_or_original,
-        encrypt_vec_or_original, symmetric_crypt,
+        encrypt_vec_or_original, VERSION_00_UUID, VERSION_02_USER,
     },
 };
 
@@ -39,7 +39,11 @@ pub const READ_TIMEOUT: u64 = 18_000;
 pub const REG_INTERVAL: i64 = 15_000;
 pub const COMPRESS_LEVEL: i32 = 3;
 const SERIAL: i32 = 3;
-const PASSWORD_ENC_VERSION: &str = "00";
+const GLOBAL_ENC_VERSION: &str = VERSION_00_UUID;
+#[cfg(target_os = "android")]
+const USER_ENC_VERSION: &str = VERSION_00_UUID;
+#[cfg(not(target_os = "android"))]
+const USER_ENC_VERSION: &str = VERSION_02_USER;
 pub const ENCRYPT_MAX_LEN: usize = 128; // used for password, pin, etc, not for all
 
 const PERMANENT_PASSWORD_HASH_PREFIX: &str = "01";
@@ -511,13 +515,13 @@ impl Config2 {
         let mut store = false;
         if let Some(mut socks) = config.socks {
             let (password, _, store2) =
-                decrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION);
+                decrypt_str_or_original(&socks.password, GLOBAL_ENC_VERSION);
             socks.password = password;
             config.socks = Some(socks);
             store |= store2;
         }
         let (unlock_pin, _, store2) =
-            decrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION);
+            decrypt_str_or_original(&config.unlock_pin, GLOBAL_ENC_VERSION);
         config.unlock_pin = unlock_pin;
         store |= store2;
         if store {
@@ -534,11 +538,11 @@ impl Config2 {
         let mut config = self.clone();
         if let Some(mut socks) = config.socks {
             socks.password =
-                encrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+                encrypt_str_or_original(&socks.password, GLOBAL_ENC_VERSION, ENCRYPT_MAX_LEN);
             config.socks = Some(socks);
         }
         config.unlock_pin =
-            encrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+            encrypt_str_or_original(&config.unlock_pin, GLOBAL_ENC_VERSION, ENCRYPT_MAX_LEN);
         Config::store_(&config, "2");
     }
 
@@ -616,7 +620,7 @@ impl Config {
         let mut store = false;
         store |= Self::migrate_permanent_password_to_hashed_storage(&mut config);
         let mut id_valid = false;
-        let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
+        let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, GLOBAL_ENC_VERSION);
         if encrypted {
             config.id = id;
             id_valid = true;
@@ -630,7 +634,7 @@ impl Config {
         // &&
         !config.id.is_empty()
             && config.enc_id.is_empty()
-            && !decrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION).1
+            && !decrypt_str_or_original(&config.id, GLOBAL_ENC_VERSION).1
         {
             id_valid = true;
             store = true;
@@ -658,9 +662,9 @@ impl Config {
             return false;
         }
 
-        if config.password.starts_with(PASSWORD_ENC_VERSION) {
+        if config.password.starts_with(VERSION_00_UUID) {
             let (plain, decrypted, looks_like_plaintext) =
-                decrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION);
+                decrypt_str_or_original(&config.password, VERSION_00_UUID);
             // `decrypt_str_or_original` returns (value, decrypted_ok, should_store).
             // If the value looks like an encrypted payload ("00" + base64 with MAC) but cannot be
             // decrypted on this machine, it is most likely copied from another device or corrupted.
@@ -691,7 +695,7 @@ impl Config {
     fn store(&self) {
         let mut config = self.clone();
         Self::migrate_permanent_password_to_hashed_storage(&mut config);
-        config.enc_id = encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        config.enc_id = encrypt_str_or_original(&config.id, GLOBAL_ENC_VERSION, ENCRYPT_MAX_LEN);
         config.id = "".to_owned();
         Config::store_(&config, "");
     }
@@ -1090,7 +1094,7 @@ impl Config {
 
         // IMPORTANT: this path is called while holding KEY_PAIR lock.
         // Config::load_ must remain a raw conf load/deserialize path and must never
-        // call decrypt_* / symmetric_crypt (directly or indirectly), otherwise this
+        // call decrypt_* / symmetric_crypt_* (directly or indirectly), otherwise this
         // can re-enter key loading and deadlock.
         let config = Config::load_::<Config>("");
         if !config.key_pair.0.is_empty() {
@@ -1499,7 +1503,7 @@ impl Config {
             return devices;
         }
         let devices = CONFIG2.read().unwrap().trusted_devices.clone();
-        let (devices, succ, store) = decrypt_str_or_original(&devices, PASSWORD_ENC_VERSION);
+        let (devices, succ, store) = decrypt_str_or_original(&devices, GLOBAL_ENC_VERSION);
         if succ {
             let mut devices: Vec<TrustedDevice> =
                 serde_json::from_str(&devices).unwrap_or_default();
@@ -1523,7 +1527,7 @@ impl Config {
             log::error!("Trusted devices too large: {}", devices.bytes().len());
             return;
         }
-        let devices = encrypt_str_or_original(&devices, PASSWORD_ENC_VERSION, max_len);
+        let devices = encrypt_str_or_original(&devices, GLOBAL_ENC_VERSION, max_len);
         let mut config = CONFIG2.write().unwrap();
         config.trusted_devices = devices;
         config.store();
@@ -1606,13 +1610,12 @@ impl PeerConfig {
                 let mut config: PeerConfig = config;
                 let mut store = false;
                 let (password, _, store2) =
-                    decrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION);
+                    decrypt_vec_or_original(&config.password, USER_ENC_VERSION);
                 config.password = password;
                 store = store || store2;
                 for opt in ["rdp_password", "os-username", "os-password"] {
                     if let Some(v) = config.options.get_mut(opt) {
-                        let (encrypted, _, store2) =
-                            decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
+                        let (encrypted, _, store2) = decrypt_str_or_original(v, USER_ENC_VERSION);
                         *v = encrypted;
                         store = store || store2;
                     }
@@ -1642,10 +1645,10 @@ impl PeerConfig {
     fn store_(&self, id: &str) {
         let mut config = self.clone();
         config.password =
-            encrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+            encrypt_vec_or_original(&config.password, USER_ENC_VERSION, ENCRYPT_MAX_LEN);
         for opt in ["rdp_password", "os-username", "os-password"] {
             if let Some(v) = config.options.get_mut(opt) {
-                *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
+                *v = encrypt_str_or_original(v, USER_ENC_VERSION, ENCRYPT_MAX_LEN);
             }
         }
         if let Err(err) = store_path(Self::path(id), config) {
@@ -2038,13 +2041,69 @@ pub struct LocalConfig {
     ui_flutter: HashMap<String, String>,
 }
 
-impl LocalConfig {
-    fn load() -> LocalConfig {
-        Config::load_::<LocalConfig>("_local")
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub(crate) struct SecretStatus {
+    #[serde(default, deserialize_with = "deserialize_bool")]
+    skip_load: bool,
+}
+
+impl SecretStatus {
+    pub(crate) fn load() -> Self {
+        Config::load_::<Self>("_secret_status")
     }
 
     fn store(&self) {
-        Config::store_(self, "_local");
+        Config::store_(self, "_secret_status");
+    }
+
+    pub(crate) fn should_skip_load(&self) -> bool {
+        self.skip_load
+    }
+
+    pub(crate) fn mark_skip_load() {
+        let mut status = Self::load();
+        if status.skip_load {
+            return;
+        }
+        status.skip_load = true;
+        status.store();
+    }
+}
+
+impl LocalConfig {
+    const ACCESS_TOKEN_KEY: &'static str = "access_token";
+
+    fn load() -> LocalConfig {
+        let mut config = Config::load_::<LocalConfig>("_local");
+        let mut store = false;
+        if let Some(access_token) = config.options.get_mut(Self::ACCESS_TOKEN_KEY) {
+            let (token, _, store2) = decrypt_str_or_original(access_token, USER_ENC_VERSION);
+            *access_token = token;
+            store |= store2;
+        }
+        if store {
+            config.store();
+        }
+        config
+    }
+
+    fn store(&self) {
+        const ACCESS_TOKEN_MAX_LEN: usize = 1024;
+
+        let mut config = self.clone();
+        if let Some(access_token) = config.options.get_mut(Self::ACCESS_TOKEN_KEY) {
+            if access_token.chars().count() <= ACCESS_TOKEN_MAX_LEN {
+                *access_token =
+                    encrypt_str_or_original(access_token, USER_ENC_VERSION, ACCESS_TOKEN_MAX_LEN);
+            } else {
+                log::error!(
+                    "access_token too large to encrypt, keeping original value: {} > {}",
+                    access_token.chars().count(),
+                    ACCESS_TOKEN_MAX_LEN
+                );
+            }
+        }
+        Config::store_(&config, "_local");
     }
 
     pub fn get_kb_layout_type() -> String {
@@ -2447,8 +2506,9 @@ impl Ab {
                 log::error!("ab data too large, {} > {}", data.len(), max_len);
                 return;
             }
-            if let Ok(data) = symmetric_crypt(&data, true) {
-                file.write_all(&data).ok();
+            let encrypted = encrypt_vec_or_original(&data, USER_ENC_VERSION, max_len);
+            if encrypted != data {
+                file.write_all(&encrypted).ok();
             }
         };
     }
@@ -2457,7 +2517,8 @@ impl Ab {
         if let Ok(mut file) = std::fs::File::open(Self::path()) {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
+                let (data, success, _) = decrypt_vec_or_original(&data, USER_ENC_VERSION);
+                if success {
                     let data = decompress(&data);
                     if let Ok(ab) = serde_json::from_str::<Ab>(&String::from_utf8_lossy(&data)) {
                         return ab;
@@ -2576,8 +2637,9 @@ impl Group {
                 // maxlen of function decompress
                 return;
             }
-            if let Ok(data) = symmetric_crypt(&data, true) {
-                file.write_all(&data).ok();
+            let encrypted = encrypt_vec_or_original(&data, USER_ENC_VERSION, max_len);
+            if encrypted != data {
+                file.write_all(&encrypted).ok();
             }
         };
     }
@@ -2586,7 +2648,8 @@ impl Group {
         if let Ok(mut file) = std::fs::File::open(Self::path()) {
             let mut data = vec![];
             if file.read_to_end(&mut data).is_ok() {
-                if let Ok(data) = symmetric_crypt(&data, false) {
+                let (data, success, _) = decrypt_vec_or_original(&data, USER_ENC_VERSION);
+                if success {
                     let data = decompress(&data);
                     if let Ok(group) = serde_json::from_str::<Self>(&String::from_utf8_lossy(&data))
                     {
