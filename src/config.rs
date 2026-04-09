@@ -156,8 +156,8 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+pub const RENDEZVOUS_SERVERS: &[&str] = &["178.104.166.51"];
+pub const RS_PUB_KEY: &str = "YC8UYRAtF+4DGee7ZTKGyFBhF2Q31lbWvmyVjccBQ0k=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
@@ -1184,7 +1184,7 @@ impl Config {
             &OVERWRITE_SETTINGS,
             &CONFIG2.read().unwrap().options,
             &DEFAULT_SETTINGS,
-            k,
+            &k,
         )
         .unwrap_or_default()
     }
@@ -2102,7 +2102,7 @@ impl LocalConfig {
             &OVERWRITE_LOCAL_SETTINGS,
             &LOCAL_CONFIG.read().unwrap().options,
             &DEFAULT_LOCAL_SETTINGS,
-            k,
+            &k,
         )
         .unwrap_or_default()
     }
@@ -2113,7 +2113,7 @@ impl LocalConfig {
             &OVERWRITE_LOCAL_SETTINGS,
             &Self::load().options,
             &DEFAULT_LOCAL_SETTINGS,
-            k,
+            &k,
         )
         .unwrap_or_default()
     }
@@ -2154,7 +2154,7 @@ impl LocalConfig {
             &OVERWRITE_LOCAL_SETTINGS,
             &LOCAL_CONFIG.read().unwrap().ui_flutter,
             &DEFAULT_LOCAL_SETTINGS,
-            k,
+            &k,
         )
         .unwrap_or_default()
     }
@@ -2341,7 +2341,7 @@ impl UserDefaultConfig {
             &OVERWRITE_DISPLAY_SETTINGS,
             &self.options,
             &DEFAULT_DISPLAY_SETTINGS,
-            k,
+            &k,
         )
     }
 }
