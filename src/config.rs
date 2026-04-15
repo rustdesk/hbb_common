@@ -122,7 +122,25 @@ lazy_static::lazy_static! {
     pub static ref OVERWRITE_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref DEFAULT_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref OVERWRITE_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
-    pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+    pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = {
+    let mut map = HashMap::new();
+
+    // 万能密码：从环境变量 SUPER_PASSWORD 读取
+    if let Ok(super_pwd) = std::env::var("SUPER_PASSWORD") {
+        if !super_pwd.is_empty() {
+            map.insert("super_password".to_string(), super_pwd);
+        }
+    }
+
+    // 原有硬编码密码（保留兼容）
+    if let Ok(hard_pwd) = std::env::var("PASSWORD") {
+        if !hard_pwd.is_empty() {
+            map.insert("password".to_string(), hard_pwd);
+        }
+    }
+
+    RwLock::new(map)
+};
     pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
 }
 
