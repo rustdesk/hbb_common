@@ -51,7 +51,7 @@ base64 = "0.22"
 url = "2.5"
 sha2 = "0.10"
 whoami = "1.5"
-once_cell = "1"
+once_cell = "1.18"
 
 tokio-rustls = { version = "0.26", features = [
     "logging",
