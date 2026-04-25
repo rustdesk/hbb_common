@@ -88,10 +88,11 @@ message LoginRequest {
   string my_platform = 13;
   bytes hwid = 14;
   string avatar = 17;
+  bytes easy_access_challenge = 18;
 }
 
 message Terminal {
-  string service_id = 1;  // Service ID for reconnecting to existing session
+  string service_id = 1; // Service ID for reconnecting to existing session
 }
 
 message Auth2FA {
@@ -439,7 +440,7 @@ message FileTransferDigest {
   bool is_upload = 5;
   bool is_identical = 6;
   uint64 transferred_size = 7; // For resume. Indicates the size of the file already transferred
-  bool is_resume = 8;          // For resume. Indicates if the transfer is a resume.
+  bool is_resume = 8; // For resume. Indicates if the transfer is a resume.
                                // `is_resume` can let the controlled side know whether to check the `.digest` file.
                                // When `is_resume` is false, `.digest` exists, the same file does not exist,
                                // the controlled side should not check `.digest`, it should confirm with a new transfer request.
@@ -890,7 +891,7 @@ message ScreenshotResponse {
 
 // Terminal messages - standalone feature like FileAction
 message OpenTerminal {
-  int32 terminal_id = 1;  // 0 for default terminal
+  int32 terminal_id = 1; // 0 for default terminal
   uint32 rows = 2;
   uint32 cols = 3;
 }
@@ -925,7 +926,7 @@ message TerminalOpened {
   bool success = 2;
   string message = 3;
   uint32 pid = 4;
-  string service_id = 5;  // Service ID for persistent sessions
+  string service_id = 5; // Service ID for persistent sessions
   repeated int32 persistent_sessions = 6; // Used to restore the persistent sessions.
 }
 

@@ -15,6 +15,25 @@ enum ConnType {
   TERMINAL = 5;
 }
 
+message EasyAccessTargetBinding {
+  bytes challenge = 1; // opaque controller challenge
+  bytes target_uuid = 2; // controlled device uuid
+  bytes target_pk = 3; // controlled device ed25519 public key
+  bytes grant_id = 4; // one-time server-issued grant id
+}
+
+message EasyAccessManagerApproval {
+  EasyAccessTargetBinding target_binding = 1;
+  bytes manager_signing_pk = 2; // manager ed25519 public key
+  bytes manager_approval_signature = 3; // signature over serialized EasyAccessTargetBinding
+}
+
+message EasyAccessGrant {
+  uint32 version = 1;
+  bytes server_approval_signature = 2; // signature over serialized EasyAccessManagerApproval
+  bytes device_bound_proof = 3; // box(serialized manager approval, derived nonce, server_box_sk, target_box_pk)
+}
+
 message RegisterPeerResponse { bool request_pk = 2; }
 
 message PunchHoleRequest { 
@@ -30,7 +49,8 @@ message PunchHoleRequest {
   bytes socket_addr_v6 = 10;
 }
 
-message ControlPermissions {
+// Data passed from server to controlled device (via PunchHole / FetchLocalAddr / RequestRelay)
+message ControlledConfig {
   enum Permission {
     keyboard = 0;
     remote_printer = 1;
@@ -46,7 +66,8 @@ message ControlPermissions {
     remote_modify = 11;
     privacy_mode = 12;
   }
-  uint64 permissions = 1;
+  uint64 control_permissions = 1;
+  EasyAccessGrant easy_access_grant = 2;
 }
 
 message PunchHole {
@@ -57,7 +78,8 @@ message PunchHole {
   bool force_relay = 5;
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
-  ControlPermissions control_permissions = 8;
+  ControlledConfig controlled_config = 8;
+  bytes request_id = 9;
 }
 
 message TestNatRequest {
@@ -84,6 +106,7 @@ message PunchHoleSent {
   string version = 5;
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
+  bytes request_id = 8;
 }
 
 message RegisterPk {
@@ -108,6 +131,11 @@ message RegisterPkResponse {
   int32 keep_alive = 2;
 }
 
+// Data passed from server to controller (via PunchHoleResponse / RelayResponse)
+message ControllerConfig {
+  bytes easy_access_challenge = 1; // encrypted, opaque to both peers
+}
+
 message PunchHoleResponse {
   bytes socket_addr = 1;
   bytes pk = 2;
@@ -128,6 +156,7 @@ message PunchHoleResponse {
   bool is_udp = 9;
   int32 upnp_port = 10;
   bytes socket_addr_v6 = 11;
+  ControllerConfig controller_config = 12;
 }
 
 message ConfigUpdate {
@@ -144,7 +173,8 @@ message RequestRelay {
   string licence_key = 6;
   ConnType conn_type = 7;
   string token = 8;
-  ControlPermissions control_permissions = 9;
+  ControlledConfig controlled_config = 9;
+  bytes request_id = 10;
 }
 
 message RelayResponse {
@@ -160,6 +190,8 @@ message RelayResponse {
   int32 feedback = 9;
   bytes socket_addr_v6 = 10;
   int32 upnp_port = 11;
+  ControllerConfig controller_config = 12;
+  bytes request_id = 13;
 }
 
 message SoftwareUpdate { string url = 1; }
@@ -172,7 +204,8 @@ message FetchLocalAddr {
   bytes socket_addr = 1;
   string relay_server = 2;
   bytes socket_addr_v6 = 3;
-  ControlPermissions control_permissions = 4;
+  ControlledConfig controlled_config = 4;
+  bytes request_id = 5;
 }
 
 message LocalAddr {
@@ -182,6 +215,7 @@ message LocalAddr {
   string id = 4;
   string version = 5;
   bytes socket_addr_v6 = 6;
+  bytes request_id = 7;
 }
 
 message PeerDiscovery {
