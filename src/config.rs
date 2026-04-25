@@ -164,6 +164,29 @@ pub const RELAY_PORT: i32 = 21117;
 pub const WS_RENDEZVOUS_PORT: i32 = 21118;
 pub const WS_RELAY_PORT: i32 = 21119;
 
+#[inline]
+pub fn is_service_ipc_postfix(postfix: &str) -> bool {
+    // `_service` is a protected cross-user IPC channel used by the root service.
+    //
+    // On Linux Wayland, input injection is implemented via uinput in the root service process.
+    // The user `--server` process must be able to connect to these uinput IPC channels, so they
+    // must share the same IPC parent directory as `_service`.
+    postfix == "_service" || postfix.starts_with("_uinput_")
+}
+
+// Keep Linux/macOS IPC parent directory rules in one place to avoid drift between
+// `ipc_path()` and Linux-only `ipc_path_for_uid()`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[inline]
+fn ipc_parent_dir_for_uid(uid: u32, postfix: &str) -> String {
+    let app_name = APP_NAME.read().unwrap().clone();
+    if is_service_ipc_postfix(postfix) {
+        format!("/tmp/{app_name}-service")
+    } else {
+        format!("/tmp/{app_name}-{uid}")
+    }
+}
+
 macro_rules! serde_field_string {
     ($default_func:ident, $de_func:ident, $default_expr:expr) => {
         fn $default_func() -> String {
@@ -817,17 +840,41 @@ impl Config {
         }
         #[cfg(not(windows))]
         {
+            #[cfg(target_os = "android")]
             use std::os::unix::fs::PermissionsExt;
             #[cfg(target_os = "android")]
             let mut path: PathBuf =
                 format!("{}/{}", *APP_DIR.read().unwrap(), *APP_NAME.read().unwrap()).into();
-            #[cfg(not(target_os = "android"))]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let mut path: PathBuf = {
+                let uid = unsafe { libc::geteuid() as u32 };
+                ipc_parent_dir_for_uid(uid, postfix).into()
+            };
+            #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
             let mut path: PathBuf = format!("/tmp/{}", *APP_NAME.read().unwrap()).into();
-            fs::create_dir(&path).ok();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o0777)).ok();
+            // Android stores IPC sockets under app-controlled directories. Create the IPC parent
+            // dir and enforce the expected mode here. On other Unix platforms, `ipc_path()` is
+            // intentionally side-effect free (no mkdir/chmod); callers should enforce directory and
+            // socket permissions at the IPC server boundary.
+            #[cfg(target_os = "android")]
+            {
+                fs::create_dir_all(&path).ok();
+                let path_mode = if is_service_ipc_postfix(postfix) {
+                    0o0711
+                } else {
+                    0o0700
+                };
+                fs::set_permissions(&path, fs::Permissions::from_mode(path_mode)).ok();
+            }
             path.push(format!("ipc{postfix}"));
             path.to_str().unwrap_or("").to_owned()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn ipc_path_for_uid(uid: u32, postfix: &str) -> String {
+        let parent = ipc_parent_dir_for_uid(uid, postfix);
+        format!("{parent}/ipc{postfix}")
     }
 
     pub fn icon_path() -> PathBuf {
@@ -3471,5 +3518,27 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_uinput_ipc_path_is_shared_across_uids() {
+        const ROOT_UID: u32 = 0;
+        const USER_UID: u32 = 1000;
+
+        let path_root = Config::ipc_path_for_uid(ROOT_UID, "_uinput_keyboard");
+        let path_user = Config::ipc_path_for_uid(USER_UID, "_uinput_keyboard");
+        assert_eq!(path_root, path_user);
+
+        let app_name = APP_NAME.read().unwrap().clone();
+        assert!(
+            path_root.starts_with(&format!("/tmp/{app_name}-service/")),
+            "unexpected uinput ipc path: {}",
+            path_root
+        );
+
+        let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
+        let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
+        assert_ne!(non_service_root, non_service_user);
     }
 }
