@@ -204,6 +204,10 @@ pub fn ipv4_to_ipv6(addr: String, ipv4: bool) -> String {
 }
 
 async fn test_target(target: &str) -> ResultType<SocketAddr> {
+    // Fast path: target is already a literal SocketAddr. Skip the 1s TCP probe.
+    if let Ok(addr) = target.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
     if let Ok(Ok(s)) = super::timeout(1000, tokio::net::TcpStream::connect(target)).await {
         if let Ok(addr) = s.peer_addr() {
             return Ok(addr);
