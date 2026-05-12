@@ -4,6 +4,7 @@ package hbb;
 message RegisterPeer {
   string id = 1;
   int32 serial = 2;
+  string licence_key = 3;
 }
 
 enum ConnType {
@@ -62,6 +63,7 @@ message PunchHole {
 
 message TestNatRequest {
   int32 serial = 1;
+  string licence_key = 2;
 }
 
 // per my test, uint/int has no difference in encoding, int not good for negative, use sint for negative
@@ -92,6 +94,7 @@ message RegisterPk {
   bytes pk = 3;
   string old_id = 4;
   bool no_register_device = 5;
+  string licence_key = 6;
 }
 
 message RegisterPkResponse {
@@ -103,6 +106,8 @@ message RegisterPkResponse {
     INVALID_ID_FORMAT = 5;
     NOT_SUPPORT = 6;
     SERVER_ERROR = 7;
+    LICENSE_MISMATCH = 8;
+    PEER_LIMIT_REACHED = 9;
   }
   Result result = 1;
   int32 keep_alive = 2;
@@ -197,6 +202,7 @@ message PeerDiscovery {
 message OnlineRequest {
   string id = 1;
   repeated string peers = 2;
+  string licence_key = 3;
 }
 
 message OnlineResponse {

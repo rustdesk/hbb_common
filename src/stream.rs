@@ -1,6 +1,6 @@
-use crate::{config, tcp, websocket, ResultType};
 #[cfg(feature = "webrtc")]
 use crate::webrtc;
+use crate::{config, tcp, websocket, ResultType};
 use sodiumoxide::crypto::secretbox::Key;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
@@ -14,6 +14,16 @@ pub enum Stream {
 }
 
 impl Stream {
+    #[inline]
+    pub fn has_secure_transport(&self) -> bool {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(_) => true,
+            Stream::WebSocket(s) => s.has_tls_transport(),
+            Stream::Tcp(_) => false,
+        }
+    }
+
     #[inline]
     pub fn set_send_timeout(&mut self, ms: u64) {
         match self {

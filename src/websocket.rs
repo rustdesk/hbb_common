@@ -36,6 +36,13 @@ pub struct WsFramedStream {
 }
 
 impl WsFramedStream {
+    pub fn has_tls_transport(&self) -> bool {
+        matches!(
+            self.stream.get_ref(),
+            MaybeTlsStream::NativeTls(_) | MaybeTlsStream::Rustls(_)
+        )
+    }
+
     #[inline]
     fn get_connector(
         tls_type: &TlsType,
@@ -380,7 +387,12 @@ pub fn check_ws(endpoint: &str) -> String {
         (format!("{}{}", endpoint_host, domain_path), true)
     };
     let protocol = if is_domain {
-        let api_server = Config::get_option("api-server");
+        let api_server = Config::get_bootstrap_api_server();
+        let api_server = if api_server.is_empty() {
+            Config::get_option("api-server")
+        } else {
+            api_server
+        };
         if api_server.starts_with("https") {
             "wss"
         } else {
