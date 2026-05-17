@@ -29,6 +29,7 @@ message PunchHoleRequest {
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
   string switch_code = 11;
+  string webrtc_sdp_offer = 12;
 }
 
 message ControlPermissions {
@@ -64,6 +65,8 @@ message PunchHole {
   bytes socket_addr_v6 = 7;
   ControlPermissions control_permissions = 8;
   ControlledContext controlled_context = 9;
+  string webrtc_sdp_offer = 10;
+  string requester_id = 11;
 }
 
 message TestNatRequest {
@@ -90,6 +93,7 @@ message PunchHoleSent {
   string version = 5;
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
+  string webrtc_sdp_answer = 8;
 }
 
 message RegisterPk {
@@ -135,6 +139,7 @@ message PunchHoleResponse {
   bool is_udp = 9;
   int32 upnp_port = 10;
   bytes socket_addr_v6 = 11;
+  string webrtc_sdp_answer = 12;
 }
 
 message ConfigUpdate {
@@ -169,6 +174,7 @@ message RelayResponse {
   int32 feedback = 9;
   bytes socket_addr_v6 = 10;
   int32 upnp_port = 11;
+  string webrtc_sdp_answer = 12;
 }
 
 message SoftwareUpdate { string url = 1; }
@@ -240,6 +246,13 @@ message HttpProxyResponse {
   string error = 4;
 }
 
+message IceCandidate {
+  string from_id = 1;
+  string to_id = 2;
+  string session_key = 3;
+  string candidate = 4;
+}
+
 message RendezvousMessage {
   oneof union {
     RegisterPeer register_peer = 6;
@@ -265,5 +278,6 @@ message RendezvousMessage {
     HealthCheck hc = 26;
     HttpProxyRequest http_proxy_request = 27;
     HttpProxyResponse http_proxy_response = 28;
+    IceCandidate ice_candidate = 29;
   }
 }
