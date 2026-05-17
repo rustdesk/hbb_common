@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice::mdns::MulticastDnsMode;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -18,8 +19,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
-use tokio::sync::watch;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::timeout;
 use url::Url;
 
@@ -28,10 +28,19 @@ use crate::protobuf::Message;
 use crate::sodiumoxide::crypto::secretbox::Key;
 use crate::ResultType;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WebRTCConnectionState {
+    Pending,
+    Open,
+    Closed(String),
+}
+
 pub struct WebRTCStream {
     pc: Arc<RTCPeerConnection>,
     stream: Arc<Mutex<Arc<RTCDataChannel>>>,
-    state_notify: watch::Receiver<bool>,
+    state_notify: watch::Receiver<WebRTCConnectionState>,
+    local_ice_rx: Arc<StdMutex<Option<mpsc::UnboundedReceiver<String>>>>,
+    session_key: String,
     send_timeout: u64,
 }
 
@@ -59,6 +68,8 @@ impl Clone for WebRTCStream {
             pc: self.pc.clone(),
             stream: self.stream.clone(),
             state_notify: self.state_notify.clone(),
+            local_ice_rx: self.local_ice_rx.clone(),
+            session_key: self.session_key.clone(),
             send_timeout: self.send_timeout,
         }
     }
@@ -260,16 +271,40 @@ impl WebRTCStream {
             ..Default::default()
         };
 
-        let (notify_tx, notify_rx) = watch::channel(false);
+        let (notify_tx, notify_rx) = watch::channel(WebRTCConnectionState::Pending);
+        let (ice_tx, ice_rx) = mpsc::unbounded_channel::<String>();
         // Create a new RTCPeerConnection
         let pc = Arc::new(api.new_peer_connection(config).await?);
+        let local_ice_tx = ice_tx.clone();
+        pc.on_ice_candidate(Box::new(move |candidate| {
+            let local_ice_tx = local_ice_tx.clone();
+            Box::pin(async move {
+                let Some(candidate) = candidate else {
+                    return;
+                };
+                match candidate.to_json() {
+                    Ok(candidate) => match serde_json::to_string(&candidate) {
+                        Ok(candidate_json) => {
+                            let _ = local_ice_tx.send(candidate_json);
+                        }
+                        Err(err) => {
+                            log::warn!("failed to serialize local ICE candidate: {}", err);
+                        }
+                    },
+                    Err(err) => {
+                        log::warn!("failed to convert local ICE candidate to JSON: {}", err);
+                    }
+                }
+            })
+        }));
+
         let bootstrap_dc = if start_local_offer {
             let dc_open_notify = notify_tx.clone();
             // Create a data channel with label "bootstrap"
             let dc = pc.create_data_channel("bootstrap", None).await?;
             dc.on_open(Box::new(move || {
                 log::debug!("Local data channel bootstrap open.");
-                let _ = dc_open_notify.send(true);
+                let _ = dc_open_notify.send(WebRTCConnectionState::Open);
                 Box::pin(async {})
             }));
             dc
@@ -294,7 +329,7 @@ impl WebRTCStream {
                     *stream_lock = dc.clone();
                     drop(stream_lock);
                     dc.on_open(Box::new(move || {
-                        let _ = dc_open_notify2.send(true);
+                        let _ = dc_open_notify2.send(WebRTCConnectionState::Open);
                         Box::pin(async {})
                     }));
                 })
@@ -314,7 +349,9 @@ impl WebRTCStream {
                     RTCPeerConnectionState::Disconnected
                     | RTCPeerConnectionState::Failed
                     | RTCPeerConnectionState::Closed => {
-                        let _ = on_connection_notify.send(true);
+                        let _ = on_connection_notify.send(WebRTCConnectionState::Closed(
+                            s.to_string(),
+                        ));
                         log::debug!("WebRTC session closing due to disconnected");
                         let stream = stream_for_close2.lock().await.clone();
                         let _ = stream.close().await;
@@ -336,9 +373,7 @@ impl WebRTCStream {
         // process offer/answer
         if start_local_offer {
             let sdp = pc.create_offer(None).await?;
-            let mut gather_complete = pc.gathering_complete_promise().await;
             pc.set_local_description(sdp.clone()).await?;
-            let _ = gather_complete.recv().await;
 
             log::debug!("local offer:\n{}", sdp.sdp);
             // get local sdp key
@@ -348,9 +383,7 @@ impl WebRTCStream {
             let sdp = serde_json::from_str::<RTCSessionDescription>(&remote_offer)?;
             pc.set_remote_description(sdp.clone()).await?;
             let answer = pc.create_answer(None).await?;
-            let mut gather_complete = pc.gathering_complete_promise().await;
             pc.set_local_description(answer).await?;
-            let _ = gather_complete.recv().await;
 
             log::debug!("remote offer:\n{}", sdp.sdp);
             // get remote sdp key
@@ -362,6 +395,8 @@ impl WebRTCStream {
             pc,
             stream,
             state_notify: notify_rx,
+            local_ice_rx: Arc::new(StdMutex::new(Some(ice_rx))),
+            session_key: key.clone(),
             send_timeout: ms_timeout,
         };
         Ok(Self::cache_or_reuse_session(key, webrtc_stream).await)
@@ -384,6 +419,38 @@ impl WebRTCStream {
         log::debug!("WebRTC set remote sdp: {}", offer);
         let sdp = serde_json::from_str::<RTCSessionDescription>(&offer)?;
         self.pc.set_remote_description(sdp).await?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn take_local_ice_rx(&self) -> Option<mpsc::UnboundedReceiver<String>> {
+        self.local_ice_rx.lock().ok().and_then(|mut rx| rx.take())
+    }
+
+    #[inline]
+    pub async fn add_remote_ice_candidate(&self, candidate_json: &str) -> ResultType<()> {
+        if candidate_json.is_empty() {
+            return Ok(());
+        }
+        let candidate = serde_json::from_str::<RTCIceCandidateInit>(candidate_json)?;
+        self.pc.add_ice_candidate(candidate).await?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn session_key(&self) -> &str {
+        &self.session_key
+    }
+
+    pub async fn wait_connected(&mut self, ms: u64) -> ResultType<()> {
+        if ms > 0 {
+            match timeout(Duration::from_millis(ms), self.wait_for_connect_result()).await {
+                Ok(result) => result?,
+                Err(_) => return Err(anyhow::anyhow!("WebRTC wait_connected timeout")),
+            }
+        } else {
+            self.wait_for_connect_result().await?;
+        }
         Ok(())
     }
 
@@ -425,33 +492,30 @@ impl WebRTCStream {
     }
 
     #[inline]
-    async fn wait_for_connect_result(&mut self) {
-        if *self.state_notify.borrow() {
-            return;
+    async fn wait_for_connect_result(&mut self) -> ResultType<()> {
+        loop {
+            match self.state_notify.borrow().clone() {
+                WebRTCConnectionState::Open => return Ok(()),
+                WebRTCConnectionState::Closed(reason) => {
+                    return Err(anyhow::anyhow!("WebRTC connection closed: {}", reason));
+                }
+                WebRTCConnectionState::Pending => {}
+            }
+            self.state_notify.changed().await?;
         }
-        let _ = self.state_notify.changed().await;
     }
 
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
-        if self.send_timeout > 0 {
-            match timeout(
-                Duration::from_millis(self.send_timeout),
-                self.wait_for_connect_result(),
-            )
-            .await
+        if let Err(err) = self.wait_connected(self.send_timeout).await {
+            self.pc.close().await.ok();
+            let kind = if err.to_string().contains("deadline")
+                || err.to_string().contains("timeout")
             {
-                Ok(_) => {}
-                Err(_) => {
-                    self.pc.close().await.ok();
-                    return Err(Error::new(
-                        ErrorKind::TimedOut,
-                        "WebRTC send wait for connect timeout",
-                    )
-                    .into());
-                }
-            }
-        } else {
-            self.wait_for_connect_result().await;
+                ErrorKind::TimedOut
+            } else {
+                ErrorKind::Other
+            };
+            return Err(Error::new(kind, err.to_string()).into());
         }
         let stream = self.stream.lock().await.clone();
         stream.send(&bytes).await?;
@@ -460,7 +524,10 @@ impl WebRTCStream {
 
     #[inline]
     pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
-        self.wait_for_connect_result().await;
+        if let Err(err) = self.wait_for_connect_result().await {
+            self.pc.close().await.ok();
+            return Some(Err(Error::new(ErrorKind::Other, err.to_string())));
+        }
         let stream = self.stream.lock().await.clone();
 
         // TODO reuse buffer?
@@ -853,5 +920,12 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
         old.pc.close().await.ok();
         replacement.pc.close().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_webrtc_wait_connected_timeout() {
+        let mut stream = WebRTCStream::new("", false, 100).await.unwrap();
+        let err = stream.wait_connected(10).await.unwrap_err();
+        assert!(err.to_string().contains("timeout"));
     }
 }
