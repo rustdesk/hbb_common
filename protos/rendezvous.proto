@@ -66,7 +66,7 @@ message PunchHole {
   ControlPermissions control_permissions = 8;
   ControlledContext controlled_context = 9;
   string webrtc_sdp_offer = 10;
-  string requester_id = 11;
+  reserved 11;
 }
 
 message TestNatRequest {
@@ -247,8 +247,8 @@ message HttpProxyResponse {
 }
 
 message IceCandidate {
-  string from_id = 1;
-  string to_id = 2;
+  string id = 1;
+  bytes socket_addr = 2;
   string session_key = 3;
   string candidate = 4;
 }
