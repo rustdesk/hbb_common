@@ -516,12 +516,17 @@ impl Config2 {
 
     fn store(&self) {
         let mut config = self.clone();
+        let stored = Config::load_::<Config2>("2");
         if let Some(mut socks) = config.socks {
+            let stored_password = stored
+                .socks
+                .as_ref()
+                .map(|socks| socks.password.as_str())
+                .unwrap_or_default();
             socks.password =
-                encrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+                keep_encrypted_storage_if_plaintext_unchanged(&socks.password, stored_password);
             config.socks = Some(socks);
         }
-        let stored = Config::load_::<Config2>("2");
         config.unlock_pin =
             keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
         Config::store_(&config, "2");
@@ -716,8 +721,9 @@ impl Config {
         if !config.password.is_empty()
             && decode_permanent_password_h1_from_storage(&config.password).is_none()
         {
+            let stored = Config::load_::<Config>("");
             config.password =
-                encrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+                keep_encrypted_storage_if_plaintext_unchanged(&config.password, &stored.password);
         }
         let (stored_id, encrypted, _) =
             decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
