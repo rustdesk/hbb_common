@@ -20,6 +20,7 @@ message YUV {
 enum Chroma {
   I420 = 0;
   I444 = 1;
+  I400 = 2;
 }
 
 message VideoFrame {

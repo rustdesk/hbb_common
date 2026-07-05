@@ -2380,6 +2380,18 @@ impl UserDefaultConfig {
             keys::OPTION_ENABLE_FILE_COPY_PASTE => self.get_string(key, "Y", vec!["", "N"]),
             keys::OPTION_EDGE_SCROLL_EDGE_THICKNESS => self.get_num_string(key, 100, 20, 150),
             keys::OPTION_TRACKPAD_SPEED => self.get_num_string(key, 100, 10, 1000),
+            keys::OPTION_COLOR_MODE => {
+                let v = self.get_string(key, "i420", vec!["i444", "i400"]);
+                if v == "i420" {
+                    if self.options.get(keys::OPTION_I444) == Some(&"Y".to_string()) {
+                        "i444".to_string()
+                    } else {
+                        "i420".to_string()
+                    }
+                } else {
+                    v
+                }
+            }
             _ => self
                 .get_after(key)
                 .map(|v| v.to_string())
@@ -2867,6 +2879,8 @@ pub mod keys {
     pub const OPTION_PRIVACY_MODE: &str = "privacy_mode";
     pub const OPTION_TOUCH_MODE: &str = "touch-mode";
     pub const OPTION_I444: &str = "i444";
+    // i444 is for backward compatibility
+    pub const OPTION_COLOR_MODE: &str = "color-mode";
     pub const OPTION_REVERSE_MOUSE_WHEEL: &str = "reverse_mouse_wheel";
     pub const OPTION_SWAP_LEFT_RIGHT_MOUSE: &str = "swap-left-right-mouse";
     pub const OPTION_DISPLAYS_AS_INDIVIDUAL_WINDOWS: &str = "displays_as_individual_windows";
