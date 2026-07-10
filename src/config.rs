@@ -938,9 +938,9 @@ impl Config {
         if !s.is_empty() {
             return vec![s];
         }
-        let s = Self::get_option("custom-rendezvous-server");
-        if !s.is_empty() {
-            return vec![s];
+        let custom = Self::get_option("custom-rendezvous-server");
+        if !custom.is_empty() {
+            return Self::merge_with_builtin_servers(vec![custom]);
         }
         let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
         if !s.is_empty() {
@@ -958,6 +958,16 @@ impl Config {
             }
         }
         return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect();
+    }
+
+    fn merge_with_builtin_servers(mut servers: Vec<String>) -> Vec<String> {
+        let builtin: Vec<String> = RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect();
+        for s in builtin {
+            if !servers.contains(&s) {
+                servers.push(s);
+            }
+        }
+        servers
     }
 
     pub fn reset_online() {
