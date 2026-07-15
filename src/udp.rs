@@ -14,7 +14,7 @@ pub enum FramedSocket {
     ProxySocks(Socks5UdpFramed),
 }
 
-fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, std::io::Error> {
+pub(crate) fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, std::io::Error> {
     let socket = match addr {
         SocketAddr::V4(..) => Socket::new(Domain::ipv4(), Type::dgram(), None),
         SocketAddr::V6(..) => Socket::new(Domain::ipv6(), Type::dgram(), None),
@@ -41,6 +41,8 @@ fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, 
     if addr.is_ipv6() && addr.ip().is_unspecified() && addr.port() > 0 {
         socket.set_only_v6(false).ok();
     }
+    // same as tcp.rs: pin the device when an interface is named
+    crate::config::apply_bind_device(&socket, addr.is_ipv4());
     socket.bind(&addr.into())?;
     Ok(socket)
 }

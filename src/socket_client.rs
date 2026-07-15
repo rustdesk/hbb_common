@@ -204,9 +204,20 @@ pub fn ipv4_to_ipv6(addr: String, ipv4: bool) -> String {
 }
 
 async fn test_target(target: &str) -> ResultType<SocketAddr> {
-    if let Ok(Ok(s)) = super::timeout(1000, tokio::net::TcpStream::connect(target)).await {
-        if let Ok(addr) = s.peer_addr() {
-            return Ok(addr);
+    // probe through a socket bound like the real connection will be: an unbound
+    // connect here leaves via the default route, which on a full-tunnel VPN is
+    // exactly the interface a configured bind-interface is meant to avoid.
+    if let Ok(addrs) = tokio::net::lookup_host(target).await {
+        for addr in addrs {
+            let local = Config::get_any_listen_addr(addr.is_ipv4());
+            let Ok(socket) = crate::tcp::new_socket_pinned(local, true, true) else {
+                continue;
+            };
+            if let Ok(Ok(s)) = super::timeout(1000, socket.connect(addr)).await {
+                if let Ok(peer) = s.peer_addr() {
+                    return Ok(peer);
+                }
+            }
         }
     }
     tokio::net::lookup_host(target)
@@ -219,7 +230,9 @@ async fn test_target(target: &str) -> ResultType<SocketAddr> {
 pub async fn new_direct_udp_for(target: &str) -> ResultType<(Arc<UdpSocket>, SocketAddr)> {
     let peer_addr = test_target(target).await?;
     let local_addr = Config::get_any_listen_addr(peer_addr.is_ipv4());
-    let socket = UdpSocket::bind(local_addr).await?;
+    // through udp::new_socket, so the device pinning applies here too; a plain
+    // UdpSocket::bind only gets the source address, not the interface
+    let socket = UdpSocket::from_std(crate::udp::new_socket(local_addr, false, 0)?.into_udp_socket())?;
     Ok((Arc::new(socket), peer_addr))
 }
 
