@@ -23,8 +23,8 @@ use webrtc::stats::StatsReportType;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio::sync::{mpsc, watch, Mutex};
-use tokio::time::timeout;
+use tokio::sync::{mpsc, watch, Mutex, Semaphore};
+use tokio::time::{timeout, timeout_at, Instant};
 use url::Url;
 
 use crate::bytes_codec::MAX_FRAME_LENGTH;
@@ -52,6 +52,9 @@ pub struct WebRTCStream {
     // Detached data channel, cached after the first `detach()` so send/recv do not re-lock and
     // re-fetch it per message. Shared across clones; `detach()` is idempotent.
     detached: Arc<Mutex<Option<Arc<DetachedDataChannel>>>>,
+    // Serialize a complete logical message across clones. Each fragment is a separate SCTP
+    // message, so serializing only individual writes would allow two large messages to interleave.
+    send_gate: Arc<Semaphore>,
     // Receive-side reassembly state, guarded by a single mutex so the fragment accumulator
     // survives `next()` cancellation (e.g. `next_timeout`) instead of losing already-read
     // fragments mid-message. Assumes a single reader, consistent with the rest of the stream API.
@@ -107,6 +110,7 @@ impl Clone for WebRTCStream {
             send_timeout: self.send_timeout,
             relay_only: self.relay_only,
             detached: self.detached.clone(),
+            send_gate: self.send_gate.clone(),
             recv_state: self.recv_state.clone(),
             peer_verified: self.peer_verified.clone(),
         }
@@ -516,6 +520,7 @@ impl WebRTCStream {
             send_timeout: ms_timeout,
             relay_only: force_relay,
             detached: Arc::new(Mutex::new(None)),
+            send_gate: Arc::new(Semaphore::new(1)),
             recv_state: Arc::new(Mutex::new(RecvState::default())),
             peer_verified: Arc::new(AtomicBool::new(false)),
         };
@@ -543,6 +548,18 @@ impl WebRTCStream {
 
     #[inline]
     pub async fn get_local_endpoint(&self) -> ResultType<String> {
+        // Preserve the original one-shot endpoint contract: callers that only exchange this SDP
+        // do not have a separate path for `take_local_ice_rx`, so their endpoint must contain the
+        // gathered host/srflx/relay candidates.
+        let mut gather_complete = self.pc.gathering_complete_promise().await;
+        let _gathering_channel_closed = gather_complete.recv().await;
+        self.get_local_endpoint_trickle().await
+    }
+
+    /// Return the current local description immediately for callers that signal candidates via
+    /// `take_local_ice_rx`. Unlike `get_local_endpoint`, this does not wait for ICE gathering.
+    #[inline]
+    pub async fn get_local_endpoint_trickle(&self) -> ResultType<String> {
         if let Some(local_desc) = self.pc.local_description().await {
             let sdp = serde_json::to_string(&local_desc)?;
             let endpoint = Self::sdp_to_endpoint(&sdp);
@@ -727,23 +744,46 @@ impl WebRTCStream {
 
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
         let send_timeout = self.send_timeout;
+        let send_gate = self.send_gate.clone();
         // Bound the WHOLE data-channel send (wait-for-open + every write) by send_timeout,
-        // mirroring FramedStream. Without this a write can park indefinitely on SCTP
-        // pending-queue backpressure and connection.rs's timeout timer never runs.
+        // including time queued behind another clone. Without this a write can park indefinitely
+        // on SCTP pending-queue backpressure and connection.rs's timeout timer never runs.
         if send_timeout > 0 {
-            match timeout(
-                Duration::from_millis(send_timeout),
-                self.send_bytes_inner(bytes),
-            )
-            .await
-            {
+            let deadline = Instant::now() + Duration::from_millis(send_timeout);
+            let _send_permit = match timeout_at(deadline, send_gate.acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(err)) => {
+                    return Err(Error::new(
+                        ErrorKind::BrokenPipe,
+                        format!("WebRTC send gate closed: {}", err),
+                    )
+                    .into());
+                }
+                Err(_) => {
+                    if let Err(err) = self.pc.close().await {
+                        log::warn!("failed to close WebRTC after send timeout: {}", err);
+                    }
+                    return Err(Error::new(ErrorKind::TimedOut, "WebRTC send timeout").into());
+                }
+            };
+            match timeout_at(deadline, self.send_bytes_inner(bytes)).await {
                 Ok(res) => res,
                 Err(_) => {
-                    self.pc.close().await.ok();
+                    // Keep the logical-message permit while closing so no waiting clone can append
+                    // a new message after a partially-written fragment sequence.
+                    if let Err(err) = self.pc.close().await {
+                        log::warn!("failed to close WebRTC after send timeout: {}", err);
+                    }
                     Err(Error::new(ErrorKind::TimedOut, "WebRTC send timeout").into())
                 }
             }
         } else {
+            let _send_permit = send_gate.acquire_owned().await.map_err(|err| {
+                Error::new(
+                    ErrorKind::BrokenPipe,
+                    format!("WebRTC send gate closed: {}", err),
+                )
+            })?;
             self.send_bytes_inner(bytes).await
         }
     }
@@ -849,7 +889,8 @@ mod tests {
     use crate::config;
     use crate::webrtc::WebRTCStream;
     use crate::webrtc::DEFAULT_ICE_SERVERS;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::Barrier;
     use tokio::time::timeout;
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
@@ -1112,9 +1153,9 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
     async fn connect_loopback() -> (WebRTCStream, WebRTCStream) {
         let mut offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let offer = offerer.get_local_endpoint().await.unwrap();
+        let offer = offerer.get_local_endpoint_trickle().await.unwrap();
         let answerer = WebRTCStream::new(&offer, false, 20000).await.unwrap();
-        let answer = answerer.get_local_endpoint().await.unwrap();
+        let answer = answerer.get_local_endpoint_trickle().await.unwrap();
         offerer.set_remote_endpoint(&answer).await.unwrap();
 
         // Bridge trickle candidates directly between the two peers, both directions.
@@ -1137,6 +1178,26 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let mut answerer = answerer;
         answerer.wait_connected(20000).await.unwrap();
         (offerer, answerer)
+    }
+
+    // One-shot callers exchange only the endpoints and never consume `take_local_ice_rx`.
+    #[tokio::test]
+    async fn test_webrtc_loopback_gathered_endpoints() {
+        let connect = async {
+            let mut offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+            let offer = offerer.get_local_endpoint().await.unwrap();
+            let mut answerer = WebRTCStream::new(&offer, false, 20000).await.unwrap();
+            let answer = answerer.get_local_endpoint().await.unwrap();
+            offerer.set_remote_endpoint(&answer).await.unwrap();
+
+            offerer.wait_connected(20000).await.unwrap();
+            answerer.wait_connected(20000).await.unwrap();
+            offerer.close().await;
+            answerer.close().await;
+        };
+        timeout(Duration::from_secs(40), connect)
+            .await
+            .expect("gathered-endpoint WebRTC loopback did not complete in time");
     }
 
     // In-process offerer<->answerer loopback exercising the send/next data plane that the framing,
@@ -1184,6 +1245,53 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         timeout(Duration::from_secs(40), connect)
             .await
             .expect("webrtc loopback did not complete in time");
+    }
+
+    #[tokio::test]
+    async fn test_webrtc_concurrent_large_sends_preserve_boundaries() {
+        let connect = async {
+            let (offerer, mut answerer) = connect_loopback().await;
+            let mut sender_a = offerer.clone();
+            let mut sender_b = offerer.clone();
+            let expected_a = vec![0xAA; 200_000];
+            let expected_b = vec![0xBB; 200_000];
+            let payload_a = expected_a.clone();
+            let payload_b = expected_b.clone();
+            let barrier = Arc::new(Barrier::new(3));
+
+            let barrier_a = barrier.clone();
+            let send_a = tokio::spawn(async move {
+                barrier_a.wait().await;
+                sender_a.send_raw(payload_a).await
+            });
+            let barrier_b = barrier.clone();
+            let send_b = tokio::spawn(async move {
+                barrier_b.wait().await;
+                sender_b.send_raw(payload_b).await
+            });
+
+            barrier.wait().await;
+            let receive = async {
+                let first = answerer.next().await.unwrap().unwrap();
+                let second = answerer.next().await.unwrap().unwrap();
+                (first, second)
+            };
+            let (send_a, send_b, (first, second)) = tokio::join!(send_a, send_b, receive);
+            send_a.unwrap().unwrap();
+            send_b.unwrap().unwrap();
+
+            let boundaries_preserved = (first.as_ref() == expected_a.as_slice()
+                && second.as_ref() == expected_b.as_slice())
+                || (first.as_ref() == expected_b.as_slice()
+                    && second.as_ref() == expected_a.as_slice());
+            assert!(boundaries_preserved, "concurrent messages were interleaved");
+
+            offerer.close().await;
+            answerer.close().await;
+        };
+        timeout(Duration::from_secs(40), connect)
+            .await
+            .expect("concurrent WebRTC sends did not complete in time");
     }
 
 }
