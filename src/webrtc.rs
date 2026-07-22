@@ -1,28 +1,33 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::stats::StatsReportType;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::timeout;
 use url::Url;
 
+use crate::bytes_codec::MAX_FRAME_LENGTH;
 use crate::config;
 use crate::protobuf::Message;
 use crate::sodiumoxide::crypto::secretbox::Key;
@@ -42,12 +47,41 @@ pub struct WebRTCStream {
     local_ice_rx: Arc<StdMutex<Option<mpsc::UnboundedReceiver<String>>>>,
     session_key: String,
     send_timeout: u64,
+    // Built with Relay-only ICE policy (force_relay): every selected pair goes through TURN.
+    relay_only: bool,
+    // Detached data channel, cached after the first `detach()` so send/recv do not re-lock and
+    // re-fetch it per message. Shared across clones; `detach()` is idempotent.
+    detached: Arc<Mutex<Option<Arc<DetachedDataChannel>>>>,
+    // Receive-side reassembly state, guarded by a single mutex so the fragment accumulator
+    // survives `next()` cancellation (e.g. `next_timeout`) instead of losing already-read
+    // fragments mid-message. Assumes a single reader, consistent with the rest of the stream API.
+    recv_state: Arc<Mutex<RecvState>>,
+    // True once the controller has completed the RustDesk identity binding (DTLS fingerprint
+    // matched to the signed peer id, via `set_key`). DTLS always encrypts; this flag mirrors TCP's
+    // "secured after key exchange" so key-less / unbound WebRTC is not shown as peer-authenticated.
+    peer_verified: Arc<AtomicBool>,
 }
 
-/// Standard maximum message size for WebRTC data channels (RFC 8831, 65535 bytes).
-/// Most browsers, including Chromium, enforce this protocol limit.
-const DATA_CHANNEL_BUFFER_SIZE: u16 = u16::MAX;
+#[derive(Default)]
+struct RecvState {
+    // Accumulated payload of the logical message currently being reassembled.
+    acc: BytesMut,
+    // Reused read scratch buffer, avoiding a per-message allocation.
+    scratch: Vec<u8>,
+}
 
+// The SCTP data channel's 65536-byte max message size is handled by
+// splitting a logical message into fragments carrying a 1-byte header. Fragment payload is kept
+// well under the limit so header+payload never reaches the exact-65536 boundary that the
+// receiver's reassembly would truncate with data loss.
+const MAX_FRAGMENT_PAYLOAD: usize = 60000;
+/// Receive scratch size: must be >= 1 (fragment header) + `MAX_FRAGMENT_PAYLOAD` and fit the
+/// negotiated SCTP max message size.
+const RECV_BUF_SIZE: usize = 64 * 1024;
+/// Fragment header byte: more fragments follow for this logical message.
+const FRAG_MORE: u8 = 1;
+/// Fragment header byte: final (or only) fragment of a logical message.
+const FRAG_END: u8 = 0;
 // use 3 public STUN servers to find out the NAT type, 2 must be the same address but different ports
 // https://stackoverflow.com/questions/72805316/determine-nat-mapping-behaviour-using-two-stun-servers
 // luckily nextcloud supports two ports for STUN
@@ -71,6 +105,10 @@ impl Clone for WebRTCStream {
             local_ice_rx: self.local_ice_rx.clone(),
             session_key: self.session_key.clone(),
             send_timeout: self.send_timeout,
+            relay_only: self.relay_only,
+            detached: self.detached.clone(),
+            recv_state: self.recv_state.clone(),
+            peer_verified: self.peer_verified.clone(),
         }
     }
 }
@@ -128,12 +166,25 @@ impl WebRTCStream {
         Ok(fingerprint.to_string())
     }
 
+    /// Process-local SESSIONS-map key: the DTLS fingerprint prefixed by role. An offerer and an
+    /// answerer that share a fingerprint (a single process connecting to its own id) would
+    /// otherwise collide, handing the offerer back as the answerer. The wire-level `session_key`
+    /// used for ICE-candidate routing stays the bare fingerprint so both peers still match.
+    #[inline]
+    fn cache_key(fingerprint: &str, is_offerer: bool) -> String {
+        format!(
+            "{}:{}",
+            if is_offerer { "offer" } else { "answer" },
+            fingerprint
+        )
+    }
+
     #[inline]
     fn get_key_for_sdp_json(sdp_json: &str) -> ResultType<String> {
         if sdp_json.is_empty() {
             return Ok("".to_string());
         }
-        let sdp = serde_json::from_str::<RTCSessionDescription>(&sdp_json)?;
+        let sdp = serde_json::from_str::<RTCSessionDescription>(sdp_json)?;
         Self::get_key_for_sdp(&sdp)
     }
 
@@ -177,6 +228,17 @@ impl WebRTCStream {
         }
     }
 
+    /// Whether the ICE configuration contains a usable TURN server. A Relay-policy peer
+    /// connection (force_relay) can only gather relay candidates, so without a TURN server it can
+    /// never connect — callers use this to skip building a guaranteed-dead pc.
+    pub fn has_turn_server() -> bool {
+        Self::get_ice_servers().iter().any(|s| {
+            s.urls
+                .iter()
+                .any(|u| u.starts_with("turn:") || u.starts_with("turns:"))
+        })
+    }
+
     #[inline]
     fn get_ice_servers() -> Vec<RTCIceServer> {
         let mut ice_servers = Vec::new();
@@ -217,7 +279,12 @@ impl WebRTCStream {
         force_relay: bool,
         ms_timeout: u64,
     ) -> ResultType<Self> {
-        log::debug!("New webrtc stream to endpoint: {}", remote_endpoint);
+        // The endpoint contains a Base64-encoded SDP with host addresses and live ICE
+        // credentials. Log only its size so debug logs cannot disclose that information.
+        log::debug!(
+            "New webrtc stream (remote endpoint: {} bytes)",
+            remote_endpoint.len()
+        );
         let remote_offer = if remote_endpoint.is_empty() {
             "".into()
         } else {
@@ -225,16 +292,16 @@ impl WebRTCStream {
         };
 
         let mut key = Self::get_key_for_sdp_json(&remote_offer)?;
-        let sessions_lock = SESSIONS.lock().await;
-        if let Some(cached_stream) = sessions_lock.get(&key) {
-            if !key.is_empty() {
+        let start_local_offer = remote_offer.is_empty();
+        if !key.is_empty() {
+            let sessions_lock = SESSIONS.lock().await;
+            if let Some(cached_stream) =
+                sessions_lock.get(&Self::cache_key(&key, start_local_offer))
+            {
                 log::debug!("Start webrtc with cached peer");
                 return Ok(cached_stream.clone());
             }
         }
-        drop(sessions_lock);
-
-        let start_local_offer = remote_offer.is_empty();
         // Create a SettingEngine and enable Detach
         let mut s = SettingEngine::default();
         s.detach_data_channels();
@@ -284,7 +351,14 @@ impl WebRTCStream {
         let bootstrap_dc = if start_local_offer {
             let dc_open_notify = notify_tx.clone();
             // Create a data channel with label "bootstrap"
-            let dc = pc.create_data_channel("bootstrap", None).await?;
+            let dc = match pc.create_data_channel("bootstrap", None).await {
+                Ok(dc) => dc,
+                Err(e) => {
+                    // Close before propagating: the pc is live and would otherwise leak.
+                    pc.close().await.ok();
+                    return Err(e.into());
+                }
+            };
             dc.on_open(Box::new(move || {
                 log::debug!("Local data channel bootstrap open.");
                 let _ = dc_open_notify.send(WebRTCConnectionState::Open);
@@ -321,7 +395,12 @@ impl WebRTCStream {
 
         // This will notify you when the peer has connected/disconnected
         let stream_for_close = stream.clone();
-        let pc_for_close = pc.clone();
+        // Weak, not strong: a handler stored inside the pc that captured a strong
+        // `Arc<RTCPeerConnection>` forms a pc -> internal -> handler -> pc cycle that `close()`
+        // never breaks (it only fires the handler) and no `Drop` clears, permanently leaking every
+        // pc and the ICE-candidate sender's forwarding task. Upgrade inside the handler; if the pc
+        // is already gone there is nothing left in SESSIONS to evict.
+        let pc_for_close = Arc::downgrade(&pc);
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             let stream_for_close2 = stream_for_close.clone();
             let on_connection_notify = notify_tx.clone();
@@ -329,21 +408,35 @@ impl WebRTCStream {
             Box::pin(async move {
                 log::debug!("WebRTC session peer connection state: {}", s);
                 match s {
-                    RTCPeerConnectionState::Disconnected
-                    | RTCPeerConnectionState::Failed
-                    | RTCPeerConnectionState::Closed => {
+                    // `Disconnected` is a transient, recoverable ICE state (webrtc-ice fires it
+                    // after ~5s without consent and returns to `Connected` when traffic resumes).
+                    // Only tear down on the terminal states so a short network blip (Wi-Fi roam,
+                    // sleep/wake, cell handover) does not permanently kill an established session.
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                         let _ = on_connection_notify.send(WebRTCConnectionState::Closed(
                             s.to_string(),
                         ));
-                        log::debug!("WebRTC session closing due to disconnected");
+                        log::debug!("WebRTC session closing due to {}", s);
                         let _ = stream_for_close2.lock().await.close().await;
                         log::debug!("WebRTC session stream closed");
 
+                        let Some(pc_for_close2) = pc_for_close2.upgrade() else {
+                            return;
+                        };
                         let mut sessions_lock = SESSIONS.lock().await;
                         match Self::get_key_for_peer(&pc_for_close2, start_local_offer).await {
-                            Ok(k) => {
-                                sessions_lock.remove(&k);
-                                log::debug!("WebRTC session removed key: {}", k);
+                            Ok(fingerprint) => {
+                                let k = Self::cache_key(&fingerprint, start_local_offer);
+                                // Only evict if the cached entry IS this pc: a duplicate offer
+                                // resolves to the same key, and closing the discarded duplicate pc
+                                // must not remove the live winner sharing that key.
+                                if sessions_lock
+                                    .get(&k)
+                                    .is_some_and(|s| Arc::ptr_eq(&s.pc, &pc_for_close2))
+                                {
+                                    sessions_lock.remove(&k);
+                                    log::debug!("WebRTC session removed key: {}", k);
+                                }
                             }
                             Err(e) => {
                                 log::error!(
@@ -374,31 +467,45 @@ impl WebRTCStream {
         }));
 
         // process offer/answer
-        if start_local_offer {
-            let sdp = pc.create_offer(None).await?;
-            pc.set_local_description(sdp.clone()).await?;
-
-            log::debug!("local offer:\n{}", sdp.sdp);
-            // get local sdp key
-            key = Self::get_key_for_sdp(&sdp)?;
-            log::debug!("Start webrtc with local key: {}", key);
-        } else {
-            let sdp = serde_json::from_str::<RTCSessionDescription>(&remote_offer)?;
-            pc.set_remote_description(sdp.clone()).await?;
-            let answer = pc.create_answer(None).await?;
-            pc.set_local_description(answer).await?;
-
-            log::debug!("remote offer:\n{}", sdp.sdp);
-            // get remote sdp key
-            key = Self::get_key_for_sdp(&sdp)?;
-            log::debug!("Start webrtc with remote key: {}", key);
+        //
+        // Trickle ICE: the local description is returned WITHOUT waiting for candidate gathering
+        // (candidates stream out via `take_local_ice_rx` afterwards), so this block is local-only
+        // work — pc construction, DTLS cert keygen, SDP marshal — at sub-millisecond cost. The
+        // controlled side awaits answer creation inline on its punch-reply critical path and
+        // relies on that: adding any gathering/network wait here would delay the TCP/UDP
+        // hole-punch reply for every connection.
+        // Any failure below leaves a live pc with handlers already registered; its state handler
+        // only fires on a terminal ICE state, so a bare `?`-drop would leak it (remotely
+        // triggerable: a crafted `type:"answer"` offer passes the JSON+fingerprint pre-check but
+        // fails `set_remote_description`). Close the pc before propagating any such error.
+        let offer_answer: ResultType<String> = async {
+            if start_local_offer {
+                let sdp = pc.create_offer(None).await?;
+                pc.set_local_description(sdp.clone()).await?;
+                // SDP carries host/srflx IPs and ICE ufrag/pwd; log only its size, not the body.
+                log::debug!("local offer SDP built ({} bytes)", sdp.sdp.len());
+                let k = Self::get_key_for_sdp(&sdp)?;
+                log::debug!("Start webrtc with local key: {}", k);
+                Ok(k)
+            } else {
+                let sdp = serde_json::from_str::<RTCSessionDescription>(&remote_offer)?;
+                pc.set_remote_description(sdp.clone()).await?;
+                let answer = pc.create_answer(None).await?;
+                pc.set_local_description(answer).await?;
+                log::debug!("remote offer SDP received ({} bytes)", sdp.sdp.len());
+                let k = Self::get_key_for_sdp(&sdp)?;
+                log::debug!("Start webrtc with remote key: {}", k);
+                Ok(k)
+            }
         }
-
-        let mut final_lock = SESSIONS.lock().await;
-        if let Some(session) = final_lock.get(&key) {
-            pc.close().await.ok();
-            return Ok(session.clone());
-        }
+        .await;
+        key = match offer_answer {
+            Ok(k) => k,
+            Err(e) => {
+                pc.close().await.ok();
+                return Err(e);
+            }
+        };
 
         let webrtc_stream = Self {
             pc,
@@ -407,8 +514,30 @@ impl WebRTCStream {
             local_ice_rx: Arc::new(StdMutex::new(Some(ice_rx))),
             session_key: key.clone(),
             send_timeout: ms_timeout,
+            relay_only: force_relay,
+            detached: Arc::new(Mutex::new(None)),
+            recv_state: Arc::new(Mutex::new(RecvState::default())),
+            peer_verified: Arc::new(AtomicBool::new(false)),
         };
-        final_lock.insert(key, webrtc_stream.clone());
+        // Insert into the session cache, but never `await pc.close()` while holding this lock:
+        // `close()` fires the peer-connection-state handler inline, which itself locks SESSIONS,
+        // self-deadlocking the whole process. Resolve any duplicate off-lock.
+        let cache_key = Self::cache_key(&key, start_local_offer);
+        let duplicate = {
+            let mut final_lock = SESSIONS.lock().await;
+            if let Some(session) = final_lock.get(&cache_key) {
+                Some(session.clone())
+            } else {
+                final_lock.insert(cache_key, webrtc_stream.clone());
+                None
+            }
+        };
+        if let Some(session) = duplicate {
+            // A concurrent `new()` already cached an equivalent stream; discard this pc's
+            // resources (off-lock) and return the cached one.
+            webrtc_stream.close().await;
+            return Ok(session);
+        }
         Ok(webrtc_stream)
     }
 
@@ -426,10 +555,56 @@ impl WebRTCStream {
     #[inline]
     pub async fn set_remote_endpoint(&self, endpoint: &str) -> ResultType<()> {
         let offer = Self::get_remote_offer(endpoint)?;
-        log::debug!("WebRTC set remote sdp: {}", offer);
+        log::debug!("WebRTC set remote sdp ({} bytes)", offer.len());
         let sdp = serde_json::from_str::<RTCSessionDescription>(&offer)?;
         self.pc.set_remote_description(sdp).await?;
         Ok(())
+    }
+
+    /// DTLS certificate fingerprint of the local description (this endpoint's own cert).
+    #[inline]
+    pub async fn local_dtls_fingerprint(&self) -> ResultType<String> {
+        Self::get_key_for_peer(&self.pc, true).await
+    }
+
+    /// DTLS certificate fingerprint of the remote description (the peer's cert). webrtc-rs
+    /// verifies the negotiated peer certificate against this fingerprint during the DTLS
+    /// handshake, so once the channel is open a matching fingerprint identifies the peer's cert.
+    #[inline]
+    pub async fn remote_dtls_fingerprint(&self) -> ResultType<String> {
+        Self::get_key_for_peer(&self.pc, false).await
+    }
+
+    /// Whether the established connection runs through a TURN relay: `Some(true)` when the pc is
+    /// Relay-policy (TURN is the only possibility) or the selected ICE candidate pair uses a
+    /// relay candidate; `None` before a pair is selected. Feeds the UI's direct/relayed flag.
+    pub async fn is_relayed(&self) -> Option<bool> {
+        if self.relay_only {
+            return Some(true);
+        }
+        let dtls = self.pc.sctp().transport();
+        dtls.ice_transport().get_selected_candidate_pair().await?;
+
+        // webrtc 0.13 keeps RTCIceCandidatePair's candidates private. Its stats report exposes
+        // the selected (nominated) pair and the corresponding candidate types instead.
+        let stats = self.pc.get_stats().await;
+        let pair = stats.reports.values().find_map(|report| match report {
+            StatsReportType::CandidatePair(pair) if pair.nominated => Some(pair),
+            _ => None,
+        })?;
+        let is_relay = |candidate_id: &str| {
+            matches!(
+                stats.reports.get(candidate_id),
+                Some(
+                    StatsReportType::LocalCandidate(candidate)
+                        | StatsReportType::RemoteCandidate(candidate)
+                ) if RTCIceCandidateType::from(candidate.candidate_type)
+                    == RTCIceCandidateType::Relay
+            )
+        };
+        Some(
+            is_relay(&pair.local_candidate_id) || is_relay(&pair.remote_candidate_id),
+        )
     }
 
     #[inline]
@@ -464,6 +639,19 @@ impl WebRTCStream {
         Ok(())
     }
 
+    /// Explicitly tear down the peer connection.
+    ///
+    /// Dropping a `WebRTCStream` handle is not enough to release the underlying
+    /// `RTCPeerConnection`: the global `SESSIONS` map holds a clone, so the pc (and its
+    /// ICE/DTLS/STUN resources) would stay alive until it happens to reach a terminal ICE
+    /// state. Closing here fires `on_peer_connection_state_change`, which removes the
+    /// `SESSIONS` entry, so callers that abandon a stream (e.g. a raced offerer that lost to
+    /// another transport) should call this to avoid leaking it.
+    #[inline]
+    pub async fn close(&self) {
+        self.pc.close().await.ok();
+    }
+
     #[inline]
     pub fn set_raw(&mut self) {
         // not-supported
@@ -481,14 +669,16 @@ impl WebRTCStream {
 
     #[inline]
     pub fn set_key(&mut self, _key: Key) {
-        // not-supported
-        // WebRTC uses built-in DTLS encryption for secure communication.
-        // DTLS handles key exchange and encryption automatically, so explicit key management is not required.
+        // WebRTC traffic is DTLS-encrypted regardless; the secretbox key is unused.
+        // Callers invoke set_key only after the controller has bound the DTLS fingerprint to the
+        // verified peer identity (or the controlled side has completed the matching handshake).
+        // Mark peer-verified so is_secured() matches TCP's post-key-exchange meaning.
+        self.peer_verified.store(true, Ordering::Release);
     }
 
     #[inline]
     pub fn is_secured(&self) -> bool {
-        true
+        self.peer_verified.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -515,20 +705,73 @@ impl WebRTCStream {
         }
     }
 
-    pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
-        if let Err(err) = self.wait_connected(self.send_timeout).await {
-            self.pc.close().await.ok();
-            let kind = if err.to_string().contains("deadline")
-                || err.to_string().contains("timeout")
-            {
-                ErrorKind::TimedOut
-            } else {
-                ErrorKind::Other
-            };
-            return Err(Error::new(kind, err.to_string()).into());
+    /// Fetch (and cache) the detached data channel. `detach()` is idempotent and returns a
+    /// clone of the same underlying channel, so caching it just avoids re-locking per message.
+    async fn detached_dc(&self) -> ResultType<Arc<DetachedDataChannel>> {
+        {
+            let cache = self.detached.lock().await;
+            if let Some(dc) = cache.as_ref() {
+                return Ok(dc.clone());
+            }
         }
-        let stream = self.stream.lock().await.clone();
-        stream.send(&bytes).await?;
+        let raw = self.stream.lock().await.clone();
+        let dc = raw.detach().await?;
+        let mut cache = self.detached.lock().await;
+        // Another task may have cached it while we were detaching.
+        if let Some(existing) = cache.as_ref() {
+            return Ok(existing.clone());
+        }
+        *cache = Some(dc.clone());
+        Ok(dc)
+    }
+
+    pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
+        let send_timeout = self.send_timeout;
+        // Bound the WHOLE data-channel send (wait-for-open + every write) by send_timeout,
+        // mirroring FramedStream. Without this a write can park indefinitely on SCTP
+        // pending-queue backpressure and connection.rs's timeout timer never runs.
+        if send_timeout > 0 {
+            match timeout(
+                Duration::from_millis(send_timeout),
+                self.send_bytes_inner(bytes),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => {
+                    self.pc.close().await.ok();
+                    Err(Error::new(ErrorKind::TimedOut, "WebRTC send timeout").into())
+                }
+            }
+        } else {
+            self.send_bytes_inner(bytes).await
+        }
+    }
+
+    async fn send_bytes_inner(&mut self, bytes: Bytes) -> ResultType<()> {
+        if bytes.len() > MAX_FRAME_LENGTH {
+            return Err(Error::new(ErrorKind::InvalidInput, "Overflow").into());
+        }
+        self.wait_for_connect_result().await?;
+        let dc = self.detached_dc().await?;
+        let data = bytes.as_ref();
+        let mut offset = 0;
+        // Always emit at least one fragment (a lone FRAG_END header for an empty message), so a
+        // zero-length data-channel message — which the receiver cannot distinguish from EOF — is
+        // never sent.
+        loop {
+            let end = (offset + MAX_FRAGMENT_PAYLOAD).min(data.len());
+            let is_last = end >= data.len();
+            let chunk = &data[offset..end];
+            let mut framed = BytesMut::with_capacity(1 + chunk.len());
+            framed.put_u8(if is_last { FRAG_END } else { FRAG_MORE });
+            framed.put_slice(chunk);
+            dc.write(&framed.freeze()).await?;
+            offset = end;
+            if is_last {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -538,30 +781,53 @@ impl WebRTCStream {
             self.pc.close().await.ok();
             return Some(Err(Error::new(ErrorKind::Other, err.to_string())));
         }
-        let stream = self.stream.lock().await.clone();
-
-        // TODO reuse buffer?
-        let mut buffer = BytesMut::zeroed(DATA_CHANNEL_BUFFER_SIZE as usize);
-        let dc = stream.detach().await.ok()?;
-        let n = match dc.read(&mut buffer).await {
-            Ok(n) => n,
+        let dc = match self.detached_dc().await {
+            Ok(dc) => dc,
             Err(err) => {
+                self.pc.close().await.ok();
+                return Some(Err(Error::new(ErrorKind::Other, err.to_string())));
+            }
+        };
+        // Hold recv_state across the reassembly loop: the accumulator must survive `next()`
+        // cancellation (e.g. next_timeout) so already-read fragments are not lost mid-message.
+        let mut st = self.recv_state.lock().await;
+        if st.scratch.len() < RECV_BUF_SIZE {
+            st.scratch.resize(RECV_BUF_SIZE, 0);
+        }
+        loop {
+            let RecvState { acc, scratch } = &mut *st;
+            let n = match dc.read(scratch.as_mut_slice()).await {
+                Ok(n) => n,
+                Err(err) => {
+                    self.pc.close().await.ok();
+                    return Some(Err(Error::new(
+                        ErrorKind::Other,
+                        format!("data channel read error: {}", err),
+                    )));
+                }
+            };
+            if n == 0 {
+                // Clean EOF: the remote reset the stream or shut its write half. An empty logical
+                // message is represented by a 1-byte header, so it is never confused with EOF.
+                self.pc.close().await.ok();
+                return None;
+            }
+            acc.extend_from_slice(&scratch[1..n]);
+            // Match TCP's maximum frame size while preventing an unbounded FRAG_MORE stream from
+            // exhausting memory.
+            if acc.len() > MAX_FRAME_LENGTH {
+                acc.clear();
                 self.pc.close().await.ok();
                 return Some(Err(Error::new(
                     ErrorKind::Other,
-                    format!("data channel read error: {}", err),
+                    "WebRTC reassembled message exceeded maximum frame size",
                 )));
             }
-        };
-        if n == 0 {
-            self.pc.close().await.ok();
-            return Some(Err(Error::new(
-                ErrorKind::Other,
-                "data channel read exited with 0 bytes",
-            )));
+            if scratch[0] == FRAG_END {
+                let msg = std::mem::take(acc);
+                return Some(Ok(msg));
+            }
         }
-        buffer.truncate(n);
-        Some(Ok(buffer))
     }
 
     #[inline]
@@ -583,6 +849,8 @@ mod tests {
     use crate::config;
     use crate::webrtc::WebRTCStream;
     use crate::webrtc::DEFAULT_ICE_SERVERS;
+    use std::time::Duration;
+    use tokio::time::timeout;
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
     #[test]
@@ -841,4 +1109,81 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let err = stream.wait_connected(10).await.unwrap_err();
         assert!(err.to_string().contains("timeout"));
     }
+
+    async fn connect_loopback() -> (WebRTCStream, WebRTCStream) {
+        let mut offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+        let offer = offerer.get_local_endpoint().await.unwrap();
+        let answerer = WebRTCStream::new(&offer, false, 20000).await.unwrap();
+        let answer = answerer.get_local_endpoint().await.unwrap();
+        offerer.set_remote_endpoint(&answer).await.unwrap();
+
+        // Bridge trickle candidates directly between the two peers, both directions.
+        let mut off_ice = offerer.take_local_ice_rx().unwrap();
+        let mut ans_ice = answerer.take_local_ice_rx().unwrap();
+        let answerer_for_ice = answerer.clone();
+        let offerer_for_ice = offerer.clone();
+        tokio::spawn(async move {
+            while let Some(c) = off_ice.recv().await {
+                let _ = answerer_for_ice.add_remote_ice_candidate(&c).await;
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(c) = ans_ice.recv().await {
+                let _ = offerer_for_ice.add_remote_ice_candidate(&c).await;
+            }
+        });
+
+        offerer.wait_connected(20000).await.unwrap();
+        let mut answerer = answerer;
+        answerer.wait_connected(20000).await.unwrap();
+        (offerer, answerer)
+    }
+
+    // In-process offerer<->answerer loopback exercising the send/next data plane that the framing,
+    // empty-message, and EOF fixes live in. Connects over host candidates (works offline; any
+    // configured/default STUN just fails in the background without blocking the host pair).
+    #[tokio::test]
+    async fn test_webrtc_loopback_roundtrip() {
+        let connect = async {
+            let (mut offerer, mut answerer) = connect_loopback().await;
+
+            // Host-candidate loopback is direct, never TURN-relayed.
+            assert_eq!(offerer.is_relayed().await, Some(false));
+
+            // Small message.
+            offerer.send_raw(b"hello".to_vec()).await.unwrap();
+            let got = answerer.next().await.unwrap().unwrap();
+            assert_eq!(&got[..], b"hello");
+
+            // Empty message: must round-trip as an empty frame, not be seen as EOF.
+            offerer.send_raw(Vec::new()).await.unwrap();
+            let got = answerer.next().await.unwrap().unwrap();
+            assert_eq!(got.len(), 0, "empty message must not be treated as EOF");
+
+            // Payload far above the 64KB single-message cap: must be fragmented and reassembled.
+            let big = vec![0xABu8; 200_000];
+            offerer.send_raw(big.clone()).await.unwrap();
+            let got = answerer.next().await.unwrap().unwrap();
+            assert_eq!(got.len(), big.len(), "large message must survive fragmentation");
+            assert_eq!(&got[..], &big[..]);
+
+            // Reverse direction.
+            answerer.send_raw(b"world".to_vec()).await.unwrap();
+            let got = offerer.next().await.unwrap().unwrap();
+            assert_eq!(&got[..], b"world");
+
+            // Peer close: the other side observes a clean EOF (None) or a close error, never a hang.
+            offerer.close().await;
+            match timeout(Duration::from_secs(10), answerer.next()).await {
+                Ok(None) | Ok(Some(Err(_))) => {}
+                Ok(Some(Ok(b))) => panic!("expected EOF after peer close, got {} bytes", b.len()),
+                Err(_) => panic!("answerer.next() hung after peer close"),
+            }
+            answerer.close().await;
+        };
+        timeout(Duration::from_secs(40), connect)
+            .await
+            .expect("webrtc loopback did not complete in time");
+    }
+
 }

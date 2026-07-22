@@ -38,6 +38,10 @@ message VideoFrame {
 message IdPk {
   string id = 1;
   bytes pk = 2;
+  // DTLS certificate fingerprint of the signer's WebRTC endpoint, signed together with id/pk so
+  // a WebRTC peer's DTLS channel can be bound to its verified identity (defeats a rendezvous/relay
+  // that swaps SDP fingerprints). Empty for non-WebRTC handshakes.
+  string dtls_fingerprint = 3;
 }
 
 message DisplayInfo {
