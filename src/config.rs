@@ -92,7 +92,7 @@ lazy_static::lazy_static! {
     pub static ref APP_DIR: RwLock<String> = Default::default();
 }
 
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
 }
@@ -137,7 +137,10 @@ pub fn is_service_ipc_postfix(postfix: &str) -> bool {
 
 // Keep Linux/macOS IPC parent directory rules in one place to avoid drift between
 // `ipc_path()` and Unix `ipc_path_for_uid()`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    target_os = "macos"
+))]
 #[inline]
 fn ipc_parent_dir_for_uid(uid: u32, postfix: &str) -> String {
     let app_name = APP_NAME.read().unwrap().clone();
@@ -459,7 +462,7 @@ pub fn get_online_state() -> i64 {
     *ONLINE.lock().unwrap().values().max().unwrap_or(&0)
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 fn patch(path: PathBuf) -> PathBuf {
     if let Some(_tmp) = path.to_str() {
         #[cfg(windows)]
@@ -471,7 +474,7 @@ fn patch(path: PathBuf) -> PathBuf {
             .into();
         #[cfg(target_os = "macos")]
         return _tmp.replace("Application Support", "Preferences").into();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             if _tmp == "/root" {
                 if let Ok(user) = crate::platform::linux::run_cmds_trim_newline("whoami") {
@@ -766,9 +769,9 @@ impl Config {
     /// where an attacker can manipulate the environment variable to inject malicious
     /// paths into privileged operations.
     pub fn get_home() -> PathBuf {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
         return PathBuf::from(APP_HOME_DIR.read().unwrap().as_str());
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
         {
             if let Some(path) = dirs_next::home_dir() {
                 patch(path)
@@ -781,13 +784,13 @@ impl Config {
     }
 
     pub fn path<P: AsRef<Path>>(p: P) -> PathBuf {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
         {
             let mut path: PathBuf = APP_DIR.read().unwrap().clone().into();
             path.push(p);
             return path;
         }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
         {
             #[cfg(not(target_os = "macos"))]
             let org = "".to_owned();
@@ -820,7 +823,7 @@ impl Config {
                 return path.clone();
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let mut path = Self::get_home();
             path.push(format!(".local/share/logs/{}", *APP_NAME.read().unwrap()));
@@ -856,23 +859,30 @@ impl Config {
         }
         #[cfg(not(windows))]
         {
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             use std::os::unix::fs::PermissionsExt;
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             let mut path: PathBuf =
                 format!("{}/{}", *APP_DIR.read().unwrap(), *APP_NAME.read().unwrap()).into();
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(
+                all(target_os = "linux", not(target_env = "ohos")),
+                target_os = "macos"
+            ))]
             let mut path: PathBuf = {
                 let uid = unsafe { libc::geteuid() as u32 };
                 ipc_parent_dir_for_uid(uid, postfix).into()
             };
-            #[cfg(not(any(target_os = "android", target_os = "linux", target_os = "macos")))]
+            #[cfg(not(any(
+                target_os = "android",
+                all(target_os = "linux", not(target_env = "ohos")),
+                target_os = "macos"
+            )))]
             let mut path: PathBuf = format!("/tmp/{}", *APP_NAME.read().unwrap()).into();
             // Android stores IPC sockets under app-controlled directories. Create the IPC parent
             // dir and enforce the expected mode here. On other Unix platforms, `ipc_path()` is
             // intentionally side-effect free (no mkdir/chmod); callers should enforce directory and
             // socket permissions at the IPC server boundary.
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             {
                 fs::create_dir_all(&path).ok();
                 let path_mode = if is_service_ipc_postfix(postfix) {
@@ -887,7 +897,10 @@ impl Config {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "macos"
+    ))]
     pub fn ipc_path_for_uid(uid: u32, postfix: &str) -> String {
         let parent = ipc_parent_dir_for_uid(uid, postfix);
         format!("{parent}/ipc{postfix}")
@@ -1020,12 +1033,12 @@ impl Config {
         std::cmp::max(CONFIG2.read().unwrap().serial, SERIAL)
     }
 
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
     fn gen_id() -> Option<String> {
         Self::get_auto_id()
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
     fn gen_id() -> Option<String> {
         let hostname_as_id = BUILTIN_SETTINGS
             .read()
@@ -1047,7 +1060,7 @@ impl Config {
     }
 
     fn get_auto_id() -> Option<String> {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
         {
             return Some(
                 rand::thread_rng()
@@ -1056,7 +1069,7 @@ impl Config {
             );
         }
 
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
         {
             let mut id = 0u32;
             if let Ok(Some(ma)) = mac_address::get_mac_address() {
