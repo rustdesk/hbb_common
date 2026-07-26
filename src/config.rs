@@ -874,6 +874,7 @@ impl Config {
             };
             #[cfg(not(any(
                 target_os = "android",
+                target_env = "ohos",
                 all(target_os = "linux", not(target_env = "ohos")),
                 target_os = "macos"
             )))]
