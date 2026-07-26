@@ -1,3 +1,32 @@
+//! WebRTC transport for RustDesk streams.
+//!
+//! # webrtc crate upgrade checklist
+//!
+//! The webrtc crate version is MSRV-pinned in Cargo.toml (see the comment there). Beyond plain
+//! API compatibility, this module relies on webrtc-rs *internals* that its public API does not
+//! guarantee. All of them were verified against webrtc 0.13 (webrtc-data 0.11, webrtc-sctp 0.12);
+//! re-verify each against the new crate sources when bumping:
+//!
+//! - **Send backpressure is bounded**: `data::DataChannel::write` PARKS when webrtc-sctp's
+//!   PendingQueue is full (byte-counting semaphore, `QUEUE_BYTES_LIMIT` = 128 KiB; permits return
+//!   as chunks drain) and inflight data is cwnd/rwnd-capped (peer default rwnd 1 MiB).
+//!   `send_bytes` depends on this both for bounded memory on slow links and for its
+//!   send_timeout-then-close semantics. If a new version buffers unboundedly instead, video can
+//!   OOM a slow session and the send timeout never fires.
+//! - **Max SCTP message size 65536**: `MAX_FRAGMENT_PAYLOAD` + 1 header byte must stay below it.
+//! - **`detach()` is an idempotent Arc clone with no close-on-drop** (`detached_dc` caches it and
+//!   clones are shared across `WebRTCStream` clones).
+//! - **`on_*` handlers are stored inside the pc**: a handler capturing a strong
+//!   `Arc<RTCPeerConnection>` forms an uncollectable cycle and leaks the pc permanently — see the
+//!   `Arc::downgrade` in `new()`; any newly added handler must follow it.
+//! - **`Disconnected` peer-connection state is transient/recoverable** (ICE consent lapse);
+//!   only `Failed`/`Closed` are treated as terminal by the state handler.
+//! - **Stats-based `is_relayed()`**: `RTCIceCandidatePair`'s candidates are private in 0.13;
+//!   0.17+ makes them `pub`, allowing direct field access instead of the stats scan.
+//!
+//! Then re-run the loopback tests at the bottom of this file (`cargo test --features webrtc
+//! webrtc::tests`).
+
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -742,12 +771,20 @@ impl WebRTCStream {
         Ok(dc)
     }
 
+    /// NOT cancel-safe: dropping this future mid-message (e.g. wrapping it in `select!`/`timeout`)
+    /// can leave a partial fragment sequence on the wire, corrupting reassembly of every later
+    /// message on this stream. A caller that abandons a send must treat the stream as dead and
+    /// close it; the built-in `send_timeout` path below already does (it closes the pc).
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
         let send_timeout = self.send_timeout;
         let send_gate = self.send_gate.clone();
         // Bound the WHOLE data-channel send (wait-for-open + every write) by send_timeout,
         // including time queued behind another clone. Without this a write can park indefinitely
         // on SCTP pending-queue backpressure and connection.rs's timeout timer never runs.
+        // That parking is also what bounds sender memory: webrtc-sctp's PendingQueue admits at
+        // most 128 KiB (byte-counting semaphore) and inflight data is cwnd/rwnd-capped, so a slow
+        // link parks the write here until this timeout closes the pc — TCP-send-timeout
+        // equivalent. Verified against webrtc-sctp 0.12; see the module-level upgrade checklist.
         if send_timeout > 0 {
             let deadline = Instant::now() + Duration::from_millis(send_timeout);
             let _send_permit = match timeout_at(deadline, send_gate.acquire_owned()).await {
