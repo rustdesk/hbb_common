@@ -69,6 +69,26 @@ message OSLogin {
   string password = 2;
 }
 
+message EasyAccessTargetBinding {
+  bytes challenge = 1; // controlled device connection challenge
+  bytes target_uuid = 2; // controlled device uuid
+  bytes target_pk = 3; // controlled device ed25519 public key
+  bytes grant_id = 4; // one-time server-issued grant id
+}
+
+message EasyAccessManagerApproval {
+  EasyAccessTargetBinding target_binding = 1;
+  bytes manager_pk = 2; // manager ed25519 public key
+  bytes manager_approval_signature = 3; // signature over serialized EasyAccessTargetBinding
+  bytes manager_id = 4; // stable manager uuid selected by the server
+}
+
+message EasyAccessGrant {
+  uint32 version = 1;
+  bytes server_approval_signature = 2; // signature over serialized EasyAccessManagerApproval
+  bytes device_bound_proof = 3; // box(serialized manager approval, derived nonce, server_box_sk, target_box_pk)
+}
+
 message LoginRequest {
   string username = 1;
   bytes password = 2;
@@ -88,6 +108,7 @@ message LoginRequest {
   string my_platform = 13;
   bytes hwid = 14;
   string avatar = 17;
+  bytes easy_access_grant_id = 18;
 }
 
 message Terminal {
@@ -329,6 +350,7 @@ message CursorPosition {
 message Hash {
   string salt = 1;
   string challenge = 2;
+  bytes easy_access_challenge = 3;
 }
 
 enum ClipboardFormat {
