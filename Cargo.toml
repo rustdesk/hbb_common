@@ -87,7 +87,7 @@ clap = "4.5.51"
 webrtc = "0.13.0" # keep in lockstep with [dependencies] webrtc (rustc 1.75 pin, see above)
 
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
 users = { version = "0.11" }
 x11 = "2.21"
 

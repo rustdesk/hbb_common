@@ -91,7 +91,7 @@ lazy_static::lazy_static! {
     pub static ref APP_DIR: RwLock<String> = Default::default();
 }
 
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
 }
@@ -321,6 +321,12 @@ pub struct PeerConfig {
     pub privacy_mode: PrivacyMode,
     #[serde(flatten)]
     pub allow_swap_key: AllowSwapKey,
+    #[serde(flatten)]
+    pub allow_swap_ctrl_alt: AllowSwapCtrlAlt,
+    #[serde(flatten)]
+    pub sync_num_lock: SyncNumLock,
+    #[serde(flatten)]
+    pub sync_caps_lock: SyncCapsLock,
     #[serde(default, deserialize_with = "deserialize_vec_i32_string_i32")]
     pub port_forwards: Vec<(i32, String, i32)>,
     #[serde(default, deserialize_with = "deserialize_i32")]
@@ -416,6 +422,9 @@ impl Default for PeerConfig {
             terminal_persistent: Default::default(),
             privacy_mode: Default::default(),
             allow_swap_key: Default::default(),
+            allow_swap_ctrl_alt: Default::default(),
+            sync_num_lock: Default::default(),
+            sync_caps_lock: Default::default(),
             port_forwards: Default::default(),
             direct_failures: Default::default(),
             disable_audio: Default::default(),
@@ -465,7 +474,7 @@ pub fn get_online_state() -> i64 {
     *ONLINE.lock().unwrap().values().max().unwrap_or(&0)
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 fn patch(path: PathBuf) -> PathBuf {
     if let Some(_tmp) = path.to_str() {
         #[cfg(windows)]
@@ -902,9 +911,9 @@ impl Config {
     /// where an attacker can manipulate the environment variable to inject malicious
     /// paths into privileged operations.
     pub fn get_home() -> PathBuf {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
         return PathBuf::from(APP_HOME_DIR.read().unwrap().as_str());
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
         {
             if let Some(path) = dirs_next::home_dir() {
                 patch(path)
@@ -917,13 +926,13 @@ impl Config {
     }
 
     pub fn path<P: AsRef<Path>>(p: P) -> PathBuf {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
         {
             let mut path: PathBuf = APP_DIR.read().unwrap().clone().into();
             path.push(p);
             return path;
         }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
         {
             #[cfg(not(target_os = "macos"))]
             let org = "".to_owned();
@@ -1156,12 +1165,12 @@ impl Config {
         std::cmp::max(CONFIG2.read().unwrap().serial, SERIAL)
     }
 
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
     fn gen_id() -> Option<String> {
         Self::get_auto_id()
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
     fn gen_id() -> Option<String> {
         let hostname_as_id = BUILTIN_SETTINGS
             .read()
@@ -1183,7 +1192,7 @@ impl Config {
     }
 
     fn get_auto_id() -> Option<String> {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
+        #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
         {
             return Some(
                 rand::thread_rng()
@@ -1192,7 +1201,7 @@ impl Config {
             );
         }
 
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
         {
             let mut id = 0u32;
             if let Ok(Some(ma)) = mac_address::get_mac_address() {
@@ -2215,6 +2224,27 @@ serde_field_bool!(
 );
 
 serde_field_bool!(
+    AllowSwapCtrlAlt,
+    "allow_swap_ctrl_alt",
+    default_allow_swap_ctrl_alt,
+    "AllowSwapCtrlAlt::default_allow_swap_ctrl_alt"
+);
+
+serde_field_bool!(
+    SyncNumLock,
+    "sync_num_lock",
+    default_sync_num_lock,
+    "SyncNumLock::default_sync_num_lock"
+);
+
+serde_field_bool!(
+    SyncCapsLock,
+    "sync_caps_lock",
+    default_sync_caps_lock,
+    "SyncCapsLock::default_sync_caps_lock"
+);
+
+serde_field_bool!(
     ViewOnly,
     "view_only",
     default_view_only,
@@ -2473,9 +2503,9 @@ impl UserDefaultConfig {
 
     pub fn get(&self, key: &str) -> String {
         match key {
-            #[cfg(any(target_os = "android", target_os = "ios"))]
+            #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
             keys::OPTION_VIEW_STYLE => self.get_string(key, "adaptive", vec!["original"]),
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
             keys::OPTION_VIEW_STYLE => self.get_string(key, "original", vec!["adaptive"]),
             keys::OPTION_SCROLL_STYLE => {
                 self.get_string(key, "scrollauto", vec!["scrolledge", "scrollbar"])
