@@ -458,7 +458,11 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                     })
                     .format(opt_format)
                     .rotate(
-                        Criterion::Age(Age::Day),
+                        // Size as well as age: rotating only daily lets one day's file grow
+                        // without limit, so whoever can drive a hot log site — a peer sending
+                        // malformed packets, a socket erroring in a retry loop — decides how
+                        // much disk this uses. Bounding it here covers every call site at once.
+                        Criterion::AgeOrSize(Age::Day, 16 * 1024 * 1024),
                         Naming::Timestamps,
                         Cleanup::KeepLogFiles(31),
                     )

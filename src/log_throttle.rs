@@ -45,12 +45,17 @@ impl LogThrottle {
     /// The first occurrence after a quiet period always reports, so an isolated fault is not
     /// delayed by the interval.
     pub fn due(&self) -> Option<u64> {
-        let Ok(mut state) = self.state.lock() else {
-            // A poisoned mutex means another thread panicked mid-update; the count is not worth
-            // propagating that, and staying silent is better than logging per call.
-            return None;
-        };
+        // A poisoned lock only means some other thread panicked while holding it; the guarded
+        // data is two plain counters that are still usable, and going silent for the rest of
+        // the process would be worse than a stale count.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.suppressed += 1;
+        // `map_or(true, ..)` rather than clippy's preferred `is_none_or`: that was stabilized in
+        // Rust 1.82 and this crate builds on the 1.75 pinned by CI.
+        #[allow(clippy::unnecessary_map_or)]
         let due = state
             .last
             .map_or(true, |last| last.elapsed() >= self.interval);
@@ -65,6 +70,21 @@ impl LogThrottle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Two directions of one socket need two throttles: an ICMP error on a connected socket is
+    // reported once and cleared, so the steady state alternates (send succeeds, the next recv
+    // reports it) and anything shared between them is reset by the succeeding side every cycle.
+    #[test]
+    fn separate_throttles_do_not_reset_each_other() {
+        let send = LogThrottle::new(Duration::from_secs(60));
+        let recv = LogThrottle::new(Duration::from_secs(60));
+        assert_eq!(recv.due(), Some(1));
+        for _ in 0..1_000 {
+            // The send side succeeding must not hand the recv side a fresh emit slot.
+            assert_eq!(recv.due(), None);
+        }
+        assert_eq!(send.due(), Some(1), "the other direction keeps its own slot");
+    }
 
     #[test]
     fn first_call_reports_immediately() {
