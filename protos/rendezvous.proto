@@ -66,7 +66,11 @@ message PunchHole {
   ControlPermissions control_permissions = 8;
   ControlledContext controlled_context = 9;
   string webrtc_sdp_offer = 10;
+  // Was `string requester_id = 11`, dropped once ICE routing stopped needing it. Reserved so the
+  // tag is never reassigned: PunchHole is written by the rendezvous server, and an hbbs built
+  // against the earlier field still puts a string here.
   reserved 11;
+  reserved "requester_id";
 }
 
 message TestNatRequest {

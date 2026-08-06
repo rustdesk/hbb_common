@@ -101,7 +101,9 @@ impl Stream {
     }
 
     /// Whether an established WebRTC transport runs through a TURN relay (used for the UI's
-    /// direct/relayed flag). None for non-WebRTC transports or before ICE selects a pair.
+    /// direct/relayed flag). `None` for non-WebRTC transports, and for a non-relay-policy pc
+    /// before ICE selects a pair; a Relay-policy pc answers `Some(true)` straight away — see
+    /// `WebRTCStream::is_relayed`.
     #[inline]
     pub async fn webrtc_relayed(&self) -> Option<bool> {
         match self {

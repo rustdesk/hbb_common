@@ -14,6 +14,14 @@
 //!   send_timeout-then-close semantics. If a new version buffers unboundedly instead, video can
 //!   OOM a slow session and the send timeout never fires.
 //! - **Max SCTP message size 65536**: `MAX_FRAGMENT_PAYLOAD` + 1 header byte must stay below it.
+//! - **The successful read path is cancel-safe**: `read_sctp` dequeues synchronously and returns
+//!   with no `.await` after it, and `read_data_channel` adds none on the user-data path. So
+//!   `next_timeout`, which drops that future routinely, cannot lose a fragment — a version that
+//!   awaited after dequeuing would, undetectably, since the header carries no length or checksum.
+//!   Scope: the *read*. `read_data_channel` does await after dequeuing on its ErrShortBuffer and
+//!   DCEP branches, and `next()` itself awaits `pc.close()` on its error paths — and
+//!   `RTCPeerConnection::close` latches `is_closed` before its first await, so a cancelled close
+//!   silently makes every later close a no-op and leaves the pc in `SESSIONS`.
 //! - **`detach()` is an idempotent Arc clone with no close-on-drop** (`detached_dc` caches it and
 //!   clones are shared across `WebRTCStream` clones).
 //! - **`on_*` handlers are stored inside the pc**: a handler capturing a strong
@@ -84,9 +92,11 @@ pub struct WebRTCStream {
     // Serialize a complete logical message across clones. Each fragment is a separate SCTP
     // message, so serializing only individual writes would allow two large messages to interleave.
     send_gate: Arc<Semaphore>,
-    // Receive-side reassembly state, guarded by a single mutex so the fragment accumulator
-    // survives `next()` cancellation (e.g. `next_timeout`) instead of losing already-read
-    // fragments mid-message. Assumes a single reader, consistent with the rest of the stream API.
+    // Receive-side reassembly state. The accumulator survives a cancelled `next()` because it
+    // lives here behind the Arc, not in the future. The mutex excludes a concurrent reader only
+    // while `next()` is actually running — a cancellation drops the guard mid-message, so it is
+    // the single-reader assumption, not the lock, that ultimately prevents two readers splicing
+    // into one `acc`. Single reader assumed, like the rest of the stream API.
     recv_state: Arc<Mutex<RecvState>>,
     // True once the controller has completed the RustDesk identity binding (DTLS fingerprint
     // matched to the signed peer id, via `set_key`). DTLS always encrypts; this flag mirrors TCP's
@@ -501,16 +511,12 @@ impl WebRTCStream {
 
         // process offer/answer
         //
-        // Trickle ICE: the local description is returned WITHOUT waiting for candidate gathering
-        // (candidates stream out via `take_local_ice_rx` afterwards), so this block is local-only
-        // work — pc construction, DTLS cert keygen, SDP marshal — at sub-millisecond cost. The
-        // controlled side awaits answer creation inline on its punch-reply critical path and
-        // relies on that: adding any gathering/network wait here would delay the TCP/UDP
-        // hole-punch reply for every connection.
-        // Any failure below leaves a live pc with handlers already registered; its state handler
-        // only fires on a terminal ICE state, so a bare `?`-drop would leak it (remotely
-        // triggerable: a crafted `type:"answer"` offer passes the JSON+fingerprint pre-check but
-        // fails `set_remote_description`). Close the pc before propagating any such error.
+        // Trickle ICE: this block is local-only work (pc construction, DTLS keygen, SDP marshal),
+        // no gathering wait. The controlled side awaits answer creation inline on its punch-reply
+        // critical path, so adding a network wait here would delay every hole punch.
+        // A failure below leaves a live pc whose state handler only fires on a terminal ICE state,
+        // so a bare `?`-drop leaks it — remotely triggerable via a crafted `type:"answer"` offer
+        // that passes the pre-check but fails `set_remote_description`. Close before propagating.
         let offer_answer: ResultType<String> = async {
             if start_local_offer {
                 let sdp = pc.create_offer(None).await?;
@@ -575,6 +581,11 @@ impl WebRTCStream {
         Ok(webrtc_stream)
     }
 
+    /// One-shot endpoint: waits for ICE gathering so the SDP already carries the candidates.
+    /// The wait is deliberately unbounded — a deadline here would return a half-gathered SDP and
+    /// defeat the contract; callers needing one should wrap the call or use the trickle variant,
+    /// which both rustdesk signaling paths do. Remaining callers are the loopback tests and
+    /// `examples/webrtc.rs`, neither of which bounds it.
     #[inline]
     pub async fn get_local_endpoint(&self) -> ResultType<String> {
         // Preserve the original one-shot endpoint contract: callers that only exchange this SDP
@@ -621,9 +632,11 @@ impl WebRTCStream {
         Self::get_key_for_peer(&self.pc, false).await
     }
 
-    /// Whether the established connection runs through a TURN relay: `Some(true)` when the pc is
-    /// Relay-policy (TURN is the only possibility) or the selected ICE candidate pair uses a
-    /// relay candidate; `None` before a pair is selected. Feeds the UI's direct/relayed flag.
+    /// Whether the connection runs through a TURN relay; feeds the UI's direct/relayed flag.
+    /// Under Relay policy the answer is known by construction, so that arm returns `Some(true)`
+    /// without consulting ICE — including before a pair is selected, unlike the `None` the other
+    /// arm returns then. Both callers ask post-connection, where the arms agree; making the relay
+    /// arm await a pair would only add a stats round trip.
     pub async fn is_relayed(&self) -> Option<bool> {
         if self.relay_only {
             return Some(true);
@@ -685,14 +698,10 @@ impl WebRTCStream {
         Ok(())
     }
 
-    /// Explicitly tear down the peer connection.
-    ///
-    /// Dropping a `WebRTCStream` handle is not enough to release the underlying
-    /// `RTCPeerConnection`: the global `SESSIONS` map holds a clone, so the pc (and its
-    /// ICE/DTLS/STUN resources) would stay alive until it happens to reach a terminal ICE
-    /// state. Closing here fires `on_peer_connection_state_change`, which removes the
-    /// `SESSIONS` entry, so callers that abandon a stream (e.g. a raced offerer that lost to
-    /// another transport) should call this to avoid leaking it.
+    /// Explicitly tear down the peer connection. Dropping the handle is not enough: `SESSIONS`
+    /// holds a clone, so the pc and its ICE/DTLS resources survive until it happens to reach a
+    /// terminal ICE state. Closing fires the state handler, which evicts the `SESSIONS` entry —
+    /// callers that abandon a stream (e.g. an offerer that lost the transport race) must call it.
     #[inline]
     pub async fn close(&self) {
         self.pc.close().await.ok();
@@ -778,13 +787,11 @@ impl WebRTCStream {
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
         let send_timeout = self.send_timeout;
         let send_gate = self.send_gate.clone();
-        // Bound the WHOLE data-channel send (wait-for-open + every write) by send_timeout,
-        // including time queued behind another clone. Without this a write can park indefinitely
-        // on SCTP pending-queue backpressure and connection.rs's timeout timer never runs.
-        // That parking is also what bounds sender memory: webrtc-sctp's PendingQueue admits at
-        // most 128 KiB (byte-counting semaphore) and inflight data is cwnd/rwnd-capped, so a slow
-        // link parks the write here until this timeout closes the pc — TCP-send-timeout
-        // equivalent. Verified against webrtc-sctp 0.12; see the module-level upgrade checklist.
+        // Bound the WHOLE send (wait-for-open, queueing behind another clone, every write) by
+        // send_timeout: otherwise a write parks indefinitely on SCTP backpressure and
+        // connection.rs's timer never runs. That parking is also what bounds sender memory —
+        // PendingQueue admits 128 KiB and inflight is cwnd/rwnd-capped — so this timeout is the
+        // TCP-send-timeout equivalent. See the checklist entry on send backpressure.
         if send_timeout > 0 {
             let deadline = Instant::now() + Duration::from_millis(send_timeout);
             let _send_permit = match timeout_at(deadline, send_gate.acquire_owned()).await {
@@ -865,8 +872,9 @@ impl WebRTCStream {
                 return Some(Err(Error::new(ErrorKind::Other, err.to_string())));
             }
         };
-        // Hold recv_state across the reassembly loop: the accumulator must survive `next()`
-        // cancellation (e.g. next_timeout) so already-read fragments are not lost mid-message.
+        // Held across the whole loop for exclusion, not for accumulator survival (see the field).
+        // Cancelling mid-`dc.read()` loses no data; cancelling mid-`pc.close()` on an error path
+        // below does leak the pc — see the checklist entry on cancel-safety.
         let mut st = self.recv_state.lock().await;
         if st.scratch.len() < RECV_BUF_SIZE {
             st.scratch.resize(RECV_BUF_SIZE, 0);
@@ -889,18 +897,41 @@ impl WebRTCStream {
                 self.pc.close().await.ok();
                 return None;
             }
+            // Two framing violations, both of which would otherwise be read as "more fragments":
+            // an unrecognized header, and a FRAG_MORE carrying no payload. The latter is the
+            // nastier one — it adds nothing to `acc`, so the MAX_FRAME_LENGTH cap below never
+            // trips and the loop spins for as long as the peer keeps sending. `send_bytes_inner`
+            // emits FRAG_MORE only for a full MAX_FRAGMENT_PAYLOAD chunk, so neither is reachable
+            // from our own sender.
+            let header = scratch[0];
+            let bad = match header {
+                FRAG_END => None,
+                FRAG_MORE if n > 1 => None,
+                FRAG_MORE => Some("FRAG_MORE fragment carries no payload".to_owned()),
+                other => Some(format!("fragment header {other} is neither FRAG_END nor FRAG_MORE")),
+            };
+            if let Some(why) = bad {
+                *acc = BytesMut::new();
+                self.pc.close().await.ok();
+                return Some(Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("WebRTC {why}"),
+                )));
+            }
             acc.extend_from_slice(&scratch[1..n]);
             // Match TCP's maximum frame size while preventing an unbounded FRAG_MORE stream from
             // exhausting memory.
             if acc.len() > MAX_FRAME_LENGTH {
-                acc.clear();
+                // Release the buffer, don't just truncate it: by definition it is at the cap here,
+                // and `recv_state` outlives this call through the `SESSIONS` clone.
+                *acc = BytesMut::new();
                 self.pc.close().await.ok();
                 return Some(Err(Error::new(
-                    ErrorKind::Other,
+                    ErrorKind::InvalidData,
                     "WebRTC reassembled message exceeded maximum frame size",
                 )));
             }
-            if scratch[0] == FRAG_END {
+            if header == FRAG_END {
                 let msg = std::mem::take(acc);
                 return Some(Ok(msg));
             }
@@ -925,7 +956,8 @@ pub fn is_webrtc_endpoint(endpoint: &str) -> bool {
 mod tests {
     use crate::config;
     use crate::webrtc::WebRTCStream;
-    use crate::webrtc::DEFAULT_ICE_SERVERS;
+    use crate::webrtc::{DEFAULT_ICE_SERVERS, FRAG_MORE};
+    use bytes::{BufMut, BytesMut};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::Barrier;
     use tokio::time::timeout;
@@ -1282,6 +1314,48 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         timeout(Duration::from_secs(40), connect)
             .await
             .expect("webrtc loopback did not complete in time");
+    }
+
+    // Both framing violations must end the stream. The empty-FRAG_MORE case is the one that
+    // cannot be caught downstream: it adds nothing to the accumulator, so the MAX_FRAME_LENGTH
+    // cap never trips and `next()` would otherwise spin for as long as the peer keeps writing.
+    // The bad frame is injected mid-message so the branch's `acc` reset is exercised too.
+    #[tokio::test]
+    async fn test_webrtc_rejects_bad_fragment_framing() {
+        // (raw frame, expected substring)
+        let cases: [(&[u8], &str); 2] = [
+            (&[0x2A, b'x'], "fragment header 42"),
+            (&[FRAG_MORE], "carries no payload"),
+        ];
+        for (frame, want) in cases {
+            let connect = async {
+                let (offerer, mut answerer) = connect_loopback().await;
+                let dc = offerer.detached_dc().await.unwrap();
+
+                // Leave a partial message in the accumulator first, so the rejection has
+                // something to discard. `send_bytes` only ever emits valid headers, so the bad
+                // frame itself has to be written through the raw channel below it.
+                let mut lead = BytesMut::with_capacity(1 + 8);
+                lead.put_u8(FRAG_MORE);
+                lead.put_slice(b"leading!");
+                dc.write(&lead.freeze()).await.unwrap();
+                dc.write(&bytes::Bytes::copy_from_slice(frame)).await.unwrap();
+
+                let err = answerer
+                    .next()
+                    .await
+                    .expect("bad framing must surface as an error, not EOF")
+                    .expect_err("bad framing must be rejected");
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+                assert!(err.to_string().contains(want), "unexpected error: {}", err);
+
+                offerer.close().await;
+                answerer.close().await;
+            };
+            timeout(Duration::from_secs(40), connect)
+                .await
+                .expect("webrtc loopback did not complete in time");
+        }
     }
 
     #[tokio::test]
