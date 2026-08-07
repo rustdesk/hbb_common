@@ -464,7 +464,13 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                         // much disk this uses. Bounding it here covers every call site at once.
                         Criterion::AgeOrSize(Age::Day, 16 * 1024 * 1024),
                         Naming::Timestamps,
-                        Cleanup::KeepLogFiles(31),
+                        // Retention is a file count, so adding the size criterion also shortened
+                        // the history a flood can leave behind: the same actor that motivates the
+                        // size cap can now force rotations until every file predating its own
+                        // activity is cleaned up. Keep enough files that ~31 days survives even
+                        // when every one of them is a full 16 MiB — trading a bounded amount of
+                        // disk for not handing an attacker a log-erasure primitive.
+                        Cleanup::KeepLogFiles(31 * 8),
                     )
                     .start()
                     .ok();

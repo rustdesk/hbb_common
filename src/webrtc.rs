@@ -29,8 +29,12 @@
 //!   `Arc::downgrade` in `new()`; any newly added handler must follow it.
 //! - **`Disconnected` peer-connection state is transient/recoverable** (ICE consent lapse);
 //!   only `Failed`/`Closed` are treated as terminal by the state handler.
-//! - **Stats-based `is_relayed()`**: `RTCIceCandidatePair`'s candidates are private in 0.13;
-//!   0.17+ makes them `pub`, allowing direct field access instead of the stats scan.
+//! - **`RTCIceCandidatePair`'s `Display` format**: its candidates are private in 0.13, so
+//!   `is_relayed()` reads the candidate type out of
+//!   `"(local) {protocol} {typ} {addr}:{port}{related} <-> (remote) ..."` by position. 0.17+
+//!   makes the fields `pub`; switch to them and delete the parse. (It cannot use the stats
+//!   report's `nominated` flag instead: webrtc-ice sets that per checklist entry and never
+//!   clears it, so several entries carry it after a pair switch.)
 //!
 //! Then re-run the loopback tests at the bottom of this file (`cargo test --features webrtc
 //! webrtc::tests`).
@@ -55,7 +59,6 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::stats::StatsReportType;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -125,19 +128,19 @@ const FRAG_MORE: u8 = 1;
 const FRAG_END: u8 = 0;
 /// Largest logical message this transport will send or reassemble.
 ///
-/// Deliberately NOT `bytes_codec::MAX_FRAME_LENGTH` (~1 GiB), which this path borrowed: that
-/// bound is affordable for TCP only because its length prefix lets the decoder reject an
-/// oversize frame before buffering a byte of it. This framing carries no length, so the cap can
-/// only be enforced by accumulating up to it — the cap IS the memory an unauthenticated peer can
-/// make a receiver hold, and the answerer is spawned straight off a PunchHole, before any
-/// password check.
+/// Held at parity with TCP on purpose. A transport-specific ceiling would be a trap: the same
+/// session moves between WebRTC and the relay, so a message under TCP's limit but over this one
+/// would work on one path and kill the connection on the other — and it would bite hardest on
+/// exactly the large messages (a keyframe, a big clipboard image) that a direct path exists to
+/// carry. Whatever the right maximum is, both transports need the same one.
 ///
-/// 64 MiB is ~500x the largest block RustDesk actually streams (fs.rs sends 128 KiB blocks; a
-/// video frame or clipboard image is far below that), so no legitimate message can reach it,
-/// while the worst case stays a bounded allocation rather than an OOM. Send and receive share
-/// the constant so the two ends of a same-version pair always agree; raising it is the knob if a
-/// real message ever needs more.
-const MAX_RECV_MESSAGE: usize = 64 * 1024 * 1024;
+/// That leaves a real exposure, shared with TCP and not created here: the cap is the memory an
+/// unauthenticated peer can make a receiver hold, and the answerer runs before any password
+/// check. TCP is no better off — `BytesCodec::new` leaves `max_packet_length` at `usize::MAX`,
+/// so its only bound is the 30-bit length field in the frame header. Tightening it belongs in
+/// one change across both paths, with a number measured against real traffic rather than
+/// guessed; until then this at least holds the peak to the cap instead of twice it.
+const MAX_RECV_MESSAGE: usize = crate::bytes_codec::MAX_FRAME_LENGTH;
 // use 3 public STUN servers to find out the NAT type, 2 must be the same address but different ports
 // https://stackoverflow.com/questions/72805316/determine-nat-mapping-behaviour-using-two-stun-servers
 // luckily nextcloud supports two ports for STUN
@@ -263,30 +266,58 @@ impl WebRTCStream {
 
     #[inline]
     fn get_ice_server_from_url(url: &str) -> Option<RTCIceServer> {
-        // standard url format with turn scheme: turn://user:pass@host:port
-        match Url::parse(url) {
-            Ok(u) => {
-                if u.scheme() == "turn"
-                    || u.scheme() == "turns"
-                    || u.scheme() == "stun"
-                    || u.scheme() == "stuns"
-                {
-                    Some(RTCIceServer {
-                        urls: vec![format!(
-                            "{}:{}:{}",
-                            u.scheme(),
-                            u.host_str().unwrap_or_default(),
-                            u.port().unwrap_or(3478)
-                        )],
-                        username: u.username().to_string(),
-                        credential: u.password().unwrap_or_default().to_string(),
-                        ..Default::default()
-                    })
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
+        let u = Url::parse(url).ok()?;
+        if !matches!(u.scheme(), "turn" | "turns" | "stun" | "stuns") {
+            return None;
+        }
+        // Two spellings are accepted, and they parse very differently:
+        //
+        // - `turn://user:pass@host:port` — non-standard, but the only form that can carry
+        //   credentials. `url` sees an authority and fills host/port/username/password.
+        // - `turn:host:port` — the RFC 7065 form users actually copy from TURN docs. These
+        //   schemes are not special and there is no `//`, so `url` makes it cannot-be-a-base:
+        //   `host_str()` is None and the whole `host:port` lands in the path. Reading it back
+        //   out is what makes this form work at all; it previously produced a hostless
+        //   `turn::3478` that no ICE agent can resolve — while still satisfying
+        //   `has_turn_server()`, so a force_relay peer connection was built against it and
+        //   could only ever time out.
+        let (host, port) = match u.host_str() {
+            Some(host) => (host.to_owned(), u.port().unwrap_or(3478)),
+            None => Self::split_host_port(u.path())?,
+        };
+        if host.is_empty() {
+            return None;
+        }
+        Some(RTCIceServer {
+            urls: vec![format!("{}:{}:{}", u.scheme(), host, port)],
+            username: u.username().to_string(),
+            credential: u.password().unwrap_or_default().to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// Split `host[:port]` from an RFC 7065 URL path, defaulting the port. Bracketed IPv6
+    /// literals keep their brackets, which is the form webrtc-rs re-parses.
+    fn split_host_port(path: &str) -> Option<(String, u16)> {
+        let rest = path.split(['?', '#']).next().unwrap_or_default();
+        if rest.is_empty() {
+            return None;
+        }
+        if let Some(after_open) = rest.strip_prefix('[') {
+            let (host, tail) = after_open.split_once(']')?;
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(3478);
+            return Some((format!("[{host}]"), port));
+        }
+        match rest.rsplit_once(':') {
+            // Only a numeric tail is a port; anything else is part of the host.
+            Some((host, port)) if !host.is_empty() => match port.parse() {
+                Ok(port) => Some((host.to_owned(), port)),
+                Err(_) => Some((rest.to_owned(), 3478)),
+            },
+            _ => Some((rest.to_owned(), 3478)),
         }
     }
 
@@ -295,17 +326,30 @@ impl WebRTCStream {
     /// never connect — callers use this to skip building a guaranteed-dead pc.
     pub fn has_turn_server() -> bool {
         Self::get_ice_servers().iter().any(|s| {
-            s.urls
-                .iter()
-                .any(|u| u.starts_with("turn:") || u.starts_with("turns:"))
+            s.urls.iter().any(|u| {
+                // `scheme:host:port`, built by get_ice_server_from_url. A missing host would
+                // still match the scheme while being unusable, and answering `true` for one of
+                // those is worse than answering `false`: the caller skips its "don't build a
+                // guaranteed-dead Relay-only pc" guard on the strength of it.
+                u.strip_prefix("turn:")
+                    .or_else(|| u.strip_prefix("turns:"))
+                    .is_some_and(|rest| !rest.starts_with(':'))
+            })
         })
     }
 
     #[inline]
     fn get_ice_servers() -> Vec<RTCIceServer> {
-        let mut ice_servers = Vec::new();
-        let cfg = config::Config::get_option(config::keys::OPTION_ICE_SERVERS);
+        Self::parse_ice_servers(&config::Config::get_option(
+            config::keys::OPTION_ICE_SERVERS,
+        ))
+    }
 
+    /// Split out from `get_ice_servers` so parsing can be exercised without touching the
+    /// process-global, on-disk-persisted option — the tests run in parallel threads of one
+    /// process, so a test that rewrote it raced every peer connection another test was building.
+    fn parse_ice_servers(cfg: &str) -> Vec<RTCIceServer> {
+        let mut ice_servers = Vec::new();
         let mut has_stun = false;
 
         for url in cfg.split(',').map(str::trim) {
@@ -356,12 +400,41 @@ impl WebRTCStream {
         let mut key = Self::get_key_for_sdp_json(&remote_offer)?;
         let start_local_offer = remote_offer.is_empty();
         if !key.is_empty() {
-            let sessions_lock = SESSIONS.lock().await;
-            if let Some(cached_stream) =
-                sessions_lock.get(&Self::cache_key(&key, start_local_offer))
-            {
-                log::debug!("Start webrtc with cached peer");
-                return Ok(cached_stream.clone());
+            let cached = {
+                let sessions_lock = SESSIONS.lock().await;
+                sessions_lock
+                    .get(&Self::cache_key(&key, start_local_offer))
+                    .cloned()
+            };
+            if let Some(cached_stream) = cached {
+                // A hit hands back a pc built for the FIRST caller. Two of its properties are
+                // this caller's to decide, so a mismatched entry must not be reused:
+                //
+                // - ICE policy. `rendezvous_mediator` recomputes relay-only per PunchHole, so a
+                //   replayed offer asking for Relay-only would otherwise get back an All-policy
+                //   pc, free to pick a direct pair — and `is_relayed()` would answer from the
+                //   cached handle's own flag, describing a policy nobody asked for.
+                // - liveness. The state handler pushes Closed and closes the stream BEFORE it
+                //   reaches SESSIONS to evict, so there is a window where the map still holds a
+                //   dead pc whose `wait_for_connect_result` errors immediately.
+                //
+                // `peer_verified` is deliberately still shared: it is an identity fact about
+                // this DTLS certificate, not a per-caller setting, and the entry is keyed by
+                // that certificate's fingerprint.
+                let stale = matches!(
+                    *cached_stream.state_notify.borrow(),
+                    WebRTCConnectionState::Closed(_)
+                );
+                if cached_stream.relay_only == force_relay && !stale {
+                    log::debug!("Start webrtc with cached peer");
+                    return Ok(cached_stream);
+                }
+                log::debug!(
+                    "Ignoring cached webrtc peer (relay_only {} != {}, or closed: {})",
+                    cached_stream.relay_only,
+                    force_relay,
+                    stale
+                );
             }
         }
         // Create a SettingEngine and enable Detach
@@ -387,6 +460,14 @@ impl WebRTCStream {
         let (ice_tx, ice_rx) = mpsc::unbounded_channel::<String>();
         // Create a new RTCPeerConnection
         let pc = Arc::new(api.new_peer_connection(config).await?);
+        // This closure is the only owner of the ICE-candidate sender, and `on_*` handlers live
+        // inside the pc: nothing clears them — not `RTCPeerConnection::close`, not the ICE
+        // gatherer's own close — so the sender outlives `close()` and every `SESSIONS` eviction.
+        // The receiver therefore never sees the channel close, and the forwarder task this API
+        // asks callers to write (`while let Some(c) = rx.recv().await { peer.add_remote_ice(..) }`
+        // with a stream clone moved in) parks on `recv()` forever, holding the pc alive with it:
+        // one leaked task plus one leaked peer connection per connection. The terminal-state
+        // handler below drops this closure to break that; see the note there.
         let local_ice_tx = ice_tx.clone();
         pc.on_ice_candidate(Box::new(move |candidate| {
             let local_ice_tx = local_ice_tx.clone();
@@ -516,6 +597,16 @@ impl WebRTCStream {
                         let Some(pc_for_close2) = pc_for_close2.upgrade() else {
                             return;
                         };
+
+                        // Drop the ICE-candidate handler, and with it the only sender for the
+                        // local-candidate channel. Nothing else ever will: `close()` clears no
+                        // handler, so the receiver would stay open forever and a caller's
+                        // forwarder task would park on `recv()` holding a stream clone — keeping
+                        // this pc alive past its own teardown. Replacing the handler with a
+                        // no-op closes the channel, the forwarder's loop ends, and its clone
+                        // goes with it. Gathering is over by this state anyway.
+                        pc_for_close2.on_ice_candidate(Box::new(|_| Box::pin(async {})));
+
                         let mut sessions_lock = SESSIONS.lock().await;
                         match Self::get_key_for_peer(&pc_for_close2, start_local_offer).await {
                             Ok(fingerprint) => {
@@ -724,26 +815,26 @@ impl WebRTCStream {
             return Some(true);
         }
         let dtls = self.pc.sctp().transport();
-        dtls.ice_transport().get_selected_candidate_pair().await?;
+        let pair = dtls.ice_transport().get_selected_candidate_pair().await?;
 
-        // webrtc 0.13 keeps RTCIceCandidatePair's candidates private. Its stats report exposes
-        // the selected (nominated) pair and the corresponding candidate types instead.
-        let stats = self.pc.get_stats().await;
-        let pair = stats.reports.values().find_map(|report| match report {
-            StatsReportType::CandidatePair(pair) if pair.nominated => Some(pair),
-            _ => None,
-        })?;
-        let is_relay = |candidate_id: &str| {
-            matches!(
-                stats.reports.get(candidate_id),
-                Some(
-                    StatsReportType::LocalCandidate(candidate)
-                        | StatsReportType::RemoteCandidate(candidate)
-                ) if RTCIceCandidateType::from(candidate.candidate_type)
-                    == RTCIceCandidateType::Relay
-            )
-        };
-        Some(is_relay(&pair.local_candidate_id) || is_relay(&pair.remote_candidate_id))
+        // Answer from the selected pair, not from the stats report's `nominated` flag: in
+        // webrtc-ice that flag is sticky per checklist entry (set on nomination, never cleared —
+        // a pair switch only clears the agent's own `nominated_pair` slot), and the report
+        // enumerates the whole checklist. After an ICE switch, or on a controlled agent that saw
+        // USE-CANDIDATE more than once, several entries carry it and `HashMap::values()` order
+        // decides the answer — which can differ between two calls in one session.
+        //
+        // 0.13 keeps the pair's candidates private, so read the types out of its `Display`:
+        // "(local) {protocol} {typ} {addr}:{port}{related} <-> (remote) ...". Positionally, not
+        // by substring — an address must not be able to pass for a candidate type. See the
+        // upgrade checklist: 0.17+ exposes the fields and this parse goes away.
+        let relay = RTCIceCandidateType::Relay.to_string();
+        Some(
+            pair.to_string()
+                .split(" <-> ")
+                .filter_map(|side| side.split_whitespace().nth(2))
+                .any(|typ| typ == relay),
+        )
     }
 
     #[inline]
@@ -904,6 +995,18 @@ impl WebRTCStream {
         // PendingQueue admits 128 KiB and inflight is cwnd/rwnd-capped — so this timeout is the
         // TCP-send-timeout equivalent. See the checklist entry on send backpressure.
         if send_timeout > 0 {
+            // Waiting for the connection to open is not this message's progress. Charging it to
+            // the send clock meant that on the first send after signaling, a slow ICE/DTLS
+            // completion ate most of the budget and the write inherited the remainder — then
+            // timed out and closed a peer connection that was an RTT from working. Give it its
+            // own budget and start the send clock once the channel is actually usable.
+            timeout(
+                Duration::from_millis(send_timeout),
+                self.wait_for_connect_result(),
+            )
+            .await
+            .map_err(|_| Error::new(ErrorKind::TimedOut, "WebRTC connect timeout"))??;
+
             let deadline = Instant::now() + Duration::from_millis(send_timeout);
             let send_permit = match timeout_at(deadline, send_gate.acquire_owned()).await {
                 Ok(Ok(permit)) => permit,
@@ -915,8 +1018,11 @@ impl WebRTCStream {
                     .into());
                 }
                 Err(_) => {
-                    self.close_detached();
-                    return Err(Error::new(ErrorKind::TimedOut, "WebRTC send timeout").into());
+                    // Deliberately no teardown: this task never held the permit, so all that
+                    // happened is that another clone is legitimately mid-message. Closing from
+                    // here would abort a healthy sender's fragment sequence — precisely the
+                    // corruption the permit exists to prevent.
+                    return Err(Error::new(ErrorKind::TimedOut, "WebRTC send gate timeout").into());
                 }
             };
             match timeout_at(deadline, self.send_bytes_inner(bytes)).await {
@@ -953,6 +1059,7 @@ impl WebRTCStream {
         // Always emit at least one fragment (a lone FRAG_END header for an empty message), so a
         // zero-length data-channel message — which the receiver cannot distinguish from EOF — is
         // never sent.
+        let mut wrote_any = false;
         loop {
             let end = (offset + MAX_FRAGMENT_PAYLOAD).min(data.len());
             let is_last = end >= data.len();
@@ -960,7 +1067,21 @@ impl WebRTCStream {
             let mut framed = BytesMut::with_capacity(1 + chunk.len());
             framed.put_u8(if is_last { FRAG_END } else { FRAG_MORE });
             framed.put_slice(chunk);
-            dc.write(&framed.freeze()).await?;
+            if let Err(err) = dc.write(&framed.freeze()).await {
+                if wrote_any {
+                    // The sequence stops with fragments already on the wire, so the peer's
+                    // accumulator holds a prefix that will never be terminated — and this framing
+                    // carries no length or sequence number for it to notice with, so the next
+                    // message is appended to the orphan and parsed as one corrupt frame. The
+                    // stream cannot be made consistent again from this side; kill it. (Callers
+                    // wrap sends in allow_err! and keep going, so returning the error alone would
+                    // leave the corruption in place.)
+                    log::warn!("WebRTC send failed mid-message, closing: {}", err);
+                    self.close_detached();
+                }
+                return Err(err.into());
+            }
+            wrote_any = true;
             offset = end;
             if is_last {
                 break;
@@ -1139,26 +1260,57 @@ mod tests {
             None
         );
 
-        config::Config::set_option("ice-servers".to_string(), "".to_string());
+        // RFC 7065 spelling (`turn:host:port`, no authority) — what TURN docs hand out, and
+        // what users paste. `url` cannot-be-a-base's it, so host/port come out of the path;
+        // getting this wrong produced a hostless "turn::3478" that still passed the TURN gate.
+        for (input, expected) in [
+            ("turn:example.com:3478", "turn:example.com:3478"),
+            ("turn:example.com", "turn:example.com:3478"),
+            ("turns:example.com:5349", "turns:example.com:5349"),
+            ("stun:example.com:19302", "stun:example.com:19302"),
+            ("turn:[2001:db8::1]:3478", "turn:[2001:db8::1]:3478"),
+            ("turn:[2001:db8::1]", "turn:[2001:db8::1]:3478"),
+            (
+                "turn:example.com:3478?transport=udp",
+                "turn:example.com:3478",
+            ),
+        ] {
+            assert_eq!(
+                WebRTCStream::get_ice_server_from_url(input)
+                    .unwrap_or_default()
+                    .urls[0],
+                expected,
+                "parsing {input}"
+            );
+        }
+        assert_eq!(WebRTCStream::get_ice_server_from_url("turn:"), None);
+
+        // The gate must not green-light an unusable server: a hostless entry makes the caller
+        // skip its "don't build a guaranteed-dead Relay-only pc" guard.
+        assert!(!WebRTCStream::parse_ice_servers("turn:")
+            .iter()
+            .any(|s| s.urls.iter().any(|u| u.starts_with("turn:"))));
+    }
+
+    // Parsing is exercised through `parse_ice_servers`, never by rewriting the global
+    // `ice-servers` option: `set_option` persists to the real config file and the tests share
+    // one process, so mutating it raced every peer connection the loopback tests were building.
+    #[test]
+    fn test_webrtc_ice_server_list() {
         assert_eq!(
-            WebRTCStream::get_ice_servers()[0].urls[0],
+            WebRTCStream::parse_ice_servers("")[0].urls[0],
             DEFAULT_ICE_SERVERS[0].to_string()
         );
 
-        config::Config::set_option(
-            "ice-servers".to_string(),
-            ",stun://example.com,turn://example.com,sdf".to_string(),
-        );
-        assert_eq!(
-            WebRTCStream::get_ice_servers()[0].urls[0],
-            "stun:example.com:3478"
-        );
-        assert_eq!(
-            WebRTCStream::get_ice_servers()[1].urls[0],
-            "turn:example.com:3478"
-        );
-        assert_eq!(WebRTCStream::get_ice_servers().len(), 2);
-        config::Config::set_option("ice-servers".to_string(), "".to_string());
+        let parsed = WebRTCStream::parse_ice_servers(",stun://example.com,turn://example.com,sdf");
+        assert_eq!(parsed[0].urls[0], "stun:example.com:3478");
+        assert_eq!(parsed[1].urls[0], "turn:example.com:3478");
+        assert_eq!(parsed.len(), 2);
+
+        // TURN-only config still gets the default STUN servers prepended.
+        let turn_only = WebRTCStream::parse_ice_servers("turn:example.com:3478");
+        assert_eq!(turn_only[0].urls[0], DEFAULT_ICE_SERVERS[0].to_string());
+        assert_eq!(turn_only[1].urls[0], "turn:example.com:3478");
     }
 
     #[test]
@@ -1433,6 +1585,32 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("detached close never evicted the peer connection from SESSIONS");
+    }
+
+    // The local-candidate channel must close when the pc does. Its only sender lives inside the
+    // on_ice_candidate handler, which close() does not clear, so without the teardown the
+    // receiver stays open forever — and the forwarder loop this API asks callers to write holds
+    // a stream clone while parked on recv(), keeping the pc alive past its own close.
+    #[tokio::test]
+    async fn test_local_ice_channel_closes_with_the_peer_connection() {
+        let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+        let mut ice_rx = offerer.take_local_ice_rx().unwrap();
+
+        // Exactly the loop every consumer writes, holding a clone of the stream.
+        let forwarder_stream = offerer.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(candidate) = ice_rx.recv().await {
+                let _ = forwarder_stream.add_remote_ice_candidate(&candidate).await;
+            }
+        });
+
+        offerer.close().await;
+        drop(offerer);
+
+        tokio::time::timeout(Duration::from_secs(20), forwarder)
+            .await
+            .expect("forwarder task outlived the peer connection")
+            .unwrap();
     }
 
     // Extra channels opened after the bootstrap one must not displace it: rebinding would leave
