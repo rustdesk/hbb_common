@@ -64,7 +64,6 @@ use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant};
 use url::Url;
 
-use crate::bytes_codec::MAX_FRAME_LENGTH;
 use crate::config;
 use crate::protobuf::Message;
 use crate::sodiumoxide::crypto::secretbox::Key;
@@ -124,6 +123,21 @@ const RECV_BUF_SIZE: usize = 64 * 1024;
 const FRAG_MORE: u8 = 1;
 /// Fragment header byte: final (or only) fragment of a logical message.
 const FRAG_END: u8 = 0;
+/// Largest logical message this transport will send or reassemble.
+///
+/// Deliberately NOT `bytes_codec::MAX_FRAME_LENGTH` (~1 GiB), which this path borrowed: that
+/// bound is affordable for TCP only because its length prefix lets the decoder reject an
+/// oversize frame before buffering a byte of it. This framing carries no length, so the cap can
+/// only be enforced by accumulating up to it — the cap IS the memory an unauthenticated peer can
+/// make a receiver hold, and the answerer is spawned straight off a PunchHole, before any
+/// password check.
+///
+/// 64 MiB is ~500x the largest block RustDesk actually streams (fs.rs sends 128 KiB blocks; a
+/// video frame or clipboard image is far below that), so no legitimate message can reach it,
+/// while the worst case stays a bounded allocation rather than an OOM. Send and receive share
+/// the constant so the two ends of a same-version pair always agree; raising it is the knob if a
+/// real message ever needs more.
+const MAX_RECV_MESSAGE: usize = 64 * 1024 * 1024;
 // use 3 public STUN servers to find out the NAT type, 2 must be the same address but different ports
 // https://stackoverflow.com/questions/72805316/determine-nat-mapping-behaviour-using-two-stun-servers
 // luckily nextcloud supports two ports for STUN
@@ -424,12 +438,44 @@ impl WebRTCStream {
             // Register data channel creation handling
             let dc_open_notify = notify_tx.clone();
             let stream_for_dc = stream.clone();
+            // The remote may open any number of channels; only the first is ever bound.
+            let dc_bound = Arc::new(AtomicBool::new(false));
             pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
                 let d_label = dc.label().to_owned();
                 let dc_open_notify2 = dc_open_notify.clone();
                 let stream_for_dc_clone = stream_for_dc.clone();
-                log::debug!("Remote data channel {} ready", d_label);
+                let dc_bound = dc_bound.clone();
                 Box::pin(async move {
+                    // Reassembly spans data-channel messages, so it is sound only on an ordered,
+                    // fully-reliable channel: the 1-byte fragment header carries no sequence
+                    // number, so a reorder splices fragments into a well-formed but wrong
+                    // message, and a dropped fragment merges two messages instead of erroring.
+                    // webrtc-rs derives these parameters entirely from the REMOTE's DCEP OPEN
+                    // (`channel_type` picks ordered / max_retransmits / max_packet_life_time),
+                    // and this pc is built from an unauthenticated offer, so the peer would
+                    // otherwise choose our reassembly's correctness conditions for us.
+                    if !dc.ordered()
+                        || dc.max_retransmits().is_some()
+                        || dc.max_packet_lifetime().is_some()
+                    {
+                        log::warn!(
+                            "Rejecting WebRTC data channel {}: not ordered and fully reliable",
+                            d_label
+                        );
+                        let _ = dc.close().await;
+                        return;
+                    }
+                    // Bind the first channel only. `detached` caches the first detached handle
+                    // for the life of the stream, so rebinding would leave teardown closing a
+                    // channel that send/recv no longer use; worse, a second channel's `on_open`
+                    // would push Open onto the same watch and re-arm a session already latched
+                    // Closed — and that watch gates both `send_bytes_inner` and `next()`.
+                    if dc_bound.swap(true, Ordering::SeqCst) {
+                        log::warn!("Ignoring extra WebRTC data channel {}", d_label);
+                        let _ = dc.close().await;
+                        return;
+                    }
+                    log::debug!("Remote data channel {} ready", d_label);
                     let mut stream_lock = stream_for_dc_clone.lock().await;
                     *stream_lock = dc.clone();
                     drop(stream_lock);
@@ -741,6 +787,37 @@ impl WebRTCStream {
         self.pc.close().await.ok();
     }
 
+    /// Tear the pc down on the runtime instead of awaiting it here, keeping `keep` alive until
+    /// the teardown finishes.
+    ///
+    /// Every caller polls `next()` — and often `send_bytes` — inside a `tokio::select!`, so an
+    /// `.await` on these paths is a cancellation point, and a competing arm (connection.rs and
+    /// io_loop.rs both run a 1s timer next to the read) routinely wins one. That is fatal to a
+    /// close: `RTCPeerConnection::close` latches `is_closed` before its first await and fires
+    /// the state handler only at the very end, so a cancelled close leaves a pc no later
+    /// `close()` can retry (they early-return on `is_closed`), whose `SESSIONS` entry — evicted
+    /// only from that handler — is stranded for the life of the process, and whose
+    /// `state_notify` never reaches `Closed`, leaving `wait_for_connect_result` reporting a live
+    /// connection on a dead pc.
+    ///
+    /// `keep` carries anything whose lifetime must span the teardown rather than the caller's:
+    /// the send path passes its logical-message permit, so no waiting clone can append to a
+    /// partially-written fragment sequence while the close is still in flight.
+    fn close_detached_with<T: Send + 'static>(&self, keep: T) {
+        let pc = self.pc.clone();
+        tokio::spawn(async move {
+            let _keep = keep;
+            if let Err(err) = pc.close().await {
+                log::debug!("WebRTC background close failed: {}", err);
+            }
+        });
+    }
+
+    #[inline]
+    fn close_detached(&self) {
+        self.close_detached_with(());
+    }
+
     #[inline]
     pub fn set_raw(&mut self) {
         // not-supported
@@ -828,7 +905,7 @@ impl WebRTCStream {
         // TCP-send-timeout equivalent. See the checklist entry on send backpressure.
         if send_timeout > 0 {
             let deadline = Instant::now() + Duration::from_millis(send_timeout);
-            let _send_permit = match timeout_at(deadline, send_gate.acquire_owned()).await {
+            let send_permit = match timeout_at(deadline, send_gate.acquire_owned()).await {
                 Ok(Ok(permit)) => permit,
                 Ok(Err(err)) => {
                     return Err(Error::new(
@@ -838,20 +915,17 @@ impl WebRTCStream {
                     .into());
                 }
                 Err(_) => {
-                    if let Err(err) = self.pc.close().await {
-                        log::warn!("failed to close WebRTC after send timeout: {}", err);
-                    }
+                    self.close_detached();
                     return Err(Error::new(ErrorKind::TimedOut, "WebRTC send timeout").into());
                 }
             };
             match timeout_at(deadline, self.send_bytes_inner(bytes)).await {
                 Ok(res) => res,
                 Err(_) => {
-                    // Keep the logical-message permit while closing so no waiting clone can append
-                    // a new message after a partially-written fragment sequence.
-                    if let Err(err) = self.pc.close().await {
-                        log::warn!("failed to close WebRTC after send timeout: {}", err);
-                    }
+                    // Hand the logical-message permit to the teardown so no waiting clone can
+                    // append a new message after a partially-written fragment sequence. Holding
+                    // it across an awaited close would drop both on cancellation.
+                    self.close_detached_with(send_permit);
                     Err(Error::new(ErrorKind::TimedOut, "WebRTC send timeout").into())
                 }
             }
@@ -867,7 +941,9 @@ impl WebRTCStream {
     }
 
     async fn send_bytes_inner(&mut self, bytes: Bytes) -> ResultType<()> {
-        if bytes.len() > MAX_FRAME_LENGTH {
+        // Same bound the receiver enforces, so we never emit a message a same-version peer
+        // would have to kill the connection over.
+        if bytes.len() > MAX_RECV_MESSAGE {
             return Err(Error::new(ErrorKind::InvalidInput, "Overflow").into());
         }
         self.wait_for_connect_result().await?;
@@ -896,19 +972,19 @@ impl WebRTCStream {
     #[inline]
     pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
         if let Err(err) = self.wait_for_connect_result().await {
-            self.pc.close().await.ok();
+            self.close_detached();
             return Some(Err(Error::new(ErrorKind::Other, err.to_string())));
         }
         let dc = match self.detached_dc().await {
             Ok(dc) => dc,
             Err(err) => {
-                self.pc.close().await.ok();
+                self.close_detached();
                 return Some(Err(Error::new(ErrorKind::Other, err.to_string())));
             }
         };
         // Held across the whole loop for exclusion, not for accumulator survival (see the field).
-        // Cancelling mid-`dc.read()` loses no data; cancelling mid-`pc.close()` on an error path
-        // below does leak the pc — see the checklist entry on cancel-safety.
+        // Cancelling mid-`dc.read()` loses no data, and every teardown below is detached rather
+        // than awaited, so a cancelled `next()` cannot strand the pc either.
         let mut st = self.recv_state.lock().await;
         if st.scratch.len() < RECV_BUF_SIZE {
             st.scratch.resize(RECV_BUF_SIZE, 0);
@@ -918,7 +994,11 @@ impl WebRTCStream {
             let n = match dc.read(scratch.as_mut_slice()).await {
                 Ok(n) => n,
                 Err(err) => {
-                    self.pc.close().await.ok();
+                    // Release the partial message, as the framing-violation paths below do: the
+                    // buffer can hold up to the cap and `recv_state` outlives this call through
+                    // the `SESSIONS` clone.
+                    *acc = BytesMut::new();
+                    self.close_detached();
                     return Some(Err(Error::new(
                         ErrorKind::Other,
                         format!("data channel read error: {}", err),
@@ -926,9 +1006,16 @@ impl WebRTCStream {
                 }
             };
             if n == 0 {
-                // Clean EOF: the remote reset the stream or shut its write half. An empty logical
-                // message is represented by a 1-byte header, so it is never confused with EOF.
-                self.pc.close().await.ok();
+                // End of stream. Our own sender never produces this — every fragment carries at
+                // least its header byte — but it is NOT exclusively a reset: webrtc-data maps the
+                // StringEmpty/BinaryEmpty PPIDs to n == 0 as well, and `read` discards the flag
+                // that would separate them, so a peer can also reach here by sending one empty
+                // data-channel message. Both mean the same thing to us (this peer will send us
+                // nothing more we can frame), so treat them alike, but do not report it as a
+                // clean remote close: it is equally a peer that just violated the framing.
+                log::debug!("WebRTC data channel ended (reset or empty message)");
+                *acc = BytesMut::new();
+                self.close_detached();
                 return None;
             }
             // Two framing violations, both of which would otherwise be read as "more fragments":
@@ -948,25 +1035,29 @@ impl WebRTCStream {
             };
             if let Some(why) = bad {
                 *acc = BytesMut::new();
-                self.pc.close().await.ok();
+                self.close_detached();
                 return Some(Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("WebRTC {why}"),
                 )));
             }
-            acc.extend_from_slice(&scratch[1..n]);
-            // Match TCP's maximum frame size while preventing an unbounded FRAG_MORE stream from
-            // exhausting memory.
-            if acc.len() > MAX_FRAME_LENGTH {
-                // Release the buffer, don't just truncate it: by definition it is at the cap here,
-                // and `recv_state` outlives this call through the `SESSIONS` clone.
+            // Bound BEFORE growing, not after. This framing carries no length, so an oversize
+            // message can only be discovered by accumulating it — unlike the TCP codec, which
+            // rejects on the declared length before a single payload byte is buffered. Checking
+            // after the append would make the peak the cap plus a fragment, and `BytesMut` grows
+            // by reallocate-and-copy, so the final doubling would hold the old and new buffers at
+            // once: ~2x the cap in RSS for a session that has produced no message at all.
+            if acc.len() + (n - 1) > MAX_RECV_MESSAGE {
+                // Release the buffer, don't just truncate it: by definition it is near the cap
+                // here, and `recv_state` outlives this call through the `SESSIONS` clone.
                 *acc = BytesMut::new();
-                self.pc.close().await.ok();
+                self.close_detached();
                 return Some(Err(Error::new(
                     ErrorKind::InvalidData,
                     "WebRTC reassembled message exceeded maximum frame size",
                 )));
             }
+            acc.extend_from_slice(&scratch[1..n]);
             if header == FRAG_END {
                 let msg = std::mem::take(acc);
                 return Some(Ok(msg));
@@ -992,8 +1083,8 @@ pub fn is_webrtc_endpoint(endpoint: &str) -> bool {
 mod tests {
     use crate::config;
     use crate::webrtc::WebRTCStream;
-    use crate::webrtc::{DEFAULT_ICE_SERVERS, FRAG_MORE};
-    use bytes::{BufMut, BytesMut};
+    use crate::webrtc::{DEFAULT_ICE_SERVERS, FRAG_MORE, SESSIONS};
+    use bytes::{BufMut, Bytes, BytesMut};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::Barrier;
     use tokio::time::timeout;
@@ -1311,6 +1402,110 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let mut answerer = answerer;
         answerer.wait_connected(20000).await.unwrap();
         (offerer, answerer)
+    }
+
+    // next()'s teardown paths must not be cancellable: every consumer polls next() inside a
+    // select! against a timer, and an awaited close that loses that race strands the pc
+    // (is_closed is already latched, so no later close retries) along with its SESSIONS entry,
+    // which only the state handler evicts.
+    //
+    // The cancellation itself is not what this test pins — `close_detached` is a non-async fn,
+    // so its callers have no await point to be cancelled at, and the compiler enforces that.
+    // What needs proving is the other half: that work handed to the runtime still runs to
+    // completion once the caller has walked away.
+    #[tokio::test]
+    async fn test_close_detached_completes_without_the_caller() {
+        let (offerer, answerer) = connect_loopback().await;
+        let key = format!("offer:{}", offerer.session_key());
+        assert!(
+            SESSIONS.lock().await.contains_key(&key),
+            "offerer should be cached while live"
+        );
+
+        offerer.close_detached();
+        drop(offerer);
+
+        for _ in 0..200 {
+            if !SESSIONS.lock().await.contains_key(&key) {
+                answerer.close().await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("detached close never evicted the peer connection from SESSIONS");
+    }
+
+    // Extra channels opened after the bootstrap one must not displace it: rebinding would leave
+    // teardown closing a channel send/recv no longer use, and the newcomer's on_open would push
+    // Open onto the watch that gates both, re-arming a session already latched Closed.
+    //
+    // Scope, honestly: only the bind-once guard is exercised. The ordered+reliable check sits
+    // ahead of it but cannot decide anything here — `WebRTCStream::new` always creates its
+    // bootstrap channel first, so whatever the offerer adds afterwards is refused for being
+    // second regardless of its parameters. Covering that check needs a hand-built peer whose
+    // FIRST channel is unordered, which is more scaffolding than the guard is worth; it is a
+    // three-accessor test against parameters webrtc-rs derives verbatim from the remote's DCEP.
+    #[tokio::test]
+    async fn test_webrtc_answerer_binds_only_the_first_data_channel() {
+        use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+
+        let mut offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+        // Replace the bootstrap channel's siblings: an unordered one and a duplicate.
+        let unordered = offerer
+            .pc
+            .create_data_channel(
+                "unordered",
+                Some(RTCDataChannelInit {
+                    ordered: Some(false),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let duplicate = offerer
+            .pc
+            .create_data_channel("duplicate", None)
+            .await
+            .unwrap();
+
+        let offer = offerer.get_local_endpoint_trickle().await.unwrap();
+        let answerer = WebRTCStream::new(&offer, false, 20000).await.unwrap();
+        let answer = answerer.get_local_endpoint_trickle().await.unwrap();
+        offerer.set_remote_endpoint(&answer).await.unwrap();
+
+        let mut off_ice = offerer.take_local_ice_rx().unwrap();
+        let mut ans_ice = answerer.take_local_ice_rx().unwrap();
+        let answerer_for_ice = answerer.clone();
+        let offerer_for_ice = offerer.clone();
+        tokio::spawn(async move {
+            while let Some(c) = off_ice.recv().await {
+                let _ = answerer_for_ice.add_remote_ice_candidate(&c).await;
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(c) = ans_ice.recv().await {
+                let _ = offerer_for_ice.add_remote_ice_candidate(&c).await;
+            }
+        });
+
+        offerer.wait_connected(20000).await.unwrap();
+        let mut answerer = answerer;
+        answerer.wait_connected(20000).await.unwrap();
+
+        // The bootstrap channel still carries data: the rejected siblings did not displace it.
+        let payload = Bytes::from_static(b"bootstrap still bound");
+        offerer.send_bytes(payload.clone()).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(10), answerer.next())
+            .await
+            .expect("answerer starved")
+            .expect("stream ended")
+            .expect("read failed");
+        assert_eq!(&got[..], &payload[..]);
+
+        drop(unordered);
+        drop(duplicate);
+        offerer.close().await;
+        answerer.close().await;
     }
 
     // One-shot callers exchange only the endpoints and never consume `take_local_ice_rx`.
