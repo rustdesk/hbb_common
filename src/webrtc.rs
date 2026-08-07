@@ -461,9 +461,8 @@ impl WebRTCStream {
                     // Only tear down on the terminal states so a short network blip (Wi-Fi roam,
                     // sleep/wake, cell handover) does not permanently kill an established session.
                     RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
-                        let _ = on_connection_notify.send(WebRTCConnectionState::Closed(
-                            s.to_string(),
-                        ));
+                        let _ =
+                            on_connection_notify.send(WebRTCConnectionState::Closed(s.to_string()));
                         log::debug!("WebRTC session closing due to {}", s);
                         let _ = stream_for_close2.lock().await.close().await;
                         log::debug!("WebRTC session stream closed");
@@ -698,9 +697,7 @@ impl WebRTCStream {
                     == RTCIceCandidateType::Relay
             )
         };
-        Some(
-            is_relay(&pair.local_candidate_id) || is_relay(&pair.remote_candidate_id),
-        )
+        Some(is_relay(&pair.local_candidate_id) || is_relay(&pair.remote_candidate_id))
     }
 
     #[inline]
@@ -945,7 +942,9 @@ impl WebRTCStream {
                 FRAG_END => None,
                 FRAG_MORE if n > 1 => None,
                 FRAG_MORE => Some("FRAG_MORE fragment carries no payload".to_owned()),
-                other => Some(format!("fragment header {other} is neither FRAG_END nor FRAG_MORE")),
+                other => Some(format!(
+                    "fragment header {other} is neither FRAG_END nor FRAG_MORE"
+                )),
             };
             if let Some(why) = bad {
                 *acc = BytesMut::new();
@@ -1068,10 +1067,7 @@ mod tests {
             "turn:example.com:3478"
         );
         assert_eq!(WebRTCStream::get_ice_servers().len(), 2);
-        config::Config::set_option(
-            "ice-servers".to_string(),
-            "".to_string(),
-        );
+        config::Config::set_option("ice-servers".to_string(), "".to_string());
     }
 
     #[test]
@@ -1362,7 +1358,11 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             let big = vec![0xABu8; 200_000];
             offerer.send_raw(big.clone()).await.unwrap();
             let got = answerer.next().await.unwrap().unwrap();
-            assert_eq!(got.len(), big.len(), "large message must survive fragmentation");
+            assert_eq!(
+                got.len(),
+                big.len(),
+                "large message must survive fragmentation"
+            );
             assert_eq!(&got[..], &big[..]);
 
             // Reverse direction.
@@ -1407,7 +1407,9 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
                 lead.put_u8(FRAG_MORE);
                 lead.put_slice(b"leading!");
                 dc.write(&lead.freeze()).await.unwrap();
-                dc.write(&bytes::Bytes::copy_from_slice(frame)).await.unwrap();
+                dc.write(&bytes::Bytes::copy_from_slice(frame))
+                    .await
+                    .unwrap();
 
                 let err = answerer
                     .next()
@@ -1472,5 +1474,4 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             .await
             .expect("concurrent WebRTC sends did not complete in time");
     }
-
 }

@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 /// hide real faults, so keep one line per interval and carry the count of everything
 /// suppressed since the last one.
 ///
+/// Prefer the [`throttled_log!`](crate::throttled_log) macro, which declares the static for
+/// you. Reach for this type directly only when the count belongs somewhere other than the end
+/// of the line, or when the decision drives more than a log call.
+///
 /// Declare one per site (they do not share counts):
 ///
 /// ```ignore
@@ -67,6 +71,33 @@ impl LogThrottle {
     }
 }
 
+/// Log at most one line per interval from this call site, suffixed with the number of
+/// occurrences it stands for.
+///
+/// Each expansion declares its own hidden static, so two sites never share a count and
+/// adding one is a single line:
+///
+/// ```ignore
+/// throttled_log!(Duration::from_secs(5), warn, "rejected ipc peer {peer_pid:?}");
+/// ```
+///
+/// An isolated event logs unchanged; a burst collapses to `... (x47)`. The count includes
+/// the occurrence being reported, so it reads as a total rather than as "and N more".
+#[macro_export]
+macro_rules! throttled_log {
+    ($interval:expr, $level:ident, $($arg:tt)+) => {{
+        static THROTTLE: $crate::log_throttle::LogThrottle =
+            $crate::log_throttle::LogThrottle::new($interval);
+        if let Some(n) = THROTTLE.due() {
+            if n > 1 {
+                $crate::log::$level!("{} (x{})", format_args!($($arg)+), n);
+            } else {
+                $crate::log::$level!("{}", format_args!($($arg)+));
+            }
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,7 +114,11 @@ mod tests {
             // The send side succeeding must not hand the recv side a fresh emit slot.
             assert_eq!(recv.due(), None);
         }
-        assert_eq!(send.due(), Some(1), "the other direction keeps its own slot");
+        assert_eq!(
+            send.due(),
+            Some(1),
+            "the other direction keeps its own slot"
+        );
     }
 
     #[test]
