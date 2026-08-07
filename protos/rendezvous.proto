@@ -29,13 +29,10 @@ message PunchHoleRequest {
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
   string switch_code = 11;
+  // The offer's envelope declares its own ICE transport policy (`ice_policy` key inside
+  // the webrtc:// payload): under force_relay it tells the peer whether the relay is
+  // transport-forced (WebSocket — answer may use full ICE) or policy (Relay-only + TURN).
   string webrtc_sdp_offer = 12;
-  // The attached offer gathers every ICE candidate type (host/srflx/relay), so a direct
-  // WebRTC path may form even when force_relay is set. Sent by clients whose force_relay
-  // stems from the transport (WebSocket tunnels only the signaling/relay legs and kills
-  // classic punching, not ICE) rather than from relay-by-policy; absent/false keeps the
-  // old semantics where force_relay implies a Relay-only-ICE offer.
-  bool webrtc_all_ice = 13;
 }
 
 message ControlPermissions {
@@ -72,9 +69,6 @@ message PunchHole {
   ControlPermissions control_permissions = 8;
   ControlledContext controlled_context = 9;
   string webrtc_sdp_offer = 10;
-  // Forwarded from PunchHoleRequest.webrtc_all_ice; see that field. Tag 11 previously
-  // carried the never-shipped `requester_id` (added and removed in one unshipped batch).
-  bool webrtc_all_ice = 11;
 }
 
 message TestNatRequest {
