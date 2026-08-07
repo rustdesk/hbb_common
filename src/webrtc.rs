@@ -1078,23 +1078,31 @@ mod tests {
     fn test_endpoint_ice_policy_declaration() {
         // An envelope with the marker declares full ICE; everything else — no marker,
         // wrong value, foreign scheme, garbage — reads as the old Relay-only semantics.
-        let marked = WebRTCStream::sdp_to_endpoint(r#"{"type":"offer","sdp":"v=0","ice_policy":"all"}"#);
+        let marked =
+            WebRTCStream::sdp_to_endpoint(r#"{"type":"offer","sdp":"v=0","ice_policy":"all"}"#);
         assert!(WebRTCStream::endpoint_declares_all_ice(&marked));
 
         let unmarked = WebRTCStream::sdp_to_endpoint(r#"{"type":"offer","sdp":"v=0"}"#);
         assert!(!WebRTCStream::endpoint_declares_all_ice(&unmarked));
 
-        let wrong = WebRTCStream::sdp_to_endpoint(r#"{"type":"offer","sdp":"v=0","ice_policy":"relay"}"#);
+        let wrong =
+            WebRTCStream::sdp_to_endpoint(r#"{"type":"offer","sdp":"v=0","ice_policy":"relay"}"#);
         assert!(!WebRTCStream::endpoint_declares_all_ice(&wrong));
 
         assert!(!WebRTCStream::endpoint_declares_all_ice(""));
-        assert!(!WebRTCStream::endpoint_declares_all_ice("webrtc://not-base64!"));
-        assert!(!WebRTCStream::endpoint_declares_all_ice("https://example.com"));
+        assert!(!WebRTCStream::endpoint_declares_all_ice(
+            "webrtc://not-base64!"
+        ));
+        assert!(!WebRTCStream::endpoint_declares_all_ice(
+            "https://example.com"
+        ));
 
         // The marker must be invisible to the plain RTCSessionDescription parse old peers do.
         let sdp_json = WebRTCStream::get_remote_offer(&marked).unwrap();
-        serde_json::from_str::<webrtc::peer_connection::sdp::session_description::RTCSessionDescription>(&sdp_json)
-            .expect("extra envelope key must not break RTCSessionDescription parsing");
+        serde_json::from_str::<
+            webrtc::peer_connection::sdp::session_description::RTCSessionDescription,
+        >(&sdp_json)
+        .expect("extra envelope key must not break RTCSessionDescription parsing");
     }
 
     #[test]
