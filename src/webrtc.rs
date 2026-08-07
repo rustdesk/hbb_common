@@ -186,6 +186,11 @@ impl WebRTCStream {
         format!("webrtc://{}", encoded_sdp)
     }
 
+    // Envelope JSON key carrying the local description's ICE transport policy, alongside the
+    // RTCSessionDescription fields (see `get_local_endpoint_trickle`).
+    const ICE_POLICY_KEY: &str = "ice_policy";
+    const ICE_POLICY_ALL: &str = "all";
+
     #[inline]
     fn get_key_for_sdp(sdp: &RTCSessionDescription) -> ResultType<String> {
         let binding = sdp.unmarshal()?;
@@ -601,12 +606,44 @@ impl WebRTCStream {
     #[inline]
     pub async fn get_local_endpoint_trickle(&self) -> ResultType<String> {
         if let Some(local_desc) = self.pc.local_description().await {
-            let sdp = serde_json::to_string(&local_desc)?;
+            let sdp = if self.relay_only {
+                serde_json::to_string(&local_desc)?
+            } else {
+                // Declare the ICE transport policy inside the envelope. The receiver of an
+                // offer that arrives with force_relay set must know whether it may answer
+                // with full ICE (relay forced by the transport, e.g. WebSocket signaling)
+                // or must stay Relay-only + TURN-gated (relay by policy) — and the envelope
+                // is the offer's own property, so it rides here rather than in a proto
+                // field the rendezvous server would have to forward. An extra key is
+                // invisible to older peers: serde ignores unknown fields when parsing
+                // RTCSessionDescription, so absence — not an error — is the old semantics.
+                let mut v = serde_json::to_value(&local_desc)?;
+                v[Self::ICE_POLICY_KEY] = serde_json::Value::from(Self::ICE_POLICY_ALL);
+                serde_json::to_string(&v)?
+            };
             let endpoint = Self::sdp_to_endpoint(&sdp);
             Ok(endpoint)
         } else {
             Err(anyhow::anyhow!("Local desc is not set"))
         }
+    }
+
+    /// Whether the peer's endpoint declares it was built with ICE transport policy `all`
+    /// (W3C RTCIceTransportPolicy), i.e. it gathers host/srflx/relay candidates and a direct
+    /// pair may form even though the request carries force_relay. Absent key, foreign format
+    /// or parse failure all mean "not declared" — the old Relay-only reading.
+    pub fn endpoint_declares_all_ice(endpoint: &str) -> bool {
+        let Ok(sdp_json) = Self::get_remote_offer(endpoint) else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&sdp_json)
+            .ok()
+            .and_then(|v| {
+                v.get(Self::ICE_POLICY_KEY)?
+                    .as_str()
+                    .map(|p| p == Self::ICE_POLICY_ALL)
+            })
+            .unwrap_or(false)
     }
 
     #[inline]
@@ -1035,6 +1072,29 @@ mod tests {
             "ice-servers".to_string(),
             "".to_string(),
         );
+    }
+
+    #[test]
+    fn test_endpoint_ice_policy_declaration() {
+        // An envelope with the marker declares full ICE; everything else — no marker,
+        // wrong value, foreign scheme, garbage — reads as the old Relay-only semantics.
+        let marked = WebRTCStream::sdp_to_endpoint(r#"{"type":"offer","sdp":"v=0","ice_policy":"all"}"#);
+        assert!(WebRTCStream::endpoint_declares_all_ice(&marked));
+
+        let unmarked = WebRTCStream::sdp_to_endpoint(r#"{"type":"offer","sdp":"v=0"}"#);
+        assert!(!WebRTCStream::endpoint_declares_all_ice(&unmarked));
+
+        let wrong = WebRTCStream::sdp_to_endpoint(r#"{"type":"offer","sdp":"v=0","ice_policy":"relay"}"#);
+        assert!(!WebRTCStream::endpoint_declares_all_ice(&wrong));
+
+        assert!(!WebRTCStream::endpoint_declares_all_ice(""));
+        assert!(!WebRTCStream::endpoint_declares_all_ice("webrtc://not-base64!"));
+        assert!(!WebRTCStream::endpoint_declares_all_ice("https://example.com"));
+
+        // The marker must be invisible to the plain RTCSessionDescription parse old peers do.
+        let sdp_json = WebRTCStream::get_remote_offer(&marked).unwrap();
+        serde_json::from_str::<webrtc::peer_connection::sdp::session_description::RTCSessionDescription>(&sdp_json)
+            .expect("extra envelope key must not break RTCSessionDescription parsing");
     }
 
     #[test]
