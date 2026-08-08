@@ -928,18 +928,31 @@ impl WebRTCStream {
     /// `keep` carries anything whose lifetime must span the teardown rather than the caller's:
     /// the send path passes its logical-message permit, so no waiting clone can append to a
     /// partially-written fragment sequence while the close is still in flight.
-    fn close_detached_with<T: Send + 'static>(&self, keep: T) {
+    pub fn close_detached_with<T: Send + 'static>(&self, keep: T) {
         let pc = self.pc.clone();
-        tokio::spawn(async move {
-            let _keep = keep;
-            if let Err(err) = pc.close().await {
-                log::debug!("WebRTC background close failed: {}", err);
-            }
-        });
+        // Take the runtime handle explicitly rather than calling `tokio::spawn`: this also runs
+        // from `Drop` impls, which can execute during runtime teardown where a bare spawn panics.
+        // `Handle::spawn` can panic while the runtime is shutting down too, so catch it — a brief
+        // leak until process exit beats aborting the process from a destructor.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            log::warn!("no tokio runtime available to close the WebRTC peer connection");
+            return;
+        };
+        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.spawn(async move {
+                let _keep = keep;
+                if let Err(err) = pc.close().await {
+                    log::debug!("WebRTC background close failed: {}", err);
+                }
+            });
+        }));
+        if spawned.is_err() {
+            log::warn!("failed to spawn the WebRTC close (runtime shutting down)");
+        }
     }
 
     #[inline]
-    fn close_detached(&self) {
+    pub fn close_detached(&self) {
         self.close_detached_with(());
     }
 
@@ -1041,8 +1054,8 @@ impl WebRTCStream {
             .await
             .map_err(|_| Error::new(ErrorKind::TimedOut, "WebRTC connect timeout"))??;
 
-            let deadline = Instant::now() + Duration::from_millis(send_timeout);
-            let send_permit = match timeout_at(deadline, send_gate.acquire_owned()).await {
+            let gate_deadline = Instant::now() + Duration::from_millis(send_timeout);
+            let send_permit = match timeout_at(gate_deadline, send_gate.acquire_owned()).await {
                 Ok(Ok(permit)) => permit,
                 Ok(Err(err)) => {
                     return Err(Error::new(
@@ -1059,7 +1072,13 @@ impl WebRTCStream {
                     return Err(Error::new(ErrorKind::TimedOut, "WebRTC send gate timeout").into());
                 }
             };
-            match timeout_at(deadline, self.send_bytes_inner(bytes)).await {
+            // Fresh budget once the permit is held: queueing behind another clone's message is
+            // not this message's progress, so charging it here meant a caller that only just lost
+            // the gate race got a few milliseconds to write in — and then tore the whole peer
+            // connection down for missing them. The narrower the miss, the more certain the
+            // teardown, which is precisely backwards.
+            let write_deadline = Instant::now() + Duration::from_millis(send_timeout);
+            match timeout_at(write_deadline, self.send_bytes_inner(bytes)).await {
                 Ok(res) => res,
                 Err(_) => {
                     // Hand the logical-message permit to the teardown so no waiting clone can
