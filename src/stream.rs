@@ -90,11 +90,17 @@ impl Stream {
     /// A WebRTC pc is kept alive by the global session cache and its cleanup handler only fires on
     /// a terminal ICE state, so it must be closed explicitly at session end. TCP/WebSocket streams
     /// release their resources on drop and need nothing here.
+    ///
+    /// Deliberately not `async`: most callers sit in a `select!` arm or a future the UI can
+    /// abandon, and an awaited close that loses that race is unretryable — `close()` latches
+    /// `is_closed` before its first await, so every later attempt early-returns while the state
+    /// handler that would evict the session never runs. With no await point here there is
+    /// nothing to cancel; the teardown finishes on the runtime.
     #[inline]
-    pub async fn close_webrtc(&self) {
+    pub fn close_webrtc(&self) {
         match self {
             #[cfg(feature = "webrtc")]
-            Stream::WebRTC(s) => s.close().await,
+            Stream::WebRTC(s) => s.close_detached(),
             #[allow(unreachable_patterns)]
             _ => {}
         }
