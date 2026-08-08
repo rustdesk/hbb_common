@@ -62,7 +62,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant};
 use url::Url;
@@ -94,11 +94,12 @@ pub struct WebRTCStream {
     // Serialize a complete logical message across clones. Each fragment is a separate SCTP
     // message, so serializing only individual writes would allow two large messages to interleave.
     send_gate: Arc<Semaphore>,
-    // Receive-side reassembly state. The accumulator survives a cancelled `next()` because it
-    // lives here behind the Arc, not in the future. The mutex excludes a concurrent reader only
-    // while `next()` is actually running — a cancellation drops the guard mid-message, so it is
-    // the single-reader assumption, not the lock, that ultimately prevents two readers splicing
-    // into one `acc`. Single reader assumed, like the rest of the stream API.
+    // Receive-side reassembly state, behind the Arc rather than in the future so a cancelled
+    // `next()` does not lose the partial message. SINGLE READER ONLY: reassembly spans calls, and
+    // the fragment header carries no length or sequence number, so two readers splice unrelated
+    // fragments into one `acc` and produce a well-formed, undetectably wrong message. Every
+    // consumer today reads from one task; keep it that way (this is why no API hands out a clone
+    // that outlives its `Stream`).
     recv_state: Arc<Mutex<RecvState>>,
     // True once the controller has completed the RustDesk identity binding (DTLS fingerprint
     // matched to the signed peer id, via `set_key`). DTLS always encrypts; this flag mirrors TCP's
@@ -108,10 +109,14 @@ pub struct WebRTCStream {
 
 #[derive(Default)]
 struct RecvState {
-    // Accumulated payload of the logical message currently being reassembled.
+    // Accumulated payload of the logical message currently being reassembled. Only multi-fragment
+    // messages reach it; a message that arrives whole is split straight out of `scratch`.
     acc: BytesMut,
-    // Reused read scratch buffer, avoiding a per-message allocation.
-    scratch: Vec<u8>,
+    // Read buffer, refilled in `SCRATCH_REFILL` chunks rather than per read. A whole-message
+    // fragment is handed to the caller with `split_to`, which shares this allocation instead of
+    // copying, so the buffer is consumed from the front and re-initialized only when what is left
+    // can no longer hold one fragment — amortizing that cost over many small messages.
+    scratch: BytesMut,
 }
 
 // The SCTP data channel's 65536-byte max message size is handled by
@@ -122,6 +127,11 @@ const MAX_FRAGMENT_PAYLOAD: usize = 60000;
 /// Receive scratch size: must be >= 1 (fragment header) + `MAX_FRAGMENT_PAYLOAD` and fit the
 /// negotiated SCTP max message size.
 const RECV_BUF_SIZE: usize = 64 * 1024;
+/// How much read buffer to initialize at a time. Whole messages are split out of it without
+/// copying, so it is consumed rather than reused; refilling in chunks spreads the one cost that
+/// remains — zeroing — across every small message that fits. Slices handed to the caller keep the
+/// whole chunk alive, so this trades a bounded amount of retention for the copy.
+const SCRATCH_REFILL: usize = 4 * RECV_BUF_SIZE;
 /// Fragment header byte: more fragments follow for this logical message.
 const FRAG_MORE: u8 = 1;
 /// Fragment header byte: final (or only) fragment of a logical message.
@@ -1156,16 +1166,18 @@ impl WebRTCStream {
                 return Some(Err(Error::new(ErrorKind::Other, err.to_string())));
             }
         };
-        // Held across the whole loop for exclusion, not for accumulator survival (see the field).
-        // Cancelling mid-`dc.read()` loses no data, and every teardown below is detached rather
-        // than awaited, so a cancelled `next()` cannot strand the pc either.
+        // Held across `dc.read().await` on purpose, against the usual "no locks across await"
+        // rule: it is what makes the single reader this reassembly requires (see the field) an
+        // exclusion rather than a convention. Releasing it around the read would admit exactly
+        // the second reader that corrupts `acc`. The cost — a would-be second reader blocking
+        // until a packet arrives — is a state the design does not permit anyway.
         let mut st = self.recv_state.lock().await;
-        if st.scratch.len() < RECV_BUF_SIZE {
-            st.scratch.resize(RECV_BUF_SIZE, 0);
-        }
         loop {
             let RecvState { acc, scratch } = &mut *st;
-            let n = match dc.read(scratch.as_mut_slice()).await {
+            if scratch.len() < RECV_BUF_SIZE {
+                scratch.resize(SCRATCH_REFILL, 0);
+            }
+            let n = match dc.read(&mut scratch[..RECV_BUF_SIZE]).await {
                 Ok(n) => n,
                 Err(err) => {
                     // Release the partial message, as the framing-violation paths below do: the
@@ -1230,6 +1242,12 @@ impl WebRTCStream {
                     ErrorKind::InvalidData,
                     "WebRTC reassembled message exceeded maximum frame size",
                 )));
+            }
+            // A message that arrived whole is handed over as a slice of the read buffer: no
+            // allocation and no copy, which is every input event and most audio packets.
+            if header == FRAG_END && acc.is_empty() {
+                scratch.advance(1);
+                return Some(Ok(scratch.split_to(n - 1)));
             }
             acc.extend_from_slice(&scratch[1..n]);
             if header == FRAG_END {
@@ -1643,6 +1661,40 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("detached close never evicted the peer connection from SESSIONS");
+    }
+
+    // Whole messages are split out of the read buffer instead of copied, so the buffer is
+    // consumed from the front and periodically re-initialized. Alternating whole and fragmented
+    // messages exercises that against the accumulator path, and running well past one refill
+    // exercises the refill itself — a boundary the fixed-size buffer never had.
+    #[tokio::test]
+    async fn test_webrtc_mixed_message_sizes_survive_scratch_refill() {
+        let (mut offerer, mut answerer) = connect_loopback().await;
+
+        // Sized either side of MAX_FRAGMENT_PAYLOAD, and enough rounds to consume several
+        // SCRATCH_REFILL chunks.
+        let sizes = [1usize, 64, 60_000, 60_001, 130_000, 7];
+        for round in 0..40u8 {
+            for &len in &sizes {
+                let payload = Bytes::from(vec![round; len]);
+                offerer.send_bytes(payload.clone()).await.unwrap();
+                let got = timeout(Duration::from_secs(10), answerer.next())
+                    .await
+                    .expect("receiver starved")
+                    .expect("stream ended")
+                    .expect("read failed");
+                assert_eq!(got.len(), len, "round {round}, len {len}");
+                assert!(
+                    got.iter().all(|&b| b == round),
+                    "round {}, len {}: content or boundary corrupted",
+                    round,
+                    len
+                );
+            }
+        }
+
+        offerer.close().await;
+        answerer.close().await;
     }
 
     // Owning the Stream owns the peer connection: dropping it must close the pc and evict the
