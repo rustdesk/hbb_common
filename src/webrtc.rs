@@ -1645,6 +1645,31 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         panic!("detached close never evicted the peer connection from SESSIONS");
     }
 
+    // Owning the Stream owns the peer connection: dropping it must close the pc and evict the
+    // session, without the owner having to remember to. Every exit path used to carry that
+    // obligation, and the controlled side never honoured it.
+    #[tokio::test]
+    async fn dropping_the_stream_closes_the_peer_connection() {
+        let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+        let key = format!("offer:{}", offerer.session_key());
+        assert!(
+            SESSIONS.lock().await.contains_key(&key),
+            "offerer should be cached while live"
+        );
+
+        // No explicit close anywhere: the stream simply goes out of scope, as it does on the
+        // exits that forget.
+        drop(crate::Stream::WebRTC(offerer));
+
+        for _ in 0..200 {
+            if !SESSIONS.lock().await.contains_key(&key) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("dropping the stream left the peer connection in SESSIONS");
+    }
+
     // A replayed offer asking for a different ICE policy must not be handed the cached peer
     // connection. The lookup and the insert-time duplicate check read the same key, so the test
     // fails if either one stops applying `is_reusable_for` — which is how the guard was dead
