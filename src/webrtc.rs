@@ -205,8 +205,10 @@ impl WebRTCStream {
 
     // Envelope JSON key carrying the local description's ICE transport policy, alongside the
     // RTCSessionDescription fields (see `get_local_endpoint_trickle`).
-    const ICE_POLICY_KEY: &str = "ice_policy";
-    const ICE_POLICY_ALL: &str = "all";
+    // `'static` spelled out: an elided lifetime here is a warn-by-default future hard error on
+    // the 1.75 toolchain CI pins (elided_lifetimes_in_associated_constant).
+    const ICE_POLICY_KEY: &'static str = "ice_policy";
+    const ICE_POLICY_ALL: &'static str = "all";
 
     #[inline]
     fn get_key_for_sdp(sdp: &RTCSessionDescription) -> ResultType<String> {
@@ -242,6 +244,25 @@ impl WebRTCStream {
             if is_offerer { "offer" } else { "answer" },
             fingerprint
         )
+    }
+
+    /// Whether a `SESSIONS` entry may be handed to a caller asking for `force_relay`.
+    ///
+    /// A hit returns a pc built for the FIRST caller, and two of its properties belong to this
+    /// caller instead: the ICE policy (`rendezvous_mediator` recomputes relay-only per PunchHole,
+    /// so a replayed offer wanting Relay-only must not get an All-policy pc free to pick a direct
+    /// pair), and liveness (the state handler latches Closed and closes the stream before it
+    /// reaches SESSIONS to evict, so the map briefly holds dead entries). `peer_verified` stays
+    /// shared on purpose: it is a fact about the DTLS certificate the entry is keyed by.
+    ///
+    /// Both the lookup and the insert-time duplicate check must use this — they read the same key,
+    /// so a test applied at only one of them is not applied at all.
+    fn is_reusable_for(&self, force_relay: bool) -> bool {
+        self.relay_only == force_relay
+            && !matches!(
+                *self.state_notify.borrow(),
+                WebRTCConnectionState::Closed(_)
+            )
     }
 
     #[inline]
@@ -288,10 +309,28 @@ impl WebRTCStream {
         if host.is_empty() {
             return None;
         }
+        let username = u.username().to_string();
+        let credential = u.password().unwrap_or_default().to_string();
+        // A TURN server without credentials is not merely useless: webrtc-rs validates every
+        // configured server in `new_peer_connection`, so one credential-less entry makes EVERY
+        // peer connection fail — including plain non-relay ones that never wanted TURN. The
+        // RFC 7065 spelling has nowhere to put credentials, so drop such entries here rather
+        // than let them poison the whole configuration; `turn://user:pass@host:port` carries them.
+        if matches!(u.scheme(), "turn" | "turns") && (username.is_empty() || credential.is_empty())
+        {
+            log::warn!(
+                "Ignoring TURN server without credentials: {}:{}:{} (use {}://user:pass@host:port)",
+                u.scheme(),
+                host,
+                port,
+                u.scheme()
+            );
+            return None;
+        }
         Some(RTCIceServer {
             urls: vec![format!("{}:{}:{}", u.scheme(), host, port)],
-            username: u.username().to_string(),
-            credential: u.password().unwrap_or_default().to_string(),
+            username,
+            credential,
             ..Default::default()
         })
     }
@@ -311,11 +350,23 @@ impl WebRTCStream {
                 .unwrap_or(3478);
             return Some((format!("[{host}]"), port));
         }
+        // An unbracketed IPv6 literal has no unambiguous split point — `2001:db8::1` would be cut
+        // at its last colon into host `2001:db8:` port `1` — so require the bracketed form for
+        // those rather than emit a host webrtc-ice cannot resolve.
+        if rest.matches(':').count() > 1 {
+            log::warn!("Ignoring ICE server {rest}: bracket IPv6 literals as [addr]:port");
+            return None;
+        }
         match rest.rsplit_once(':') {
-            // Only a numeric tail is a port; anything else is part of the host.
             Some((host, port)) if !host.is_empty() => match port.parse() {
                 Ok(port) => Some((host.to_owned(), port)),
-                Err(_) => Some((rest.to_owned(), 3478)),
+                // A port that is present but unusable is a typo, not a host: folding it back in
+                // would produce `host:99999:3478`, which webrtc-ice rejects outright — taking
+                // every peer connection down with it, not just this server.
+                Err(_) => {
+                    log::warn!("Ignoring ICE server {rest}: invalid port");
+                    None
+                }
             },
             _ => Some((rest.to_owned(), 3478)),
         }
@@ -325,16 +376,14 @@ impl WebRTCStream {
     /// connection (force_relay) can only gather relay candidates, so without a TURN server it can
     /// never connect — callers use this to skip building a guaranteed-dead pc.
     pub fn has_turn_server() -> bool {
+        // `get_ice_server_from_url` is what makes a bare scheme test sufficient: it drops entries
+        // with no host and TURN entries with no credentials, i.e. exactly the ones that would
+        // answer `true` here while being unusable — which is worse than answering `false`, since
+        // the caller skips its "don't build a guaranteed-dead Relay-only pc" guard on our word.
         Self::get_ice_servers().iter().any(|s| {
-            s.urls.iter().any(|u| {
-                // `scheme:host:port`, built by get_ice_server_from_url. A missing host would
-                // still match the scheme while being unusable, and answering `true` for one of
-                // those is worse than answering `false`: the caller skips its "don't build a
-                // guaranteed-dead Relay-only pc" guard on the strength of it.
-                u.strip_prefix("turn:")
-                    .or_else(|| u.strip_prefix("turns:"))
-                    .is_some_and(|rest| !rest.starts_with(':'))
-            })
+            s.urls
+                .iter()
+                .any(|u| u.starts_with("turn:") || u.starts_with("turns:"))
         })
     }
 
@@ -407,33 +456,14 @@ impl WebRTCStream {
                     .cloned()
             };
             if let Some(cached_stream) = cached {
-                // A hit hands back a pc built for the FIRST caller. Two of its properties are
-                // this caller's to decide, so a mismatched entry must not be reused:
-                //
-                // - ICE policy. `rendezvous_mediator` recomputes relay-only per PunchHole, so a
-                //   replayed offer asking for Relay-only would otherwise get back an All-policy
-                //   pc, free to pick a direct pair — and `is_relayed()` would answer from the
-                //   cached handle's own flag, describing a policy nobody asked for.
-                // - liveness. The state handler pushes Closed and closes the stream BEFORE it
-                //   reaches SESSIONS to evict, so there is a window where the map still holds a
-                //   dead pc whose `wait_for_connect_result` errors immediately.
-                //
-                // `peer_verified` is deliberately still shared: it is an identity fact about
-                // this DTLS certificate, not a per-caller setting, and the entry is keyed by
-                // that certificate's fingerprint.
-                let stale = matches!(
-                    *cached_stream.state_notify.borrow(),
-                    WebRTCConnectionState::Closed(_)
-                );
-                if cached_stream.relay_only == force_relay && !stale {
+                if cached_stream.is_reusable_for(force_relay) {
                     log::debug!("Start webrtc with cached peer");
                     return Ok(cached_stream);
                 }
                 log::debug!(
-                    "Ignoring cached webrtc peer (relay_only {} != {}, or closed: {})",
+                    "Ignoring cached webrtc peer (relay_only {}, wanted {})",
                     cached_stream.relay_only,
-                    force_relay,
-                    stale
+                    force_relay
                 );
             }
         }
@@ -706,11 +736,15 @@ impl WebRTCStream {
         let cache_key = Self::cache_key(&key, start_local_offer);
         let duplicate = {
             let mut final_lock = SESSIONS.lock().await;
-            if let Some(session) = final_lock.get(&cache_key) {
-                Some(session.clone())
-            } else {
-                final_lock.insert(cache_key, webrtc_stream.clone());
-                None
+            // Same admissibility test as the lookup above, or that lookup is dead code: an entry
+            // rejected there is still in the map when we get here, so returning it unconditionally
+            // would discard the pc we just built precisely because the cached one was unusable.
+            match final_lock.get(&cache_key) {
+                Some(session) if session.is_reusable_for(force_relay) => Some(session.clone()),
+                _ => {
+                    final_lock.insert(cache_key, webrtc_stream.clone());
+                    None
+                }
             }
         };
         if let Some(session) = duplicate {
@@ -1202,7 +1236,6 @@ pub fn is_webrtc_endpoint(endpoint: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::config;
     use crate::webrtc::WebRTCStream;
     use crate::webrtc::{DEFAULT_ICE_SERVERS, FRAG_MORE, SESSIONS};
     use bytes::{BufMut, Bytes, BytesMut};
@@ -1213,41 +1246,37 @@ mod tests {
 
     #[test]
     fn test_webrtc_ice_url() {
-        assert_eq!(
-            WebRTCStream::get_ice_server_from_url("turn://example.com:3478")
-                .unwrap_or_default()
-                .urls[0],
-            "turn:example.com:3478"
-        );
-
-        assert_eq!(
-            WebRTCStream::get_ice_server_from_url("turn://example.com")
-                .unwrap_or_default()
-                .urls[0],
-            "turn:example.com:3478"
-        );
-
-        assert_eq!(
-            WebRTCStream::get_ice_server_from_url("turn://123@example.com")
-                .unwrap_or_default()
-                .username,
-            "123"
-        );
-
-        assert_eq!(
-            WebRTCStream::get_ice_server_from_url("turn://123@example.com")
-                .unwrap_or_default()
-                .credential,
-            ""
-        );
+        let turn = WebRTCStream::get_ice_server_from_url("turn://123:321@example.com:3478")
+            .expect("credentialed turn is usable");
+        assert_eq!(turn.urls[0], "turn:example.com:3478");
+        assert_eq!(turn.username, "123");
+        assert_eq!(turn.credential, "321");
 
         assert_eq!(
             WebRTCStream::get_ice_server_from_url("turn://123:321@example.com")
                 .unwrap_or_default()
-                .credential,
-            "321"
+                .urls[0],
+            "turn:example.com:3478"
         );
 
+        // TURN without both halves of the credential is dropped rather than passed on:
+        // webrtc-rs validates every configured server when the peer connection is built, so
+        // one such entry fails EVERY connection, including those that never wanted TURN.
+        for missing in [
+            "turn://example.com:3478",
+            "turn://example.com",
+            "turn://123@example.com",
+            "turns://example.com:5349",
+            "turn:example.com:3478",
+        ] {
+            assert_eq!(
+                WebRTCStream::get_ice_server_from_url(missing),
+                None,
+                "credential-less {missing} must not reach the configuration"
+            );
+        }
+
+        // STUN needs no credentials, so both spellings stay usable.
         assert_eq!(
             WebRTCStream::get_ice_server_from_url("stun://example.com:3478")
                 .unwrap_or_default()
@@ -1260,19 +1289,17 @@ mod tests {
             None
         );
 
-        // RFC 7065 spelling (`turn:host:port`, no authority) — what TURN docs hand out, and
-        // what users paste. `url` cannot-be-a-base's it, so host/port come out of the path;
-        // getting this wrong produced a hostless "turn::3478" that still passed the TURN gate.
+        // RFC 7065 spelling (`scheme:host:port`, no authority) — what STUN/TURN docs hand out.
+        // `url` cannot-be-a-base's it, so host and port come out of the path; getting this wrong
+        // produced a hostless "stun::3478" no ICE agent can resolve.
         for (input, expected) in [
-            ("turn:example.com:3478", "turn:example.com:3478"),
-            ("turn:example.com", "turn:example.com:3478"),
-            ("turns:example.com:5349", "turns:example.com:5349"),
             ("stun:example.com:19302", "stun:example.com:19302"),
-            ("turn:[2001:db8::1]:3478", "turn:[2001:db8::1]:3478"),
-            ("turn:[2001:db8::1]", "turn:[2001:db8::1]:3478"),
+            ("stun:example.com", "stun:example.com:3478"),
+            ("stun:[2001:db8::1]:19302", "stun:[2001:db8::1]:19302"),
+            ("stun:[2001:db8::1]", "stun:[2001:db8::1]:3478"),
             (
-                "turn:example.com:3478?transport=udp",
-                "turn:example.com:3478",
+                "stun:example.com:19302?transport=udp",
+                "stun:example.com:19302",
             ),
         ] {
             assert_eq!(
@@ -1283,13 +1310,22 @@ mod tests {
                 "parsing {input}"
             );
         }
-        assert_eq!(WebRTCStream::get_ice_server_from_url("turn:"), None);
 
-        // The gate must not green-light an unusable server: a hostless entry makes the caller
-        // skip its "don't build a guaranteed-dead Relay-only pc" guard.
-        assert!(!WebRTCStream::parse_ice_servers("turn:")
-            .iter()
-            .any(|s| s.urls.iter().any(|u| u.starts_with("turn:"))));
+        // Malformed entries are dropped, never repaired into something webrtc-ice will choke
+        // on: a folded-in bad port ("host:99999:3478") or an unbracketed IPv6 split at its last
+        // colon fails peer-connection construction outright, taking every server down with it.
+        for bad in [
+            "stun:",
+            "stun:example.com:99999",
+            "stun:example.com:abc",
+            "stun:2001:db8::1",
+        ] {
+            assert_eq!(
+                WebRTCStream::get_ice_server_from_url(bad),
+                None,
+                "malformed {bad} must be dropped"
+            );
+        }
     }
 
     // Parsing is exercised through `parse_ice_servers`, never by rewriting the global
@@ -1302,13 +1338,16 @@ mod tests {
             DEFAULT_ICE_SERVERS[0].to_string()
         );
 
-        let parsed = WebRTCStream::parse_ice_servers(",stun://example.com,turn://example.com,sdf");
+        // Unusable entries drop out of the list; the rest of the config still applies.
+        let parsed = WebRTCStream::parse_ice_servers(
+            ",stun://example.com,turn://u:p@example.com,turn://nocreds.example.com,sdf",
+        );
         assert_eq!(parsed[0].urls[0], "stun:example.com:3478");
         assert_eq!(parsed[1].urls[0], "turn:example.com:3478");
         assert_eq!(parsed.len(), 2);
 
         // TURN-only config still gets the default STUN servers prepended.
-        let turn_only = WebRTCStream::parse_ice_servers("turn:example.com:3478");
+        let turn_only = WebRTCStream::parse_ice_servers("turn://u:p@example.com:3478");
         assert_eq!(turn_only[0].urls[0], DEFAULT_ICE_SERVERS[0].to_string());
         assert_eq!(turn_only[1].urls[0], "turn:example.com:3478");
     }
@@ -1585,6 +1624,29 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("detached close never evicted the peer connection from SESSIONS");
+    }
+
+    // A replayed offer asking for a different ICE policy must not be handed the cached peer
+    // connection. The lookup and the insert-time duplicate check read the same key, so the test
+    // fails if either one stops applying `is_reusable_for` — which is how the guard was dead
+    // code: the lookup rejected the entry, and the insert handed back the very same one.
+    #[tokio::test]
+    async fn test_cached_peer_is_not_reused_across_ice_policies() {
+        let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+        let offer = offerer.get_local_endpoint_trickle().await.unwrap();
+
+        let all_ice = WebRTCStream::new(&offer, false, 20000).await.unwrap();
+        assert!(!all_ice.relay_only);
+
+        let relay_only = WebRTCStream::new(&offer, true, 20000).await.unwrap();
+        assert!(
+            relay_only.relay_only,
+            "a Relay-only request was answered with the cached All-policy peer connection"
+        );
+
+        relay_only.close().await;
+        all_ice.close().await;
+        offerer.close().await;
     }
 
     // The local-candidate channel must close when the pc does. Its only sender lives inside the
