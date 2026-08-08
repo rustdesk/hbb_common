@@ -203,13 +203,21 @@ impl Stream {
     pub fn from(stream: TcpStream, stream_addr: SocketAddr) -> Self {
         Self::Tcp(tcp::FramedStream::from(stream, stream_addr))
     }
+}
 
-    #[inline]
-    #[cfg(feature = "webrtc")]
-    pub fn get_webrtc_stream(&self) -> Option<webrtc::WebRTCStream> {
-        match self {
-            Self::WebRTC(s) => Some(s.clone()),
-            _ => None,
-        }
+/// Owning the stream owns the transport, WebRTC included.
+///
+/// A peer connection outlives its handle — the session cache holds a clone, and the handler that
+/// evicts it only fires on a terminal ICE state — so it has to be closed explicitly. Doing that
+/// at each exit path made it an obligation every `return`, `break` and `?` had to remember, and
+/// the long-lived side never did: `server::connection` ends its ~15 exits by dropping the stream.
+/// Nothing warned, because a missed close leaks silently and only under WebRTC.
+///
+/// `Stream` is not `Clone`, so dropping it really is the end of the transport and there is no
+/// second owner to surprise. Explicit `close_webrtc()` calls remain valid — they close sooner
+/// than scope end — but they are now an optimization rather than the thing correctness rests on.
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.close_webrtc();
     }
 }
