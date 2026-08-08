@@ -256,6 +256,28 @@ impl WebRTCStream {
         )
     }
 
+    /// Reject a data channel from inside `on_data_channel`, where closing it directly does not
+    /// work.
+    ///
+    /// webrtc-rs runs this handler to completion BEFORE `handle_open` binds the SCTP stream, so
+    /// at this point `close()` only flips the ready state and returns — no stream reset — and
+    /// `handle_open` then sets it back to Open. With detached channels no read loop is spawned
+    /// either, so a channel refused here would stay open and undrained, and its queued bytes
+    /// count against the association-wide receive window: about a megabyte written into an
+    /// ignored channel stalls the one carrying the session. Close from the channel's own
+    /// `on_open` instead, which runs once the stream exists.
+    fn close_unbound_channel(dc: Arc<RTCDataChannel>) {
+        let dc_for_close = dc.clone();
+        dc.on_open(Box::new(move || {
+            let dc = dc_for_close.clone();
+            Box::pin(async move {
+                if let Err(err) = dc.close().await {
+                    log::debug!("failed to close rejected data channel: {}", err);
+                }
+            })
+        }));
+    }
+
     /// Whether a `SESSIONS` entry may be handed to a caller asking for `force_relay`.
     ///
     /// A hit returns a pc built for the FIRST caller, and two of its properties belong to this
@@ -583,7 +605,7 @@ impl WebRTCStream {
                             "Rejecting WebRTC data channel {}: not ordered and fully reliable",
                             d_label
                         );
-                        let _ = dc.close().await;
+                        Self::close_unbound_channel(dc);
                         return;
                     }
                     // Bind the first channel only. `detached` caches the first detached handle
@@ -593,7 +615,7 @@ impl WebRTCStream {
                     // Closed — and that watch gates both `send_bytes_inner` and `next()`.
                     if dc_bound.swap(true, Ordering::SeqCst) {
                         log::warn!("Ignoring extra WebRTC data channel {}", d_label);
-                        let _ = dc.close().await;
+                        Self::close_unbound_channel(dc);
                         return;
                     }
                     log::debug!("Remote data channel {} ready", d_label);
@@ -941,24 +963,20 @@ impl WebRTCStream {
     pub fn close_detached_with<T: Send + 'static>(&self, keep: T) {
         let pc = self.pc.clone();
         // Take the runtime handle explicitly rather than calling `tokio::spawn`: this also runs
-        // from `Drop` impls, which can execute during runtime teardown where a bare spawn panics.
-        // `Handle::spawn` can panic while the runtime is shutting down too, so catch it — a brief
-        // leak until process exit beats aborting the process from a destructor.
+        // from `Drop`, which can execute on a thread with no runtime, where a bare spawn panics —
+        // and a panic in a destructor aborts the process. Without a handle the pc cannot be closed
+        // here at all; it is released at process exit. (Catching a panic from `Handle::spawn`
+        // during runtime shutdown is not an option: release builds set `panic = "abort"`.)
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            log::warn!("no tokio runtime available to close the WebRTC peer connection");
+            log::debug!("no tokio runtime available to close the WebRTC peer connection");
             return;
         };
-        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle.spawn(async move {
-                let _keep = keep;
-                if let Err(err) = pc.close().await {
-                    log::debug!("WebRTC background close failed: {}", err);
-                }
-            });
-        }));
-        if spawned.is_err() {
-            log::warn!("failed to spawn the WebRTC close (runtime shutting down)");
-        }
+        handle.spawn(async move {
+            let _keep = keep;
+            if let Err(err) = pc.close().await {
+                log::debug!("WebRTC background close failed: {}", err);
+            }
+        });
     }
 
     #[inline]
@@ -1088,8 +1106,17 @@ impl WebRTCStream {
             // connection down for missing them. The narrower the miss, the more certain the
             // teardown, which is precisely backwards.
             let write_deadline = Instant::now() + Duration::from_millis(send_timeout);
-            match timeout_at(write_deadline, self.send_bytes_inner(bytes)).await {
-                Ok(res) => res,
+            let mut desynced = false;
+            match timeout_at(write_deadline, self.send_bytes_inner(bytes, &mut desynced)).await {
+                // A write that failed part-way leaves the same orphaned prefix a timeout does, so
+                // it needs the same teardown — and the same handoff of the permit, or a waiting
+                // clone appends its message to that prefix while the close is still in flight.
+                Ok(res) => {
+                    if desynced {
+                        self.close_detached_with(send_permit);
+                    }
+                    res
+                }
                 Err(_) => {
                     // Hand the logical-message permit to the teardown so no waiting clone can
                     // append a new message after a partially-written fragment sequence. Holding
@@ -1099,17 +1126,24 @@ impl WebRTCStream {
                 }
             }
         } else {
-            let _send_permit = send_gate.acquire_owned().await.map_err(|err| {
+            let send_permit = send_gate.acquire_owned().await.map_err(|err| {
                 Error::new(
                     ErrorKind::BrokenPipe,
                     format!("WebRTC send gate closed: {}", err),
                 )
             })?;
-            self.send_bytes_inner(bytes).await
+            let mut desynced = false;
+            let res = self.send_bytes_inner(bytes, &mut desynced).await;
+            if desynced {
+                self.close_detached_with(send_permit);
+            }
+            res
         }
     }
 
-    async fn send_bytes_inner(&mut self, bytes: Bytes) -> ResultType<()> {
+    /// `desynced` is set when the failure left a partial fragment sequence on the wire, i.e. when
+    /// the stream can no longer be made consistent and the caller must close it.
+    async fn send_bytes_inner(&mut self, bytes: Bytes, desynced: &mut bool) -> ResultType<()> {
         // Same bound the receiver enforces, so we never emit a message a same-version peer
         // would have to kill the connection over.
         if bytes.len() > MAX_RECV_MESSAGE {
@@ -1131,17 +1165,14 @@ impl WebRTCStream {
             framed.put_u8(if is_last { FRAG_END } else { FRAG_MORE });
             framed.put_slice(chunk);
             if let Err(err) = dc.write(&framed.freeze()).await {
-                if wrote_any {
-                    // The sequence stops with fragments already on the wire, so the peer's
-                    // accumulator holds a prefix that will never be terminated — and this framing
-                    // carries no length or sequence number for it to notice with, so the next
-                    // message is appended to the orphan and parsed as one corrupt frame. The
-                    // stream cannot be made consistent again from this side; kill it. (Callers
-                    // wrap sends in allow_err! and keep going, so returning the error alone would
-                    // leave the corruption in place.)
-                    log::warn!("WebRTC send failed mid-message, closing: {}", err);
-                    self.close_detached();
-                }
+                // A sequence that stops with fragments already on the wire leaves the peer's
+                // accumulator holding a prefix that will never be terminated — and this framing
+                // carries no length or sequence number for it to notice with, so the next message
+                // is appended to the orphan and parsed as one corrupt frame. Report it so the
+                // caller can tear the stream down while still holding the send permit; callers
+                // wrap sends in allow_err! and keep going, so returning the error alone would
+                // leave the corruption in place.
+                *desynced = wrote_any;
                 return Err(err.into());
             }
             wrote_any = true;
