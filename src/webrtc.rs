@@ -1,43 +1,20 @@
 //! WebRTC transport for RustDesk streams.
 //!
-//! # webrtc crate upgrade checklist
+//! # Bumping the webrtc crate
 //!
-//! The webrtc crate version is MSRV-pinned in Cargo.toml (see the comment there). Beyond plain
-//! API compatibility, this module relies on webrtc-rs *internals* that its public API does not
-//! guarantee. All of them were verified against webrtc 0.13 (webrtc-data 0.11, webrtc-sctp 0.12);
-//! re-verify each against the new crate sources when bumping:
+//! This module depends on webrtc-rs internals its public API does not promise. Re-verify each
+//! against the new sources (last checked: webrtc 0.13, -data 0.11, -sctp 0.12), then run
+//! `cargo test --features webrtc webrtc::tests`.
 //!
-//! - **Send backpressure is bounded**: `data::DataChannel::write` PARKS when webrtc-sctp's
-//!   PendingQueue is full (byte-counting semaphore, `QUEUE_BYTES_LIMIT` = 128 KiB; permits return
-//!   as chunks drain) and inflight data is cwnd/rwnd-capped (peer default rwnd 1 MiB).
-//!   `send_bytes` depends on this both for bounded memory on slow links and for its
-//!   send_timeout-then-close semantics. If a new version buffers unboundedly instead, video can
-//!   OOM a slow session and the send timeout never fires.
-//! - **Max SCTP message size 65536**: `MAX_FRAGMENT_PAYLOAD` + 1 header byte must stay below it.
-//! - **The successful read path is cancel-safe**: `read_sctp` dequeues synchronously and returns
-//!   with no `.await` after it, and `read_data_channel` adds none on the user-data path. So
-//!   `next_timeout`, which drops that future routinely, cannot lose a fragment — a version that
-//!   awaited after dequeuing would, undetectably, since the header carries no length or checksum.
-//!   Scope: the *read*. `read_data_channel` does await after dequeuing on its ErrShortBuffer and
-//!   DCEP branches, and `next()` itself awaits `pc.close()` on its error paths — and
-//!   `RTCPeerConnection::close` latches `is_closed` before its first await, so a cancelled close
-//!   silently makes every later close a no-op and leaves the pc in `SESSIONS`.
-//! - **`detach()` is an idempotent Arc clone with no close-on-drop** (`detached_dc` caches it and
-//!   clones are shared across `WebRTCStream` clones).
-//! - **`on_*` handlers are stored inside the pc**: a handler capturing a strong
-//!   `Arc<RTCPeerConnection>` forms an uncollectable cycle and leaks the pc permanently — see the
-//!   `Arc::downgrade` in `new()`; any newly added handler must follow it.
-//! - **`Disconnected` peer-connection state is transient/recoverable** (ICE consent lapse);
-//!   only `Failed`/`Closed` are treated as terminal by the state handler.
-//! - **`RTCIceCandidatePair`'s `Display` format**: its candidates are private in 0.13, so
-//!   `is_relayed()` reads the candidate type out of
-//!   `"(local) {protocol} {typ} {addr}:{port}{related} <-> (remote) ..."` by position. 0.17+
-//!   makes the fields `pub`; switch to them and delete the parse. (It cannot use the stats
-//!   report's `nominated` flag instead: webrtc-ice sets that per checklist entry and never
-//!   clears it, so several entries carry it after a pair switch.)
-//!
-//! Then re-run the loopback tests at the bottom of this file (`cargo test --features webrtc
-//! webrtc::tests`).
+//! - `DataChannel::write` parks on a full PendingQueue instead of buffering without bound.
+//! - SCTP max message size is 65536: `MAX_FRAGMENT_PAYLOAD` + 1 must stay below it.
+//! - `read_sctp` does not await after dequeuing, so a dropped `next()` cannot lose a fragment.
+//! - `detach()` is an idempotent Arc clone that does not close on drop.
+//! - `on_*` handlers live in the pc: one holding a strong `Arc<RTCPeerConnection>` leaks it.
+//! - `close()` latches `is_closed` before its first await, so a cancelled close is unretryable.
+//! - `Disconnected` is transient; only `Failed`/`Closed` are terminal.
+//! - `RTCIceCandidatePair`'s `Display` layout — `is_relayed()` parses it because 0.13 keeps the
+//!   candidates private. 0.17+ exposes them; switch and delete the parse.
 
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
@@ -94,12 +71,9 @@ pub struct WebRTCStream {
     // Serialize a complete logical message across clones. Each fragment is a separate SCTP
     // message, so serializing only individual writes would allow two large messages to interleave.
     send_gate: Arc<Semaphore>,
-    // Receive-side reassembly state, behind the Arc rather than in the future so a cancelled
-    // `next()` does not lose the partial message. SINGLE READER ONLY: reassembly spans calls, and
-    // the fragment header carries no length or sequence number, so two readers splice unrelated
-    // fragments into one `acc` and produce a well-formed, undetectably wrong message. Every
-    // consumer today reads from one task; keep it that way (this is why no API hands out a clone
-    // that outlives its `Stream`).
+    // Behind the Arc, not in the future, so a cancelled `next()` keeps the partial message.
+    // SINGLE READER ONLY: reassembly spans calls and the fragment header carries no length or
+    // sequence number, so two readers splice unrelated fragments into one wrong-but-valid message.
     recv_state: Arc<Mutex<RecvState>>,
     // True once the controller has completed the RustDesk identity binding (DTLS fingerprint
     // matched to the signed peer id, via `set_key`). DTLS always encrypts; this flag mirrors TCP's
@@ -136,20 +110,9 @@ const SCRATCH_REFILL: usize = 4 * RECV_BUF_SIZE;
 const FRAG_MORE: u8 = 1;
 /// Fragment header byte: final (or only) fragment of a logical message.
 const FRAG_END: u8 = 0;
-/// Largest logical message this transport will send or reassemble.
-///
-/// Held at parity with TCP on purpose. A transport-specific ceiling would be a trap: the same
-/// session moves between WebRTC and the relay, so a message under TCP's limit but over this one
-/// would work on one path and kill the connection on the other — and it would bite hardest on
-/// exactly the large messages (a keyframe, a big clipboard image) that a direct path exists to
-/// carry. Whatever the right maximum is, both transports need the same one.
-///
-/// That leaves a real exposure, shared with TCP and not created here: the cap is the memory an
-/// unauthenticated peer can make a receiver hold, and the answerer runs before any password
-/// check. TCP is no better off — `BytesCodec::new` leaves `max_packet_length` at `usize::MAX`,
-/// so its only bound is the 30-bit length field in the frame header. Tightening it belongs in
-/// one change across both paths, with a number measured against real traffic rather than
-/// guessed; until then this at least holds the peak to the cap instead of twice it.
+/// Largest logical message this transport will send or reassemble, and the memory an
+/// unauthenticated peer can make a receiver hold. Kept at parity with TCP on purpose: one session
+/// moves between both paths, so a transport-specific ceiling would kill it on the other one.
 const MAX_RECV_MESSAGE: usize = crate::bytes_codec::MAX_FRAME_LENGTH;
 // use 3 public STUN servers to find out the NAT type, 2 must be the same address but different ports
 // https://stackoverflow.com/questions/72805316/determine-nat-mapping-behaviour-using-two-stun-servers
@@ -257,15 +220,8 @@ impl WebRTCStream {
     }
 
     /// Reject a data channel from inside `on_data_channel`, where closing it directly does not
-    /// work.
-    ///
-    /// webrtc-rs runs this handler to completion BEFORE `handle_open` binds the SCTP stream, so
-    /// at this point `close()` only flips the ready state and returns — no stream reset — and
-    /// `handle_open` then sets it back to Open. With detached channels no read loop is spawned
-    /// either, so a channel refused here would stay open and undrained, and its queued bytes
-    /// count against the association-wide receive window: about a megabyte written into an
-    /// ignored channel stalls the one carrying the session. Close from the channel's own
-    /// `on_open` instead, which runs once the stream exists.
+    /// work: webrtc-rs runs that handler to completion BEFORE `handle_open` binds the SCTP stream,
+    /// so `close()` only flips the ready state and `handle_open` then sets it back to Open.
     fn close_unbound_channel(dc: Arc<RTCDataChannel>) {
         let dc_for_close = dc.clone();
         dc.on_open(Box::new(move || {
@@ -278,17 +234,9 @@ impl WebRTCStream {
         }));
     }
 
-    /// Whether a `SESSIONS` entry may be handed to a caller asking for `force_relay`.
-    ///
-    /// A hit returns a pc built for the FIRST caller, and two of its properties belong to this
-    /// caller instead: the ICE policy (`rendezvous_mediator` recomputes relay-only per PunchHole,
-    /// so a replayed offer wanting Relay-only must not get an All-policy pc free to pick a direct
-    /// pair), and liveness (the state handler latches Closed and closes the stream before it
-    /// reaches SESSIONS to evict, so the map briefly holds dead entries). `peer_verified` stays
-    /// shared on purpose: it is a fact about the DTLS certificate the entry is keyed by.
-    ///
-    /// Both the lookup and the insert-time duplicate check must use this — they read the same key,
-    /// so a test applied at only one of them is not applied at all.
+    /// Whether a cached `SESSIONS` entry may be handed to a caller asking for `force_relay`: it
+    /// was built for the first caller, so its ICE policy may not match, and the state handler
+    /// evicts late enough that dead entries linger. Both the lookup and the insert must use it.
     fn is_reusable_for(&self, force_relay: bool) -> bool {
         self.relay_only == force_relay
             && !matches!(
@@ -323,17 +271,9 @@ impl WebRTCStream {
         if !matches!(u.scheme(), "turn" | "turns" | "stun" | "stuns") {
             return None;
         }
-        // Two spellings are accepted, and they parse very differently:
-        //
-        // - `turn://user:pass@host:port` — non-standard, but the only form that can carry
-        //   credentials. `url` sees an authority and fills host/port/username/password.
-        // - `turn:host:port` — the RFC 7065 form users actually copy from TURN docs. These
-        //   schemes are not special and there is no `//`, so `url` makes it cannot-be-a-base:
-        //   `host_str()` is None and the whole `host:port` lands in the path. Reading it back
-        //   out is what makes this form work at all; it previously produced a hostless
-        //   `turn::3478` that no ICE agent can resolve — while still satisfying
-        //   `has_turn_server()`, so a force_relay peer connection was built against it and
-        //   could only ever time out.
+        // Two accepted spellings parse differently: `turn://user:pass@host:port` has an authority
+        // and is the only form that can carry credentials, while the RFC 7065 `turn:host:port` is
+        // cannot-be-a-base, so `host_str()` is None and the whole `host:port` lands in the path.
         let (host, port) = match u.host_str() {
             Some(host) => (host.to_owned(), u.port().unwrap_or(3478)),
             None => Self::split_host_port(u.path())?,
@@ -522,14 +462,9 @@ impl WebRTCStream {
         let (ice_tx, ice_rx) = mpsc::unbounded_channel::<String>();
         // Create a new RTCPeerConnection
         let pc = Arc::new(api.new_peer_connection(config).await?);
-        // This closure is the only owner of the ICE-candidate sender, and `on_*` handlers live
-        // inside the pc: nothing clears them — not `RTCPeerConnection::close`, not the ICE
-        // gatherer's own close — so the sender outlives `close()` and every `SESSIONS` eviction.
-        // The receiver therefore never sees the channel close, and the forwarder task this API
-        // asks callers to write (`while let Some(c) = rx.recv().await { peer.add_remote_ice(..) }`
-        // with a stream clone moved in) parks on `recv()` forever, holding the pc alive with it:
-        // one leaked task plus one leaked peer connection per connection. The terminal-state
-        // handler below drops this closure to break that; see the note there.
+        // `on_*` handlers are never cleared — not by `close()`, not by `SESSIONS` eviction — so
+        // this sender outlives the pc and would park a caller's ICE forwarder on `recv()` forever,
+        // holding the pc with it. The terminal-state handler below drops this closure to break it.
         let local_ice_tx = ice_tx.clone();
         pc.on_ice_candidate(Box::new(move |candidate| {
             let local_ice_tx = local_ice_tx.clone();
@@ -589,14 +524,9 @@ impl WebRTCStream {
                 let stream_for_dc_clone = stream_for_dc.clone();
                 let dc_bound = dc_bound.clone();
                 Box::pin(async move {
-                    // Reassembly spans data-channel messages, so it is sound only on an ordered,
-                    // fully-reliable channel: the 1-byte fragment header carries no sequence
-                    // number, so a reorder splices fragments into a well-formed but wrong
-                    // message, and a dropped fragment merges two messages instead of erroring.
-                    // webrtc-rs derives these parameters entirely from the REMOTE's DCEP OPEN
-                    // (`channel_type` picks ordered / max_retransmits / max_packet_life_time),
-                    // and this pc is built from an unauthenticated offer, so the peer would
-                    // otherwise choose our reassembly's correctness conditions for us.
+                    // Reassembly is sound only on an ordered, fully-reliable channel: the fragment
+                    // header has no sequence number, so a reorder or a loss silently merges
+                    // messages. webrtc-rs takes these from the unauthenticated REMOTE's DCEP OPEN.
                     if !dc.ordered()
                         || dc.max_retransmits().is_some()
                         || dc.max_packet_lifetime().is_some()
@@ -660,13 +590,9 @@ impl WebRTCStream {
                             return;
                         };
 
-                        // Drop the ICE-candidate handler, and with it the only sender for the
-                        // local-candidate channel. Nothing else ever will: `close()` clears no
-                        // handler, so the receiver would stay open forever and a caller's
-                        // forwarder task would park on `recv()` holding a stream clone — keeping
-                        // this pc alive past its own teardown. Replacing the handler with a
-                        // no-op closes the channel, the forwarder's loop ends, and its clone
-                        // goes with it. Gathering is over by this state anyway.
+                        // Nothing else ever drops this sender (`close()` clears no handler), so
+                        // replace the handler to close the channel: a caller's forwarder loop then
+                        // ends instead of parking on `recv()` and holding this pc alive.
                         pc_for_close2.on_ice_candidate(Box::new(|_| Box::pin(async {})));
 
                         let mut sessions_lock = SESSIONS.lock().await;
@@ -712,14 +638,9 @@ impl WebRTCStream {
             })
         }));
 
-        // process offer/answer
-        //
-        // Trickle ICE: this block is local-only work (pc construction, DTLS keygen, SDP marshal),
-        // no gathering wait. The controlled side awaits answer creation inline on its punch-reply
-        // critical path, so adding a network wait here would delay every hole punch.
-        // A failure below leaves a live pc whose state handler only fires on a terminal ICE state,
-        // so a bare `?`-drop leaks it — remotely triggerable via a crafted `type:"answer"` offer
-        // that passes the pre-check but fails `set_remote_description`. Close before propagating.
+        // Trickle ICE: local-only work, no gathering wait — the controlled side awaits answer
+        // creation inline on its punch-reply critical path. A failure below leaves a live pc whose
+        // state handler only fires on a terminal ICE state, so close before propagating.
         let offer_answer: ResultType<String> = async {
             if start_local_offer {
                 let sdp = pc.create_offer(None).await?;
@@ -811,14 +732,9 @@ impl WebRTCStream {
             let sdp = if self.relay_only {
                 serde_json::to_string(&local_desc)?
             } else {
-                // Declare the ICE transport policy inside the envelope. The receiver of an
-                // offer that arrives with force_relay set must know whether it may answer
-                // with full ICE (relay forced by the transport, e.g. WebSocket signaling)
-                // or must stay Relay-only + TURN-gated (relay by policy) — and the envelope
-                // is the offer's own property, so it rides here rather than in a proto
-                // field the rendezvous server would have to forward. An extra key is
-                // invisible to older peers: serde ignores unknown fields when parsing
-                // RTCSessionDescription, so absence — not an error — is the old semantics.
+                // Rides in the envelope, not a proto field the rendezvous server would forward,
+                // because it is the offer's own property: the receiver must know whether
+                // force_relay was policy (stay Relay-only) or transport. Older peers ignore it.
                 let mut v = serde_json::to_value(&local_desc)?;
                 v[Self::ICE_POLICY_KEY] = serde_json::Value::from(Self::ICE_POLICY_ALL);
                 serde_json::to_string(&v)?
@@ -883,17 +799,9 @@ impl WebRTCStream {
         let dtls = self.pc.sctp().transport();
         let pair = dtls.ice_transport().get_selected_candidate_pair().await?;
 
-        // Answer from the selected pair, not from the stats report's `nominated` flag: in
-        // webrtc-ice that flag is sticky per checklist entry (set on nomination, never cleared —
-        // a pair switch only clears the agent's own `nominated_pair` slot), and the report
-        // enumerates the whole checklist. After an ICE switch, or on a controlled agent that saw
-        // USE-CANDIDATE more than once, several entries carry it and `HashMap::values()` order
-        // decides the answer — which can differ between two calls in one session.
-        //
-        // 0.13 keeps the pair's candidates private, so read the types out of its `Display`:
-        // "(local) {protocol} {typ} {addr}:{port}{related} <-> (remote) ...". Positionally, not
-        // by substring — an address must not be able to pass for a candidate type. See the
-        // upgrade checklist: 0.17+ exposes the fields and this parse goes away.
+        // Not the stats report's `nominated` flag: webrtc-ice never clears it per checklist entry,
+        // so after a pair switch several entries carry it and map order decides the answer.
+        // 0.13 keeps the candidates private, so read the types out of `Display` by position.
         let relay = RTCIceCandidateType::Relay.to_string();
         Some(
             pair.to_string()
@@ -944,22 +852,11 @@ impl WebRTCStream {
         self.pc.close().await.ok();
     }
 
-    /// Tear the pc down on the runtime instead of awaiting it here, keeping `keep` alive until
-    /// the teardown finishes.
+    /// Tear the pc down on the runtime, keeping `keep` alive until the teardown finishes.
     ///
-    /// Every caller polls `next()` — and often `send_bytes` — inside a `tokio::select!`, so an
-    /// `.await` on these paths is a cancellation point, and a competing arm (connection.rs and
-    /// io_loop.rs both run a 1s timer next to the read) routinely wins one. That is fatal to a
-    /// close: `RTCPeerConnection::close` latches `is_closed` before its first await and fires
-    /// the state handler only at the very end, so a cancelled close leaves a pc no later
-    /// `close()` can retry (they early-return on `is_closed`), whose `SESSIONS` entry — evicted
-    /// only from that handler — is stranded for the life of the process, and whose
-    /// `state_notify` never reaches `Closed`, leaving `wait_for_connect_result` reporting a live
-    /// connection on a dead pc.
-    ///
-    /// `keep` carries anything whose lifetime must span the teardown rather than the caller's:
-    /// the send path passes its logical-message permit, so no waiting clone can append to a
-    /// partially-written fragment sequence while the close is still in flight.
+    /// Callers poll this path inside a `select!`, and `close()` latches `is_closed` before its
+    /// first await, so a cancelled close strands the pc: unretryable, never evicted from
+    /// `SESSIONS`, never notifying `Closed`. The send path passes its permit as `keep`.
     pub fn close_detached_with<T: Send + 'static>(&self, keep: T) {
         let pc = self.pc.clone();
         // Take the runtime handle explicitly rather than calling `tokio::spawn`: this also runs
@@ -1165,13 +1062,9 @@ impl WebRTCStream {
             framed.put_u8(if is_last { FRAG_END } else { FRAG_MORE });
             framed.put_slice(chunk);
             if let Err(err) = dc.write(&framed.freeze()).await {
-                // A sequence that stops with fragments already on the wire leaves the peer's
-                // accumulator holding a prefix that will never be terminated — and this framing
-                // carries no length or sequence number for it to notice with, so the next message
-                // is appended to the orphan and parsed as one corrupt frame. Report it so the
-                // caller can tear the stream down while still holding the send permit; callers
-                // wrap sends in allow_err! and keep going, so returning the error alone would
-                // leave the corruption in place.
+                // Fragments already on the wire leave the peer an unterminated prefix, and this
+                // framing has no length for it to notice with, so the next message is appended
+                // to it. Callers wrap sends in `allow_err!`, so the error alone is not enough.
                 *desynced = wrote_any;
                 return Err(err.into());
             }
@@ -1223,24 +1116,17 @@ impl WebRTCStream {
                 }
             };
             if n == 0 {
-                // End of stream. Our own sender never produces this — every fragment carries at
-                // least its header byte — but it is NOT exclusively a reset: webrtc-data maps the
-                // StringEmpty/BinaryEmpty PPIDs to n == 0 as well, and `read` discards the flag
-                // that would separate them, so a peer can also reach here by sending one empty
-                // data-channel message. Both mean the same thing to us (this peer will send us
-                // nothing more we can frame), so treat them alike, but do not report it as a
-                // clean remote close: it is equally a peer that just violated the framing.
+                // Not exclusively a stream reset: webrtc-data maps the empty-message PPIDs to
+                // n == 0 as well and `read` drops the flag that would separate them. Both mean
+                // nothing frameable follows, so treat them alike but not as a clean remote close.
                 log::debug!("WebRTC data channel ended (reset or empty message)");
                 *acc = BytesMut::new();
                 self.close_detached();
                 return None;
             }
-            // Two framing violations, both of which would otherwise be read as "more fragments":
-            // an unrecognized header, and a FRAG_MORE carrying no payload. The latter is the
-            // nastier one — it adds nothing to `acc`, so the MAX_FRAME_LENGTH cap below never
-            // trips and the loop spins for as long as the peer keeps sending. `send_bytes_inner`
-            // emits FRAG_MORE only for a full MAX_FRAGMENT_PAYLOAD chunk, so neither is reachable
-            // from our own sender.
+            // Both would otherwise read as "more fragments". The payload-less FRAG_MORE is the
+            // nastier one: it adds nothing to `acc`, so the cap below never trips and the loop
+            // spins for as long as the peer keeps sending.
             let header = scratch[0];
             let bad = match header {
                 FRAG_END => None,
@@ -1258,12 +1144,9 @@ impl WebRTCStream {
                     format!("WebRTC {why}"),
                 )));
             }
-            // Bound BEFORE growing, not after. This framing carries no length, so an oversize
-            // message can only be discovered by accumulating it — unlike the TCP codec, which
-            // rejects on the declared length before a single payload byte is buffered. Checking
-            // after the append would make the peak the cap plus a fragment, and `BytesMut` grows
-            // by reallocate-and-copy, so the final doubling would hold the old and new buffers at
-            // once: ~2x the cap in RSS for a session that has produced no message at all.
+            // Bound BEFORE growing: this framing carries no length, so an oversize message is only
+            // discovered by accumulating it, and checking after the append would let `BytesMut`'s
+            // reallocate-and-copy hold the old and the new buffer at once.
             if acc.len() + (n - 1) > MAX_RECV_MESSAGE {
                 // Release the buffer, don't just truncate it: by definition it is near the cap
                 // here, and `recv_state` outlives this call through the `SESSIONS` clone.
@@ -1663,15 +1546,9 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         (offerer, answerer)
     }
 
-    // next()'s teardown paths must not be cancellable: every consumer polls next() inside a
-    // select! against a timer, and an awaited close that loses that race strands the pc
-    // (is_closed is already latched, so no later close retries) along with its SESSIONS entry,
-    // which only the state handler evicts.
-    //
-    // The cancellation itself is not what this test pins — `close_detached` is a non-async fn,
-    // so its callers have no await point to be cancelled at, and the compiler enforces that.
-    // What needs proving is the other half: that work handed to the runtime still runs to
-    // completion once the caller has walked away.
+    // next()'s teardown must not be cancellable: an awaited close that loses the select! race
+    // against a consumer's timer strands the pc (is_closed already latched) and its SESSIONS
+    // entry. `close_detached` is non-async, so what needs proving is that the handoff completes.
     #[tokio::test]
     async fn test_close_detached_completes_without_the_caller() {
         let (offerer, answerer) = connect_loopback().await;
@@ -1802,16 +1679,9 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             .unwrap();
     }
 
-    // Extra channels opened after the bootstrap one must not displace it: rebinding would leave
-    // teardown closing a channel send/recv no longer use, and the newcomer's on_open would push
-    // Open onto the watch that gates both, re-arming a session already latched Closed.
-    //
-    // Scope, honestly: only the bind-once guard is exercised. The ordered+reliable check sits
-    // ahead of it but cannot decide anything here — `WebRTCStream::new` always creates its
-    // bootstrap channel first, so whatever the offerer adds afterwards is refused for being
-    // second regardless of its parameters. Covering that check needs a hand-built peer whose
-    // FIRST channel is unordered, which is more scaffolding than the guard is worth; it is a
-    // three-accessor test against parameters webrtc-rs derives verbatim from the remote's DCEP.
+    // Extra channels must not displace the bound one: the newcomer's on_open would push Open onto
+    // the watch that gates send and recv, re-arming a session already latched Closed. Only the
+    // bind-once guard is exercised; the ordered+reliable check cannot decide anything here.
     #[tokio::test]
     async fn test_webrtc_answerer_binds_only_the_first_data_channel() {
         use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
