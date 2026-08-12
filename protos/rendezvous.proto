@@ -64,16 +64,19 @@ message PunchHole {
   bytes socket_addr_v6 = 7;
   ControlPermissions control_permissions = 8;
   ControlledContext controlled_context = 9;
+  bytes udp_punch_token = 10;
 }
 
 message TestNatRequest {
   int32 serial = 1;
+  bytes nonce = 2;
 }
 
 // per my test, uint/int has no difference in encoding, int not good for negative, use sint for negative
 message TestNatResponse {
   int32 port = 1; 
   ConfigUpdate cu = 2; // for mobile
+  bytes nonce = 3;
 }
 
 enum NatType {
@@ -90,6 +93,7 @@ message PunchHoleSent {
   string version = 5;
   int32 upnp_port = 6;
   bytes socket_addr_v6 = 7;
+  bytes udp_punch_token = 8;
 }
 
 message RegisterPk {
@@ -98,6 +102,7 @@ message RegisterPk {
   bytes pk = 3;
   string old_id = 4;
   bool no_register_device = 5;
+  bool udp_punch_token_supported = 6;
 }
 
 message RegisterPkResponse {
