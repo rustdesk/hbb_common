@@ -9,6 +9,9 @@ edition = "2018"
 [features]
 default = []
 webrtc = ["dep:webrtc"]
+# The isolated Wayland socket-probe fallback (src/platform/linux/wayland_probe.rs). Off by default
+# so the base Wayland enumeration is untouched; the DRM login-screen build (scrap/drm) turns it on.
+wayland_probe = []
 
 [dependencies]
 # new flexi_logger failed on rustc 1.75

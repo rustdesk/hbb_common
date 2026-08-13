@@ -365,7 +365,7 @@ pub fn system_message(title: &str, msg: &str, forever: bool) -> ResultType<()> {
     crate::bail!("failed to post system message");
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde_derive::Serialize, serde_derive::Deserialize)]
 pub struct WaylandDisplayInfo {
     pub name: String,
     pub x: i32,
@@ -376,8 +376,31 @@ pub struct WaylandDisplayInfo {
     pub refresh_rate: i32,
 }
 
+/// The isolated socket-probe fallback, in its own file and behind the `wayland_probe` feature so
+/// the base Wayland path never compiles it. The DRM login-screen build turns it on.
+#[cfg(feature = "wayland_probe")]
+pub mod wayland_probe;
+#[cfg(feature = "wayland_probe")]
+pub use wayland_probe::{wayland_display_probe_child_main, WAYLAND_DISPLAY_PROBE_ARG};
+
 // Retrieves information about all connected displays via the Wayland protocol.
 pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
+    // Read before connecting: `connect_to_env` consumes `WAYLAND_SOCKET`. Only the probe fallback
+    // needs this, so it is computed only when that feature is compiled in.
+    #[cfg(feature = "wayland_probe")]
+    let named_endpoint = wayland_probe::env_names_wayland_endpoint();
+    match Connection::connect_to_env() {
+        Ok(conn) => collect_wayland_displays(&conn),
+        // Without the feature, the connect error is final, exactly as before this fallback existed.
+        #[cfg(not(feature = "wayland_probe"))]
+        Err(err) => Err(err.into()),
+        #[cfg(feature = "wayland_probe")]
+        Err(err) => wayland_probe::wayland_displays_from_runtime_dir(named_endpoint)
+            .map_err(|fallback_err| anyhow::anyhow!("{err}; {fallback_err}")),
+    }
+}
+
+fn collect_wayland_displays(conn: &Connection) -> ResultType<Vec<WaylandDisplayInfo>> {
     struct WaylandEnv {
         registry_state: RegistryState,
         output_state: OutputState,
@@ -398,14 +421,13 @@ pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
             &mut self.registry_state
         }
 
-        sctk::registry_handlers!();
+        sctk::registry_handlers![OutputState];
     }
 
     sctk::delegate_output!(WaylandEnv);
     sctk::delegate_registry!(WaylandEnv);
 
-    let conn = Connection::connect_to_env()?;
-    let (globals, mut event_queue) = globals::registry_queue_init(&conn)?;
+    let (globals, mut event_queue) = globals::registry_queue_init(conn)?;
     let queue_handle = event_queue.handle();
 
     let registry_state = RegistryState::new(&globals);

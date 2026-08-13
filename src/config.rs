@@ -2903,6 +2903,9 @@ pub mod keys {
     pub const OPTION_ENABLE_OPEN_NEW_CONNECTIONS_IN_TABS: &str =
         "enable-open-new-connections-in-tabs";
     pub const OPTION_TEXTURE_RENDER: &str = "use-texture-render";
+    // Internal health record written by the texture-render watchdog/probe;
+    // "failed-*" flips the texture-render default to opt-in on this machine.
+    pub const OPTION_TEXTURE_RENDER_HEALTH: &str = "texture-render-health";
     pub const OPTION_ALLOW_D3D_RENDER: &str = "allow-d3d-render";
     pub const OPTION_ENABLE_CHECK_UPDATE: &str = "enable-check-update";
     pub const OPTION_ALLOW_AUTO_UPDATE: &str = "allow-auto-update";
