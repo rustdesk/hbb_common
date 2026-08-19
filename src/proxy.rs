@@ -9,6 +9,7 @@ use base64::{engine::general_purpose, Engine};
 use httparse::{Error as HttpParseError, Response, EMPTY_HEADER};
 use thiserror::Error as ThisError;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufStream};
+#[cfg(not(target_env = "ohos"))]
 use tokio_native_tls::{native_tls, TlsConnector, TlsStream};
 use tokio_rustls::{client::TlsStream as RustlsTlsStream, TlsConnector as RustlsTlsConnector};
 use tokio_socks::{tcp::Socks5Stream, IntoTargetAddr, TargetAddr};
@@ -45,6 +46,7 @@ pub enum ProxyError {
     HttpCode200(u16),
     #[error("The proxy address resolution failed: {0}")]
     AddressResolutionFailed(String),
+    #[cfg(not(target_env = "ohos"))]
     #[error("The native tls error: {0}")]
     NativeTlsError(#[from] tokio_native_tls::native_tls::Error),
 }
@@ -425,6 +427,7 @@ impl Proxy {
                         )
                         .await?
                     }
+                    #[cfg(not(target_env = "ohos"))]
                     TlsType::NativeTls => {
                         self.https_connect_nativetls_wrap_danger(
                             &url,
@@ -434,6 +437,10 @@ impl Proxy {
                             danger_accept_invalid_cert,
                         )
                         .await?
+                    }
+                    #[cfg(target_env = "ohos")]
+                    TlsType::NativeTls => {
+                        bail!("NativeTls is unavailable on OpenHarmony")
                     }
                     _ => {
                         // Unreachable
@@ -477,6 +484,7 @@ impl Proxy {
         };
     }
 
+    #[cfg(not(target_env = "ohos"))]
     async fn https_connect_nativetls_wrap_danger<'a>(
         &self,
         url: &str,
@@ -503,6 +511,7 @@ impl Proxy {
         Ok(DynTcpStream(Box::new(s)))
     }
 
+    #[cfg(not(target_env = "ohos"))]
     pub async fn https_connect_nativetls<'a, Input>(
         &self,
         io: Input,
@@ -584,16 +593,33 @@ impl Proxy {
                     )
                     .await?
                 } else if !is_tls_type_cached {
-                    log::warn!("Falling back to native-tls for HTTPS proxy server.");
-                    self.https_connect_nativetls_wrap_danger(
-                        &url,
-                        local,
-                        proxy,
-                        &target_addr,
-                        origin_danger_accept_invalid_cert,
-                    )
-                    .await?
+                    #[cfg(target_env = "ohos")]
+                    {
+                        log::error!(
+                            "Failed to connect to HTTPS proxy server with rustls: {:?}.",
+                            e
+                        );
+                        bail!(e)
+                    }
+                    #[cfg(not(target_env = "ohos"))]
+                    {
+                        log::warn!("Falling back to native-tls for HTTPS proxy server.");
+                        self.https_connect_nativetls_wrap_danger(
+                            &url,
+                            local,
+                            proxy,
+                            &target_addr,
+                            origin_danger_accept_invalid_cert,
+                        )
+                        .await?
+                    }
                 } else {
+                    #[cfg(target_env = "ohos")]
+                    log::error!(
+                        "Failed to connect to HTTPS proxy server with rustls: {:?}.",
+                        e
+                    );
+                    #[cfg(not(target_env = "ohos"))]
                     log::error!(
                         "Failed to connect to HTTPS proxy server with native-tls: {:?}.",
                         e

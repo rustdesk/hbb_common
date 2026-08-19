@@ -30,7 +30,7 @@ pub mod config;
 pub mod fs;
 pub mod mem;
 pub use lazy_static;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 pub use mac_address;
 pub use rand;
 pub use regex;
@@ -44,9 +44,9 @@ pub use directories_next;
 pub use libc;
 pub mod keyboard;
 pub use base64;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 pub use dlopen;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
 pub use machine_uid;
 pub use serde_derive;
 pub use serde_json;
@@ -61,17 +61,17 @@ pub mod stream;
 pub mod websocket;
 #[cfg(feature = "webrtc")]
 pub mod webrtc;
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
 pub use rustls_platform_verifier;
 pub use stream::Stream;
 pub use whoami;
 pub mod tls;
 pub mod verifier;
 pub use async_recursion;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use users;
 pub use libloading;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use x11;
 
 pub type SessionID = uuid::Uuid;
@@ -316,7 +316,7 @@ pub fn get_exe_time() -> SystemTime {
 /// - Windows shutdown: "The media is write protected. (os error 19)"
 /// - macOS (hard to reproduce, reproduced at login screen): "No matching IOPlatformUUID in `ioreg -rd1 -c IOPlatformExpertDevice` command"
 pub fn get_uuid() -> Vec<u8> {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
     {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
