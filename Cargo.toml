@@ -74,6 +74,11 @@ libloading = "0.8"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 mac_address = "1.1"
 default_net = { git = "https://github.com/rustdesk-org/default_net" }
+# netdev (renamed to avoid clashing with the `default_net` fork above, which
+# only exposes `get_mac`) provides interface/address enumeration used to bind
+# sockets to a specific network interface. It is the maintained successor of
+# the default-net crate that fork was taken from.
+netif = { package = "netdev", version = "0.37" }
 machine-uid = { git = "https://github.com/rustdesk-org/machine-uid" }
 
 [build-dependencies]
@@ -90,6 +95,7 @@ winapi = { version = "0.3", features = [
     "pdh",
     "memoryapi",
     "sysinfoapi",
+    "winsock2",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

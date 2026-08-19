@@ -63,6 +63,18 @@ impl DerefMut for DynTcpStream {
 }
 
 pub(crate) fn new_socket(addr: std::net::SocketAddr, reuse: bool) -> Result<TcpSocket, std::io::Error> {
+    new_socket_pinned(addr, reuse, false)
+}
+
+// `pin_device` must only be set for sockets whose address came from the
+// interface binding. new_listener() binds caller-supplied addresses -- the
+// port-forward/RDP listeners use 127.0.0.1 -- and SO_BINDTODEVICE on those
+// would filter out traffic arriving on loopback, making them unreachable.
+pub(crate) fn new_socket_pinned(
+    addr: std::net::SocketAddr,
+    reuse: bool,
+    pin_device: bool,
+) -> Result<TcpSocket, std::io::Error> {
     let socket = match addr {
         std::net::SocketAddr::V4(..) => TcpSocket::new_v4()?,
         std::net::SocketAddr::V6(..) => TcpSocket::new_v6()?,
@@ -75,6 +87,11 @@ pub(crate) fn new_socket(addr: std::net::SocketAddr, reuse: bool) -> Result<TcpS
         #[cfg(all(unix, not(target_os = "illumos")))]
         socket.set_reuseport(true).ok();
         socket.set_reuseaddr(true).ok();
+    }
+    // source ip is set via `addr` (get_any_listen_addr); when an interface is
+    // named, also pin the device so routing follows it, not just the source ip
+    if pin_device {
+        crate::config::apply_bind_device(&socket, addr.is_ipv4());
     }
     socket.bind(addr)?;
     Ok(socket)
@@ -92,7 +109,7 @@ impl FramedStream {
             } else {
                 crate::config::Config::get_any_listen_addr(remote_addr.is_ipv4())
             };
-            if let Ok(socket) = new_socket(local, true) {
+            if let Ok(socket) = new_socket_pinned(local, true, true) {
                 if let Ok(Ok(stream)) =
                     super::timeout(ms_timeout, socket.connect(remote_addr)).await
                 {
@@ -224,6 +241,18 @@ pub async fn new_listener<T: ToSocketAddrs>(addr: T, reuse: bool) -> ResultType<
 }
 
 pub async fn listen_any(port: u16) -> ResultType<TcpListener> {
+    // ingress counterpart of the egress binding in new_socket: if bound to a
+    // specific interface/ip, listen there instead of on all interfaces, so the
+    // host stays reachable on that interface (e.g. the LAN) regardless of a VPN.
+    if let Some(ip) = crate::config::Config::get_bind_listen_ip(true)
+        .or_else(|| crate::config::Config::get_bind_listen_ip(false))
+    {
+        // a listener bound to one address cannot be dual-stack: v4-mapped
+        // acceptance only works on the unspecified address. ipv4 first, that
+        // being what direct lan access uses in practice.
+        log::info!("listening on {ip}:{port} only, per the configured interface binding");
+        return Ok(new_socket_pinned(SocketAddr::new(ip, port), true, true)?.listen(DEFAULT_BACKLOG)?);
+    }
     if let Ok(mut socket) = TcpSocket::new_v6() {
         #[cfg(unix)]
         {
@@ -245,6 +274,10 @@ pub async fn listen_any(port: u16) -> ResultType<TcpListener> {
             sock2.set_only_v6(false).ok();
             socket = unsafe { TcpSocket::from_raw_socket(sock2.into_raw_socket()) };
         }
+        // this path builds its own socket rather than going through new_socket,
+        // so pin the device here too: without it a PinOnly binding (an interface
+        // we cannot resolve to an address) would silently not apply to ingress
+        crate::config::apply_bind_device(&socket, false);
         if socket
             .bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
             .is_ok()
@@ -254,8 +287,9 @@ pub async fn listen_any(port: u16) -> ResultType<TcpListener> {
             }
         }
     }
-    Ok(new_socket(
+    Ok(new_socket_pinned(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        true,
         true,
     )?
     .listen(DEFAULT_BACKLOG)?)

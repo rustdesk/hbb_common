@@ -19,10 +19,13 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    net::TcpStream,
+    time::{timeout, timeout_at, Instant},
+};
 use tokio_native_tls::native_tls::TlsConnector;
 use tokio_tungstenite::{
-    connect_async_tls_with_config, tungstenite::protocol::Message as WsMessage, Connector,
+    client_async_tls_with_config, tungstenite::protocol::Message as WsMessage, Connector,
     MaybeTlsStream, WebSocketStream,
 };
 use tungstenite::client::IntoClientRequest;
@@ -65,6 +68,32 @@ impl WsFramedStream {
         }
     }
 
+    // dial the websocket peer through a socket bound to the configured
+    // interface. tungstenite's own connect_async opens an unbound socket, which
+    // would leave this transport ignoring bind-interface entirely.
+    async fn connect_bound_tcp(request: &tungstenite::handshake::client::Request) -> ResultType<TcpStream> {
+        let uri = request.uri();
+        let Some(host) = uri.host() else {
+            bail!("websocket url has no host: {uri}");
+        };
+        let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+            Some("wss") | Some("https") => 443,
+            _ => 80,
+        });
+        let mut last_err = None;
+        for addr in tokio::net::lookup_host((host, port)).await? {
+            let local = Config::get_any_listen_addr(addr.is_ipv4());
+            match crate::tcp::new_socket(local, false) {
+                Ok(socket) => match socket.connect(addr).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(e) => last_err = Some(anyhow::Error::from(e)),
+                },
+                Err(e) => last_err = Some(anyhow::Error::from(e)),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("failed to resolve {host}:{port}")))
+    }
+
     async fn connect(
         url: &str,
         ms_timeout: u64,
@@ -96,15 +125,21 @@ impl WsFramedStream {
         original_danger_accept_invalid_certs: Option<bool>,
     ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         let ws_config = None;
-        let disable_nagle = false;
         let request = url
             .into_client_request()
             .map_err(|e| Error::new(ErrorKind::Other, e))?;
         let connector =
             Self::get_connector(&tls_type, danger_accept_invalid_cert.unwrap_or(false))?;
-        match timeout(
-            Duration::from_millis(ms_timeout),
-            connect_async_tls_with_config(request, ws_config, disable_nagle, connector),
+        // build the tcp connection ourselves instead of letting tungstenite dial,
+        // so this transport honours bind-interface like the plain tcp one does.
+        // dial and handshake share one deadline, as they did when tungstenite
+        // did both: a budget per phase would let a single attempt take twice
+        // ms_timeout, and the tls fallback below retries up to three times.
+        let deadline = Instant::now() + Duration::from_millis(ms_timeout);
+        let stream = timeout_at(deadline, Self::connect_bound_tcp(&request)).await??;
+        match timeout_at(
+            deadline,
+            client_async_tls_with_config(request, stream, ws_config, connector),
         )
         .await?
         {
