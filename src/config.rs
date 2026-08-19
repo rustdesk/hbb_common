@@ -3012,6 +3012,9 @@ pub mod keys {
     pub const OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD: &str = "disable-change-permanent-password";
     pub const OPTION_DISABLE_CHANGE_ID: &str = "disable-change-id";
     pub const OPTION_DISABLE_UNLOCK_PIN: &str = "disable-unlock-pin";
+    pub const COMPANY_ONE_WAY_FILE_TRANSFER: bool = true;
+    pub const COMPANY_ONE_WAY_CLIPBOARD: bool = true;
+    pub const COMPANY_ENABLE_FILE_COPY_PASTE: bool = true;
 
     // flutter local options
     pub const OPTION_FLUTTER_REMOTE_MENUBAR_STATE: &str = "remoteMenubarState";
