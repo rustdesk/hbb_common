@@ -95,7 +95,9 @@ impl Stream {
     /// abandon, and an awaited close that loses that race is unretryable — `close()` latches
     /// `is_closed` before its first await, so every later attempt early-returns while the state
     /// handler that would evict the session never runs. With no await point here there is
-    /// nothing to cancel; the teardown finishes on the runtime.
+    /// nothing to cancel; the teardown runs to completion on the WebRTC I/O runtime
+    /// (see `webrtc::WEBRTC_RT`) that owns the pc's sockets and pump tasks, so it reaches the
+    /// wire even after a caller's own runtime dies on return.
     #[inline]
     pub fn close_webrtc(&self) {
         match self {
