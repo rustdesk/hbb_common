@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -79,6 +79,28 @@ pub struct WebRTCStream {
     // matched to the signed peer id, via `set_key`). DTLS always encrypts; this flag mirrors TCP's
     // "secured after key exchange" so key-less / unbound WebRTC is not shown as peer-authenticated.
     peer_verified: Arc<AtomicBool>,
+    // Whether anyone still wants this pc — see `HandoffState`. Shared by every clone, the
+    // `SESSIONS` entry included, because that question is about the pc, not about one handle.
+    handoff: Arc<HandoffState>,
+}
+
+/// Whether a pc `new_inner` built is still wanted, shared by every `NewStreamHandoff` handed out
+/// for it. `new_inner` caches the pc before its `new()` returns, so the builder's handoff and any
+/// number of cache hits are in flight at once; a pc is abandoned only when the last of them is
+/// dropped with none adopted, and closing on any single Drop would kill a live caller's session.
+#[derive(Default)]
+struct HandoffState {
+    // Handoffs handed out and neither adopted nor dropped yet. Incremented under the `SESSIONS`
+    // lock so a hit that is still arriving cannot be overtaken by the abandon-close below.
+    pending: AtomicUsize,
+    // Latched by the first `into_inner`: some caller owns the stream, and since `WebRTCStream`
+    // has no `Drop` there is nothing that could un-own it. Abandoning any later hit is then a
+    // no-op, which is what keeps a cached pc alive across a cancelled caller.
+    adopted: AtomicBool,
+    // Set under the `SESSIONS` lock once the abandon-close commits, so a hit that locks the map
+    // afterwards (eviction only happens later, from the state handler) rejects the entry instead
+    // of adopting a pc that is already going away.
+    closing: AtomicBool,
 }
 
 #[derive(Default)]
@@ -126,6 +148,69 @@ static DEFAULT_ICE_SERVERS: [&str; 3] = [
 
 lazy_static::lazy_static! {
     static ref SESSIONS: Arc::<Mutex<HashMap<String, WebRTCStream>>> = Default::default();
+
+    // The process-lifetime runtime that owns ALL WebRTC I/O. A pc's UDP sockets register with
+    // the reactor — and its ICE/DTLS/SCTP pump tasks spawn on the runtime — that is current
+    // while `new_inner` and the handlers it installs execute; if that were a session's
+    // `#[tokio::main]` runtime (dropped the moment io_loop returns), the sockets and pumps
+    // would die with it and even a close driven elsewhere would "succeed" without ever putting
+    // close_notify on the wire — the peer then waits out ICE decay. So `new()` runs its body
+    // here, and detached closes run here too: as independent tasks (a deadline-free `close()`
+    // must not head-of-line block other sessions' teardown) that are never cancelled (a close
+    // cancelled after `RTCPeerConnection::close` latches `is_closed` is unretryable, stranding
+    // the pc in SESSIONS). Data-plane futures (send/recv/close) may be polled from any caller
+    // runtime — cross-runtime polling is fine; only the OWNING driver must stay alive. Two
+    // workers so one busy session cannot starve the rest. This is the one deliberate exception
+    // to AGENTS.md's no-runtime-in-libraries rule: a single lazily-built runtime for I/O whose
+    // lifetime exceeds any caller's.
+    static ref WEBRTC_RT: Option<tokio::runtime::Runtime> = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("webrtc-io")
+        .enable_all()
+        .build()
+        .map_err(|err| log::error!("failed to build the WebRTC I/O runtime: {}", err))
+        .ok();
+}
+
+/// Hands a stream from `new_inner` (running detached on `WEBRTC_RT`) back to its `new()`
+/// caller. If that caller was cancelled while awaiting, the runtime drops the task's output —
+/// this guard — and an unanswered offerer never reaches a terminal ICE state on its own, so
+/// without the Drop-close its pc, sockets and pump tasks would sit in SESSIONS forever. Claims
+/// are counted in the shared `HandoffState`, so only the last one dropped with the stream still
+/// unadopted closes it; a hit another caller is already using is left alone.
+struct NewStreamHandoff {
+    stream: Option<WebRTCStream>,
+}
+
+impl NewStreamHandoff {
+    /// Take a claim on `stream`. Call under the `SESSIONS` lock: a claim registered after the map
+    /// is unlocked can land behind the abandon-close of the claim that was last outstanding.
+    fn claim(stream: WebRTCStream) -> Self {
+        stream.handoff.pending.fetch_add(1, Ordering::AcqRel);
+        Self {
+            stream: Some(stream),
+        }
+    }
+
+    fn into_inner(mut self) -> Option<WebRTCStream> {
+        let stream = self.stream.take()?;
+        // Before releasing the claim, or a concurrent Drop can see the count reach zero without
+        // seeing that this caller took ownership.
+        stream.handoff.adopted.store(true, Ordering::Release);
+        stream.handoff.pending.fetch_sub(1, Ordering::AcqRel);
+        Some(stream)
+    }
+}
+
+impl Drop for NewStreamHandoff {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            let last = stream.handoff.pending.fetch_sub(1, Ordering::AcqRel) == 1;
+            if last && !stream.handoff.adopted.load(Ordering::Acquire) {
+                stream.close_if_abandoned();
+            }
+        }
+    }
 }
 
 impl Clone for WebRTCStream {
@@ -142,6 +227,7 @@ impl Clone for WebRTCStream {
             send_gate: self.send_gate.clone(),
             recv_state: self.recv_state.clone(),
             peer_verified: self.peer_verified.clone(),
+            handoff: self.handoff.clone(),
         }
     }
 }
@@ -239,6 +325,7 @@ impl WebRTCStream {
     /// evicts late enough that dead entries linger. Both the lookup and the insert must use it.
     fn is_reusable_for(&self, force_relay: bool) -> bool {
         self.relay_only == force_relay
+            && !self.handoff.closing.load(Ordering::Acquire)
             && !matches!(
                 *self.state_notify.borrow(),
                 WebRTCConnectionState::Closed(_)
@@ -418,11 +505,31 @@ impl WebRTCStream {
         ice_servers
     }
 
+    /// Built and driven on `WEBRTC_RT`: every socket and background task the pc creates must
+    /// belong to a runtime that outlives the session (see `WEBRTC_RT`). A caller that abandons
+    /// this future mid-await leaves the setup task to finish there; the abandoned result then
+    /// closes a freshly built pc (and leaves a shared cache hit alone) — see `NewStreamHandoff`.
     pub async fn new(
         remote_endpoint: &str,
         force_relay: bool,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        let Some(rt) = WEBRTC_RT.as_ref() else {
+            return Err(anyhow::anyhow!("WebRTC I/O runtime unavailable"));
+        };
+        let remote_endpoint = remote_endpoint.to_owned();
+        rt.spawn(Self::new_inner(remote_endpoint, force_relay, ms_timeout))
+            .await
+            .map_err(|err| anyhow::anyhow!("WebRTC setup task failed: {}", err))??
+            .into_inner()
+            .ok_or_else(|| anyhow::anyhow!("WebRTC setup handoff was empty"))
+    }
+
+    async fn new_inner(
+        remote_endpoint: String,
+        force_relay: bool,
+        ms_timeout: u64,
+    ) -> ResultType<NewStreamHandoff> {
         // The endpoint contains a Base64-encoded SDP with host addresses and live ICE
         // credentials. Log only its size so debug logs cannot disclose that information.
         log::debug!(
@@ -432,28 +539,34 @@ impl WebRTCStream {
         let remote_offer = if remote_endpoint.is_empty() {
             "".into()
         } else {
-            Self::get_remote_offer(remote_endpoint)?
+            Self::get_remote_offer(&remote_endpoint)?
         };
 
         let mut key = Self::get_key_for_sdp_json(&remote_offer)?;
         let start_local_offer = remote_offer.is_empty();
         if !key.is_empty() {
+            // Claim inside the lock: `close_if_abandoned` commits under it too, so this hit
+            // either registers in time to call that close off, or finds the entry already rejected.
             let cached = {
                 let sessions_lock = SESSIONS.lock().await;
-                sessions_lock
-                    .get(&Self::cache_key(&key, start_local_offer))
-                    .cloned()
-            };
-            if let Some(cached_stream) = cached {
-                if cached_stream.is_reusable_for(force_relay) {
-                    log::debug!("Start webrtc with cached peer");
-                    return Ok(cached_stream);
+                match sessions_lock.get(&Self::cache_key(&key, start_local_offer)) {
+                    Some(session) if session.is_reusable_for(force_relay) => {
+                        Some(NewStreamHandoff::claim(session.clone()))
+                    }
+                    Some(session) => {
+                        log::debug!(
+                            "Ignoring cached webrtc peer (relay_only {}, wanted {})",
+                            session.relay_only,
+                            force_relay
+                        );
+                        None
+                    }
+                    None => None,
                 }
-                log::debug!(
-                    "Ignoring cached webrtc peer (relay_only {}, wanted {})",
-                    cached_stream.relay_only,
-                    force_relay
-                );
+            };
+            if let Some(handoff) = cached {
+                log::debug!("Start webrtc with cached peer");
+                return Ok(handoff);
             }
         }
         // Create a SettingEngine and enable Detach
@@ -699,31 +812,38 @@ impl WebRTCStream {
             send_gate: Arc::new(Semaphore::new(1)),
             recv_state: Arc::new(Mutex::new(RecvState::default())),
             peer_verified: Arc::new(AtomicBool::new(false)),
+            handoff: Default::default(),
         };
         // Insert into the session cache, but never `await pc.close()` while holding this lock:
         // `close()` fires the peer-connection-state handler inline, which itself locks SESSIONS,
         // self-deadlocking the whole process. Resolve any duplicate off-lock.
         let cache_key = Self::cache_key(&key, start_local_offer);
-        let duplicate = {
+        // Claim inside the lock, the insert included: with the pc cached but unclaimed, a hit
+        // could take the only claim on it and release it again, closing it under this caller.
+        let mut duplicate = None;
+        let handoff = {
             let mut final_lock = SESSIONS.lock().await;
             // Same admissibility test as the lookup above, or that lookup is dead code: an entry
             // rejected there is still in the map when we get here, so returning it unconditionally
             // would discard the pc we just built precisely because the cached one was unusable.
             match final_lock.get(&cache_key) {
-                Some(session) if session.is_reusable_for(force_relay) => Some(session.clone()),
+                Some(session) if session.is_reusable_for(force_relay) => {
+                    duplicate = Some(webrtc_stream.clone());
+                    NewStreamHandoff::claim(session.clone())
+                }
                 _ => {
                     final_lock.insert(cache_key, webrtc_stream.clone());
-                    None
+                    NewStreamHandoff::claim(webrtc_stream)
                 }
             }
         };
-        if let Some(session) = duplicate {
+        if let Some(loser) = duplicate {
             // A concurrent `new()` already cached an equivalent stream; discard this pc's
-            // resources (off-lock) and return the cached one.
-            webrtc_stream.close().await;
-            return Ok(session);
+            // resources (on the closer thread — awaiting here would strand the pc if this
+            // `new()` were cancelled mid-close) and return the cached one.
+            loser.close_detached();
         }
-        Ok(webrtc_stream)
+        Ok(handoff)
     }
 
     /// One-shot endpoint: waits for ICE gathering so the SDP already carries the candidates.
@@ -869,33 +989,55 @@ impl WebRTCStream {
         self.pc.close().await.ok();
     }
 
-    /// Tear the pc down on the runtime, keeping `keep` alive until the teardown finishes.
-    ///
-    /// Callers poll this path inside a `select!`, and `close()` latches `is_closed` before its
-    /// first await, so a cancelled close strands the pc: unretryable, never evicted from
-    /// `SESSIONS`, never notifying `Closed`. The send path passes its permit as `keep`.
+    /// Tear the pc down as an independent task on `WEBRTC_RT` — the runtime that owns the
+    /// pc's sockets and pump tasks, so the close can actually reach the wire no matter which
+    /// caller runtimes have died — keeping `keep` alive until the teardown finishes. Callable
+    /// from any context, `Drop` on a runtime-less thread included, and never cancelled, so
+    /// `close()`'s `is_closed` latch is only ever set by a close that finishes. The send path
+    /// passes its permit as `keep`.
     pub fn close_detached_with<T: Send + 'static>(&self, keep: T) {
-        let pc = self.pc.clone();
-        // Take the runtime handle explicitly rather than calling `tokio::spawn`: this also runs
-        // from `Drop`, which can execute on a thread with no runtime, where a bare spawn panics —
-        // and a panic in a destructor aborts the process. Without a handle the pc cannot be closed
-        // here at all; it is released at process exit. (Catching a panic from `Handle::spawn`
-        // during runtime shutdown is not an option: release builds set `panic = "abort"`.)
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            log::debug!("no tokio runtime available to close the WebRTC peer connection");
+        // If the runtime never built, no pc exists either (`new` fails first); nothing to close.
+        let Some(rt) = WEBRTC_RT.as_ref() else {
             return;
         };
-        handle.spawn(async move {
-            let _keep = keep;
+        let pc = self.pc.clone();
+        rt.spawn(async move {
             if let Err(err) = pc.close().await {
-                log::debug!("WebRTC background close failed: {}", err);
+                log::debug!("WebRTC close failed: {}", err);
             }
+            drop(keep);
         });
     }
 
     #[inline]
     pub fn close_detached(&self) {
         self.close_detached_with(());
+    }
+
+    /// Close a pc no caller ever took. Spawned on `WEBRTC_RT` like `close_detached`, but the
+    /// decision is remade under the `SESSIONS` lock that a cache hit claims under: either the hit
+    /// registers first and this call stands down, or `closing` commits first and
+    /// `is_reusable_for` rejects the entry, which the state handler evicts only later.
+    fn close_if_abandoned(&self) {
+        let Some(rt) = WEBRTC_RT.as_ref() else {
+            return;
+        };
+        let stream = self.clone();
+        rt.spawn(async move {
+            {
+                let _sessions_lock = SESSIONS.lock().await;
+                if stream.handoff.pending.load(Ordering::Acquire) != 0
+                    || stream.handoff.adopted.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                stream.handoff.closing.store(true, Ordering::Release);
+            }
+            // Off-lock: `close()` fires the state handler inline and that handler locks SESSIONS.
+            if let Err(err) = stream.pc.close().await {
+                log::debug!("WebRTC close of an abandoned peer failed: {}", err);
+            }
+        });
     }
 
     #[inline]
@@ -1209,7 +1351,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::webrtc::{WebRTCStream, DEFAULT_ICE_SERVERS, FRAG_MORE, SESSIONS};
+    use crate::webrtc::{NewStreamHandoff, WebRTCStream, DEFAULT_ICE_SERVERS, FRAG_MORE, SESSIONS, WEBRTC_RT};
     use bytes::{BufMut, Bytes, BytesMut};
     use tokio::sync::{watch, Barrier, Mutex};
     use tokio::time::timeout;
@@ -1529,10 +1671,12 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             "invalid webrtc endpoint should error"
         );
 
-        assert!(
-            WebRTCStream::new("", false, 10000).await.is_ok(),
-            "local webrtc endpoint should ok"
-        );
+        let stream = WebRTCStream::new("", false, 10000)
+            .await
+            .expect("local webrtc endpoint should ok");
+        // A raw WebRTCStream has no Drop: close it, or its session stays cached in SESSIONS
+        // and pollutes cross-test assertions about the cache.
+        stream.close().await;
 
         endpoint = "webrtc://eyJ0eXBlIjoiYW5zd2VyIiwic2RwIjoidj0wXHJcbm89LSA0MTA1NDk3NTY2NDgyMTQzODEwIDYwMzk1NzQw\
 MCBJTiBJUDQgMC4wLjAuMFxyXG5zPS1cclxudD0wIDBcclxuYT1maW5nZXJwcmludDpzaGEtMjU2IDYxOjYwOjc0OjQwOjI4OkNFOjBCOjBDOjc1OjRCOj\
@@ -1626,6 +1770,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         let mut stream = WebRTCStream::new("", false, 100).await.unwrap();
         let err = stream.wait_connected(10).await.unwrap_err();
         assert!(err.to_string().contains("timeout"));
+        stream.close().await; // see test_webrtc_new_stream: no Drop on a raw WebRTCStream
     }
 
     async fn connect_loopback() -> (WebRTCStream, WebRTCStream) {
@@ -1925,6 +2070,222 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         timeout(Duration::from_secs(40), connect)
             .await
             .expect("webrtc loopback did not complete in time");
+    }
+
+    // A client session runs on its own `#[tokio::main(flavor = "current_thread")]` runtime that
+    // is dropped the moment io_loop returns, so a close spawned or awaited there can be killed
+    // before (or worse, after) `close()` latches `is_closed`. Pin the production sequence over
+    // `Stream::WebRTC`: `close_webrtc()` from a thread with no runtime at all, then Drop; the
+    // peer must still see EOF — the closer thread, not any caller runtime, delivers it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_session_end_close_reaches_the_peer() {
+        let (offerer, mut answerer) = connect_loopback().await;
+        let stream = crate::Stream::WebRTC(offerer);
+        tokio::task::spawn_blocking(move || {
+            stream.close_webrtc();
+            drop(stream);
+        })
+        .await
+        .expect("session thread");
+
+        match timeout(Duration::from_secs(5), answerer.next()).await {
+            Ok(None) | Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(b))) => panic!("expected EOF after session close, got {} bytes", b.len()),
+            Err(_) => panic!("peer never observed the session-end close"),
+        }
+        answerer.close().await;
+    }
+
+    // The shared count, not any one handoff, decides: with a second claim outstanding on a pc
+    // no one has adopted, dropping the first must leave it open for that caller, and dropping
+    // the last must close it — an unanswered offerer never reaches a terminal ICE state itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_last_abandoned_claim_closes_an_unadopted_pc() {
+        let builder = WEBRTC_RT
+            .as_ref()
+            .expect("WebRTC I/O runtime")
+            .spawn(WebRTCStream::new_inner(String::new(), false, 20000))
+            .await
+            .expect("setup task")
+            .expect("offerer builds");
+        let stream = builder
+            .stream
+            .as_ref()
+            .expect("a fresh handoff carries its stream")
+            .clone();
+        let key = format!("offer:{}", stream.session_key());
+        let hit = NewStreamHandoff::claim(stream);
+
+        drop(builder);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            SESSIONS.lock().await.contains_key(&key),
+            "a claim was still outstanding, so the pc had to stay open"
+        );
+
+        drop(hit);
+        for _ in 0..200 {
+            if !SESSIONS.lock().await.contains_key(&key) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the last abandoned claim never closed the unadopted pc");
+    }
+
+    // `new_inner` caches the pc BEFORE its own `new()` returns, so a concurrent caller can hit
+    // that cache and adopt the stream while the builder's handoff is still outstanding. Closing
+    // on the builder's Drop then tears down a connection another caller is already using, so
+    // abandonment has to be a property of the pc, not of one handoff.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_abandoned_builder_handoff_spares_an_adopted_pc() {
+        // Exactly what `new()` does, minus the adoption: the setup task runs on WEBRTC_RT and
+        // hands back a fresh, still-unadopted handoff.
+        let builder = WEBRTC_RT
+            .as_ref()
+            .expect("WebRTC I/O runtime")
+            .spawn(WebRTCStream::new_inner(String::new(), false, 20000))
+            .await
+            .expect("setup task")
+            .expect("offerer builds");
+        let stream = builder
+            .stream
+            .as_ref()
+            .expect("a fresh handoff carries its stream")
+            .clone();
+        let key = format!("offer:{}", stream.session_key());
+        assert!(
+            SESSIONS.lock().await.contains_key(&key),
+            "new_inner must cache the pc it built"
+        );
+
+        // The concurrent `new()`: a cache hit that takes the stream and goes on using it.
+        let adopted = NewStreamHandoff::claim(stream)
+            .into_inner()
+            .expect("a cache hit hands the stream back");
+        // ...and now the builder's `new()` is cancelled, so the runtime drops its handoff.
+        drop(builder);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            SESSIONS.lock().await.contains_key(&key),
+            "abandoning the builder's handoff closed a pc another caller had already adopted"
+        );
+        adopted.close_detached();
+    }
+
+    // End-to-end: cancel `new()` itself after its first poll (the spawn is already in flight)
+    // and every session it transiently created must be closed and evicted again. Keys are
+    // compared as a set difference so concurrent tests' own sessions do not interfere; theirs
+    // clean up within the wait too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cancelled_new_does_not_leak_the_pc() {
+        use std::collections::HashSet;
+        let before: HashSet<String> = SESSIONS.lock().await.keys().cloned().collect();
+        // Zero timeout: polls the future exactly once (spawning new_inner), then cancels it.
+        let _ = timeout(Duration::ZERO, WebRTCStream::new("", false, 20000)).await;
+        // Let the detached setup task finish (and insert its session) before demanding the
+        // difference be empty, or an early check passes vacuously while the leak forms later.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // 30s: concurrent tests' transient sessions land in the difference too and must be
+        // given time to finish and evict (every test closes what it creates).
+        const ATTEMPTS: usize = 600;
+        for attempt in 1..=ATTEMPTS {
+            let now: HashSet<String> = SESSIONS.lock().await.keys().cloned().collect();
+            let leftover: Vec<&String> = now.difference(&before).collect();
+            if leftover.is_empty() {
+                return;
+            }
+            // Positional, not an inline `{leftover:?}`: on edition 2018 a lone-literal `panic!`
+            // does not go through format_args and would print the placeholder verbatim.
+            assert!(
+                attempt < ATTEMPTS,
+                "cancelled new() left a pc cached in SESSIONS (leftover: {:?})",
+                leftover
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // The production shape of a controller session end: the offerer was created on a session's
+    // own current-thread runtime, the session queues its detached close and the runtime is
+    // destroyed immediately after (io_loop returning drops it). The pc's sockets and its
+    // ICE/DTLS/SCTP pump tasks must not die with that runtime, or the queued close completes
+    // without ever putting close_notify on the wire and the peer waits out ICE decay. Gathered
+    // (non-trickle) endpoints keep the cross-runtime signaling to two string handoffs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_close_survives_creator_runtime_destruction() {
+        // tokio oneshots for every handoff: their sends are synchronous, and the session side
+        // awaits them INSIDE block_on — a current_thread runtime only drives its tasks while
+        // being block_on-driven, and the offerer's SCTP/ICE pumps must stay live until the
+        // answerer has confirmed the channel is open.
+        let (offer_tx, offer_rx) = tokio::sync::oneshot::channel::<String>();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<String>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let session = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("session runtime");
+            let offerer = rt.block_on(async {
+                let mut offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+                offer_tx
+                    .send(offerer.get_local_endpoint().await.unwrap())
+                    .unwrap();
+                let answer = answer_rx.await.unwrap();
+                offerer.set_remote_endpoint(&answer).await.unwrap();
+                offerer.wait_connected(20000).await.unwrap();
+                // Keep driving the runtime until the answerer confirms open, so the EOF
+                // assertion — not connection setup — is what discriminates.
+                go_rx.await.unwrap();
+                offerer
+            });
+            // The session ends: queue the close, then destroy the runtime the pc was created
+            // on — exactly what io_loop returning does.
+            drop(crate::Stream::WebRTC(offerer));
+            drop(rt);
+        });
+
+        let offer = offer_rx.await.expect("offer from session thread");
+        let mut answerer = WebRTCStream::new(&offer, false, 20000).await.unwrap();
+        answer_tx
+            .send(answerer.get_local_endpoint().await.unwrap())
+            .expect("answer to session thread");
+        answerer.wait_connected(20000).await.unwrap();
+        go_tx.send(()).expect("release session thread");
+        session.join().expect("session thread");
+
+        match timeout(Duration::from_secs(5), answerer.next()).await {
+            Ok(None) | Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(b))) => panic!("expected EOF after session close, got {} bytes", b.len()),
+            Err(_) => panic!("peer never observed the close after the creator runtime died"),
+        }
+        answerer.close().await;
+    }
+
+    // The peer-initiated end: `next()` hits EOF and fires its own `close_detached` before the
+    // session's final close (here via `Stream`'s Drop) is issued. Both land on the serialized
+    // closer thread, so the first runs to completion and the second is a benign no-op — the pc
+    // must end up closed and evicted, never stranded by one closer cancelling the other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_eof_close_then_drop_still_evicts() {
+        let (mut offerer, answerer) = connect_loopback().await;
+        let key = format!("offer:{}", offerer.session_key());
+        answerer.close().await;
+        match timeout(Duration::from_secs(5), offerer.next()).await {
+            Ok(None) | Ok(Some(Err(_))) => {} // EOF path fired close_detached internally
+            Ok(Some(Ok(b))) => panic!("expected EOF after peer close, got {} bytes", b.len()),
+            Err(_) => panic!("offerer.next() hung after peer close"),
+        }
+        drop(crate::Stream::WebRTC(offerer)); // second close via Drop
+
+        for _ in 0..200 {
+            if !SESSIONS.lock().await.contains_key(&key) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("pc still cached after EOF close + Drop close");
     }
 
     // Both framing violations must end the stream. The empty-FRAG_MORE case is the one that
