@@ -57,6 +57,11 @@ enum WebRTCConnectionState {
     Closed(String),
 }
 
+/// A shared handle, not an owner: every clone points at the same `pc`, and `SESSIONS` holds one
+/// of those clones. Hence no `Drop` — closing per clone would kill a live session as soon as a
+/// losing race future is dropped, and closing on the last clone would wait on the very close
+/// that evicts the cache entry. Ownership is `OffererGuard` until a connection attempt adopts
+/// the stream and `Stream::WebRTC` after; holding one outside those two means closing it by hand.
 pub struct WebRTCStream {
     pc: Arc<RTCPeerConnection>,
     stream: Arc<Mutex<Arc<RTCDataChannel>>>,
