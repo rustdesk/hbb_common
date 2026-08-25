@@ -34,6 +34,7 @@ use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
+use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -82,9 +83,8 @@ pub struct WebRTCStream {
     // Whether anyone still wants this pc — see `HandoffState`. Shared by every clone, the
     // `SESSIONS` entry included, because that question is about the pc, not about one handle.
     handoff: Arc<HandoffState>,
-    // The offer/answer envelope as created, kept because `pc.local_description()` grows with
-    // every gathered candidate — see `get_local_endpoint_trickle`. Shared, not copied per clone:
-    // a session clones this struct several times and reads the envelope once.
+    // Taken once at construction: `pc.local_description()` grows with every gathered candidate
+    // and this must not (why: `UDP_ENDPOINT_BUDGET`). Shared so cloning the struct stays cheap.
     local_endpoint: Arc<String>,
 }
 
@@ -268,7 +268,7 @@ impl WebRTCStream {
     }
 
     // Envelope JSON key carrying the local description's ICE transport policy, alongside the
-    // RTCSessionDescription fields (see `get_local_endpoint_trickle`).
+    // RTCSessionDescription fields (see `local_endpoint`).
     // `'static` spelled out: an elided lifetime here is a warn-by-default future hard error on
     // the 1.75 toolchain CI pins (elided_lifetimes_in_associated_constant).
     const ICE_POLICY_KEY: &'static str = "ice_policy";
@@ -891,41 +891,42 @@ impl WebRTCStream {
         let Some(local_desc) = self.pc.local_description().await else {
             return Err(anyhow::anyhow!("Local desc is not set"));
         };
-        Self::encode_endpoint(&local_desc, self.relay_only)
+        Self::encode_endpoint(local_desc.sdp_type, &local_desc.sdp, self.relay_only)
     }
 
     /// The offer/answer exactly as it was created, for callers that signal candidates via
-    /// `take_local_ice_rx`.
+    /// `take_local_ice_rx`. Taken at construction, so this cannot fail and cannot block — unlike
+    /// `get_local_endpoint`, which reads the live description and waits for gathering.
     ///
-    /// Deliberately not `pc.local_description()`: that one runs `populate_local_candidates`, so
-    /// it returns the SDP plus every candidate gathered up to that moment — hundreds of bytes on
-    /// a multi-homed host, and the caller reads it a network round trip after `new`, by which
-    /// time gathering has filled it in. The rendezvous server forwards this blob to the peer as a
-    /// single UDP datagram, and one that needs IP fragmentation is dropped outright on paths that
-    /// discard fragments, silently and every time. Candidates belong on the trickle channel.
+    /// Deliberately not `pc.local_description()`, which runs `populate_local_candidates` and so
+    /// returns the SDP plus every candidate gathered up to that moment — and callers read this a
+    /// network round trip after `new`, by which time gathering has filled it in. Why the size
+    /// matters: `UDP_ENDPOINT_BUDGET`.
     #[inline]
-    pub async fn get_local_endpoint_trickle(&self) -> ResultType<String> {
-        Ok(self.local_endpoint.as_ref().clone())
+    pub fn local_endpoint(&self) -> &str {
+        self.local_endpoint.as_str()
     }
 
-    /// How large the offer/answer may be before the UDP leg of its route stops being safe. It is
+    /// The size a trickle endpoint must stay under for the UDP leg of its route to be safe. It is
     /// the one signaling message that can grow: a peer registered over UDP receives it inside
     /// `PunchHole` — with the mangled addresses and the permission blobs — as a single datagram,
     /// and one that needs IP fragmentation is dropped without a trace on paths that discard
-    /// fragments. The candidates that follow are one small message each, so they never approach
-    /// this. Nothing enforces it: a TCP/WS leg has no packet ceiling, and `trickle_endpoint`
-    /// already pins the value near 700 bytes either way. It is what the warning and the tests
-    /// measure against, so a regression shows up as a log line instead of a silent drop.
+    /// fragments. The candidates that follow are one small message each and never approach it.
+    ///
+    /// Not an MTU calculation: `PunchHole`'s other fields are not bounded here, so a value near
+    /// this number could still fragment. It is a tripwire on a quantity `trickle_endpoint` pins at
+    /// ~700 bytes, sized to leave that headroom while still catching a regression that lets
+    /// candidates back in — as a log line rather than another silent drop. Nothing enforces it: a
+    /// TCP/WS leg has no packet ceiling.
     const UDP_ENDPOINT_BUDGET: usize = 1024;
 
     /// The endpoint a trickling peer signals: the session parameters needed to start ICE and DTLS
     /// (ice-ufrag, ice-pwd, fingerprint, setup, the sctp m-line), without the candidates — those
     /// ride `take_local_ice_rx` and arrive as individual `IceCandidate` messages.
     ///
-    /// The split is what keeps this endpoint a fixed ~700 bytes: candidates are the only part of a
-    /// local description that grows, and `pc.local_description()` appends every one gathered so
-    /// far. Stripping them here makes the bound a property of the value rather than of when it was
-    /// taken, so the size cannot drift with gathering however this is later refactored.
+    /// Candidates are the only part of a local description that grows. Stripping them makes the
+    /// size a property of the value rather than of when it was taken, so it cannot drift with
+    /// gathering however this is later refactored.
     fn trickle_endpoint(local_desc: &RTCSessionDescription, relay_only: bool) -> ResultType<String> {
         let mut sdp = String::with_capacity(local_desc.sdp.len());
         for line in local_desc.sdp.lines() {
@@ -936,25 +937,27 @@ impl WebRTCStream {
             sdp.push_str(line);
             sdp.push_str("\r\n");
         }
-        let mut desc = local_desc.clone();
-        desc.sdp = sdp;
-        Self::encode_endpoint(&desc, relay_only)
+        Self::encode_endpoint(local_desc.sdp_type, &sdp, relay_only)
     }
 
     /// Base64 envelope of a local description, carrying its ICE transport policy unless the pc is
     /// Relay-only (see `ICE_POLICY_KEY`).
-    fn encode_endpoint(local_desc: &RTCSessionDescription, relay_only: bool) -> ResultType<String> {
-        let sdp = if relay_only {
-            serde_json::to_string(local_desc)?
-        } else {
+    /// Built from the two fields a session description serializes rather than from the value, so
+    /// a caller that rewrote the SDP cannot leave a stale `parsed` tree riding along with it.
+    fn encode_endpoint(sdp_type: RTCSdpType, sdp: &str, relay_only: bool) -> ResultType<String> {
+        let mut envelope = serde_json::Map::new();
+        envelope.insert("type".to_owned(), serde_json::to_value(sdp_type)?);
+        envelope.insert("sdp".to_owned(), serde_json::Value::from(sdp));
+        if !relay_only {
             // Rides in the envelope, not a proto field the rendezvous server would forward,
             // because it is the offer's own property: the receiver must know whether
             // force_relay was policy (stay Relay-only) or transport. Older peers ignore it.
-            let mut v = serde_json::to_value(local_desc)?;
-            v[Self::ICE_POLICY_KEY] = serde_json::Value::from(Self::ICE_POLICY_ALL);
-            serde_json::to_string(&v)?
-        };
-        Ok(Self::sdp_to_endpoint(&sdp))
+            envelope.insert(
+                Self::ICE_POLICY_KEY.to_owned(),
+                serde_json::Value::from(Self::ICE_POLICY_ALL),
+            );
+        }
+        Ok(Self::sdp_to_endpoint(&serde_json::to_string(&envelope)?))
     }
 
     /// Whether the peer's endpoint declares it was built with ICE transport policy `all`
@@ -1590,43 +1593,54 @@ mod tests {
         .expect("extra envelope key must not break RTCSessionDescription parsing");
     }
 
-    /// The rendezvous server hands a trickle endpoint to the peer inside one UDP datagram, so it
-    /// must stay small however far gathering has got. `pc.local_description()` appends every
-    /// candidate gathered so far — the stored endpoint must not, or the datagram fragments and is
-    /// dropped without a trace on paths that discard fragments.
+    /// The live description once it has gathered something. Polls instead of awaiting
+    /// `gathering_complete_promise`: a stream sits in the global `SESSIONS` for the whole wait, and
+    /// waiting out gathering there is long enough to trip `test_cancelled_new_does_not_leak_the_pc`
+    /// when the suite runs its tests in parallel. One candidate is all these tests need.
+    /// Returns `None` on timeout rather than panicking: the caller must get to `close()` before
+    /// it asserts, or a stranded pc fails `test_cancelled_new_does_not_leak_the_pc` as well and
+    /// one root failure is reported as two.
+    async fn first_gathered_description(stream: &WebRTCStream) -> Option<RTCSessionDescription> {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(desc) = stream.pc.local_description().await {
+                    if desc.sdp.contains("a=candidate:") {
+                        return desc;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// The signalled endpoint and the live description must diverge. `pc.local_description()`
+    /// appends every candidate gathered so far; the endpoint the peer is handed must not grow with
+    /// them, because the rendezvous server delivers it to a UDP-registered peer as one datagram
+    /// and a fragmented one is dropped without a trace on paths that discard fragments.
     #[tokio::test]
-    async fn test_trickle_endpoint_never_grows_with_candidates() {
+    async fn test_stored_endpoint_does_not_grow_with_the_live_description() {
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let first = offerer.get_local_endpoint_trickle().await.unwrap();
+        let live = first_gathered_description(&offerer).await;
+        let endpoint = offerer.local_endpoint().to_owned();
+        offerer.close().await;
 
-        let mut gather_complete = offerer.pc.gathering_complete_promise().await;
-        let _ = timeout(Duration::from_secs(10), gather_complete.recv()).await;
-
-        let after = offerer.get_local_endpoint_trickle().await.unwrap();
-        assert_eq!(first, after, "trickle endpoint changed while ICE gathered");
+        // Some(_) is the assertion that the live description grew: the helper only returns once it
+        // carries a candidate, so the endpoint below really had something to grow by.
+        live.expect("no ICE candidate gathered within 10s");
         assert!(
-            after.len() <= WebRTCStream::UDP_ENDPOINT_BUDGET,
-            "trickle endpoint is {} bytes, over the {} byte budget",
-            after.len(),
-            WebRTCStream::UDP_ENDPOINT_BUDGET
-        );
-        assert!(
-            !WebRTCStream::get_remote_offer(&after)
+            !WebRTCStream::get_remote_offer(&endpoint)
                 .unwrap()
                 .contains("a=candidate"),
-            "trickle endpoint must carry no ICE candidates"
+            "the signalled endpoint grew candidates alongside the live description"
         );
-
-        // The one-shot endpoint keeps its old contract, which is also what makes the check above
-        // meaningful: candidates really were gathered by now.
-        let gathered = offerer.get_local_endpoint().await.unwrap();
         assert!(
-            gathered.len() > after.len(),
-            "gathered endpoint {} is not larger than the trickle one {}",
-            gathered.len(),
-            after.len()
+            endpoint.len() <= WebRTCStream::UDP_ENDPOINT_BUDGET,
+            "signalled endpoint is {} bytes, over the {} byte budget",
+            endpoint.len(),
+            WebRTCStream::UDP_ENDPOINT_BUDGET
         );
-        offerer.close().await;
     }
 
     /// The split itself: candidates out, everything ICE and DTLS need to start in. A stripped
@@ -1634,14 +1648,9 @@ mod tests {
     #[tokio::test]
     async fn test_trickle_endpoint_splits_candidates_off() {
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let mut gather_complete = offerer.pc.gathering_complete_promise().await;
-        let _ = timeout(Duration::from_secs(10), gather_complete.recv()).await;
-
-        let gathered = offerer.pc.local_description().await.unwrap();
-        assert!(
-            gathered.sdp.contains("a=candidate:"),
-            "nothing to strip: the pc gathered no candidate"
-        );
+        let gathered = first_gathered_description(&offerer).await;
+        offerer.close().await;
+        let gathered = gathered.expect("no ICE candidate gathered within 10s");
 
         let endpoint = WebRTCStream::trickle_endpoint(&gathered, false).unwrap();
         let json = WebRTCStream::get_remote_offer(&endpoint).unwrap();
@@ -1659,17 +1668,31 @@ mod tests {
             "a=mid:",
             "a=sctp-port:",
         ] {
-            assert!(json.contains(keep), "trickle endpoint dropped {keep}");
+            assert!(json.contains(keep), "trickle endpoint dropped {}", keep);
         }
         assert!(
             endpoint.len() <= WebRTCStream::UDP_ENDPOINT_BUDGET,
             "stripped endpoint is {} bytes",
             endpoint.len()
         );
-        serde_json::from_str::<RTCSessionDescription>(&json)
-            .expect("a stripped endpoint must still parse as a session description");
+        // `parsed` is #[serde(skip)], so deserializing alone would accept any string as the SDP
+        // body. Unmarshal it, which is also what the peer does, and require the fingerprint the
+        // session key is derived from to have survived.
+        let desc: RTCSessionDescription =
+            serde_json::from_str(&json).expect("a stripped endpoint must deserialize");
+        WebRTCStream::get_key_for_sdp(&desc)
+            .expect("a stripped endpoint must still parse as SDP and keep its fingerprint");
 
-        offerer.close().await;
+        // `encode_endpoint`, which `get_local_endpoint` also goes through, holds the opposite
+        // contract: carry whatever it is handed, candidates included. (What `get_local_endpoint`
+        // adds on top — the gathering wait — is covered by test_webrtc_loopback_gathered_endpoints.)
+        let kept = WebRTCStream::encode_endpoint(gathered.sdp_type, &gathered.sdp, false).unwrap();
+        assert!(
+            WebRTCStream::get_remote_offer(&kept)
+                .unwrap()
+                .contains("a=candidate:"),
+            "encode_endpoint dropped the candidates it was handed"
+        );
     }
 
     #[test]
@@ -1931,9 +1954,9 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
     async fn connect_loopback() -> (WebRTCStream, WebRTCStream) {
         let mut offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let offer = offerer.get_local_endpoint_trickle().await.unwrap();
+        let offer = offerer.local_endpoint().to_owned();
         let answerer = WebRTCStream::new(&offer, false, 20000).await.unwrap();
-        let answer = answerer.get_local_endpoint_trickle().await.unwrap();
+        let answer = answerer.local_endpoint().to_owned();
         offerer.set_remote_endpoint(&answer).await.unwrap();
 
         // Bridge trickle candidates directly between the two peers, both directions.
@@ -2049,7 +2072,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     #[tokio::test]
     async fn test_cached_peer_is_not_reused_across_ice_policies() {
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
-        let offer = offerer.get_local_endpoint_trickle().await.unwrap();
+        let offer = offerer.local_endpoint().to_owned();
 
         let all_ice = WebRTCStream::new(&offer, false, 20000).await.unwrap();
         assert!(!all_ice.relay_only);
@@ -2117,9 +2140,9 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             .await
             .unwrap();
 
-        let offer = offerer.get_local_endpoint_trickle().await.unwrap();
+        let offer = offerer.local_endpoint().to_owned();
         let answerer = WebRTCStream::new(&offer, false, 20000).await.unwrap();
-        let answer = answerer.get_local_endpoint_trickle().await.unwrap();
+        let answer = answerer.local_endpoint().to_owned();
         offerer.set_remote_endpoint(&answer).await.unwrap();
 
         let mut off_ice = offerer.take_local_ice_rx().unwrap();
