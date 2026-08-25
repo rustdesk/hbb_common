@@ -2354,33 +2354,44 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     }
 
     // End-to-end: cancel `new()` itself after its first poll (the spawn is already in flight)
-    // and every session it transiently created must be closed and evicted again. Keys are
-    // compared as a set difference so concurrent tests' own sessions do not interfere; theirs
-    // clean up within the wait too.
+    // and every session it transiently created must be closed and evicted again.
+    //
+    // The cancelled attempt's own key is unknowable here — its DTLS fingerprint is generated
+    // inside the task that was abandoned — so what is watched for is a key that OUTLASTS the
+    // window, not an instant with no new keys at all. Concurrent tests each close what they
+    // create, so their keys come and go and drop out of the running intersection; a leaked pc
+    // never does. Waiting for an empty difference instead made this test depend on the suite
+    // having an idle moment, which `--test-threads=2` never gives it: one lane is this test for
+    // the whole wait while the other keeps starting sessions.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cancelled_new_does_not_leak_the_pc() {
         use std::collections::HashSet;
         let before: HashSet<String> = SESSIONS.lock().await.keys().cloned().collect();
         // Zero timeout: polls the future exactly once (spawning new_inner), then cancels it.
         let _ = timeout(Duration::ZERO, WebRTCStream::new("", false, 20000)).await;
-        // Let the detached setup task finish (and insert its session) before demanding the
-        // difference be empty, or an early check passes vacuously while the leak forms later.
+        // Let the detached setup task finish (and insert its session) before sampling, or the
+        // first sample is taken before the leak has formed and every later one intersects to
+        // nothing.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        // 30s: concurrent tests' transient sessions land in the difference too and must be
-        // given time to finish and evict (every test closes what it creates).
-        const ATTEMPTS: usize = 600;
+        const ATTEMPTS: usize = 600; // 30s
+        let mut persisted: Option<HashSet<String>> = None;
         for attempt in 1..=ATTEMPTS {
             let now: HashSet<String> = SESSIONS.lock().await.keys().cloned().collect();
-            let leftover: Vec<&String> = now.difference(&before).collect();
-            if leftover.is_empty() {
+            let new_keys: HashSet<String> = now.difference(&before).cloned().collect();
+            persisted = Some(match persisted {
+                None => new_keys,
+                Some(prev) => prev.intersection(&new_keys).cloned().collect(),
+            });
+            let persisted_keys = persisted.as_ref().map_or(0, HashSet::len);
+            if persisted_keys == 0 {
                 return;
             }
-            // Positional, not an inline `{leftover:?}`: on edition 2018 a lone-literal `panic!`
+            // Positional, not an inline `{persisted:?}`: on edition 2018 a lone-literal `panic!`
             // does not go through format_args and would print the placeholder verbatim.
             assert!(
                 attempt < ATTEMPTS,
-                "cancelled new() left a pc cached in SESSIONS (leftover: {:?})",
-                leftover
+                "cancelled new() left a pc cached in SESSIONS (persisted: {:?})",
+                persisted
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
