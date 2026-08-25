@@ -583,6 +583,13 @@ impl WebRTCStream {
         let mut s = SettingEngine::default();
         s.detach_data_channels();
         s.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        // fe80::/10 can only be bound together with a scope id, which `IpAddr` cannot carry, so
+        // gathering one never yields a candidate - only a failed bind and a warning per address.
+        // Spelled out because `is_unicast_link_local` is not stable on our MSRV.
+        s.set_ip_filter(Box::new(|ip: IpAddr| match ip {
+            IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 != 0xfe80,
+            IpAddr::V4(_) => true,
+        }));
 
         // Create the API object
         let api = APIBuilder::new().with_setting_engine(s).build();
