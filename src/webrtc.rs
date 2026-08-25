@@ -145,13 +145,14 @@ const FRAG_END: u8 = 0;
 /// unauthenticated peer can make a receiver hold. Kept at parity with TCP on purpose: one session
 /// moves between both paths, so a transport-specific ceiling would kill it on the other one.
 const MAX_RECV_MESSAGE: usize = crate::bytes_codec::MAX_FRAME_LENGTH;
-// use 3 public STUN servers to find out the NAT type, 2 must be the same address but different ports
-// https://stackoverflow.com/questions/72805316/determine-nat-mapping-behaviour-using-two-stun-servers
-// luckily nextcloud supports two ports for STUN
-// unluckily webrtc-rs does not use the same port to do the STUN request
-static DEFAULT_ICE_SERVERS: [&str; 3] = [
+// Four networks, not four names: webrtc-ice queries each URL from its own socket, so entries
+// sharing a host buy no redundancy - the two this list used to carry failed together, in the same
+// millisecond, on a peer whose route to that one host was down. Two anycast, two unicast; the 443
+// entry is for networks that pass no other UDP port.
+static DEFAULT_ICE_SERVERS: [&str; 4] = [
     "stun:stun.cloudflare.com:3478",
-    "stun:stun.nextcloud.com:3478",
+    "stun:stun.l.google.com:19302",
+    "stun:stun.antisip.com:3478",
     "stun:stun.nextcloud.com:443",
 ];
 
@@ -478,6 +479,14 @@ impl WebRTCStream {
         Self::parse_ice_servers(&config::Config::get_option(
             config::keys::OPTION_ICE_SERVERS,
         ))
+    }
+
+    /// The default UDP STUN servers as bare `host:port`, for application-level address probes.
+    pub fn default_stun_servers() -> Vec<String> {
+        DEFAULT_ICE_SERVERS
+            .iter()
+            .filter_map(|url| url.strip_prefix("stun:").map(str::to_owned))
+            .collect()
     }
 
     /// Split out from `get_ice_servers` so parsing can be exercised without touching the
