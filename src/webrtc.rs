@@ -2367,8 +2367,25 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     async fn test_cancelled_new_does_not_leak_the_pc() {
         use std::collections::HashSet;
         let before: HashSet<String> = SESSIONS.lock().await.keys().cloned().collect();
-        // Zero timeout: polls the future exactly once (spawning new_inner), then cancels it.
-        let _ = timeout(Duration::ZERO, WebRTCStream::new("", false, 20000)).await;
+        // Zero timeout: polls the future exactly once (spawning new_inner), then cancels it —
+        // usually. The setup task runs on its own runtime and can finish inside that single poll,
+        // and then `new()` hands back a live stream instead. `WebRTCStream` has no `Drop`, so
+        // discarding that one is itself a leak, and this test would go on to report it as the
+        // cancelled attempt's. Close what comes back and try for a real cancellation. Fewer test
+        // threads make the setup task likelier to win, which is why this surfaced under
+        // `--test-threads=2` and not at the default.
+        let mut cancelled = false;
+        for _ in 0..20 {
+            match timeout(Duration::ZERO, WebRTCStream::new("", false, 20000)).await {
+                Err(_) => {
+                    cancelled = true;
+                    break;
+                }
+                Ok(Ok(stream)) => stream.close().await,
+                Ok(Err(_)) => {}
+            }
+        }
+        assert!(cancelled, "new() never lost the race with its own cancellation");
         // Let the detached setup task finish (and insert its session) before sampling, or the
         // first sample is taken before the leak has formed and every later one intersects to
         // nothing.
