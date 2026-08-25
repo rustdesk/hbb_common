@@ -1037,6 +1037,20 @@ impl WebRTCStream {
         )
     }
 
+    /// Whether the nominated pair reaches the peer over IPv6 — `None` before one is selected.
+    /// The remote side on purpose: it is the address the peer is actually reached at, which the
+    /// rendezvous-observed address the session is otherwise identified by cannot report.
+    pub async fn is_remote_ipv6(&self) -> Option<bool> {
+        let dtls = self.pc.sctp().transport();
+        let pair = dtls.ice_transport().get_selected_candidate_pair().await?;
+        // Same `Display` parse as `is_relayed`, one token over: a side renders as
+        // `(remote) <protocol> <typ> <address>:<port>`, and `protocol` is only udp/tcp, so the
+        // family has to come from the address — an IPv6 literal is the only one with two colons.
+        let pair = pair.to_string();
+        let remote = pair.split(" <-> ").nth(1)?;
+        Some(remote.split_whitespace().nth(3)?.matches(':').count() > 1)
+    }
+
     #[inline]
     pub fn take_local_ice_rx(&self) -> Option<mpsc::UnboundedReceiver<String>> {
         self.local_ice_rx.lock().ok().and_then(|mut rx| rx.take())

@@ -122,6 +122,19 @@ impl Stream {
         }
     }
 
+    /// Whether an established WebRTC transport reaches the peer over IPv6 (used to name the
+    /// transport in the UI). `None` for non-WebRTC transports and before ICE selects a pair —
+    /// every other transport already carries the family in the label it was raced under.
+    #[inline]
+    pub async fn webrtc_remote_ipv6(&self) -> Option<bool> {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.is_remote_ipv6().await,
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /// DTLS certificate fingerprint for a WebRTC stream (`local`=true for this endpoint's own
     /// cert, false for the peer's), used to bind the channel to the signed peer identity.
     /// Returns None for non-WebRTC transports, which authenticate via the secretbox key exchange.
