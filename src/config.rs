@@ -900,11 +900,60 @@ impl Config {
 
     #[inline]
     pub fn get_any_listen_addr(is_ipv4: bool) -> SocketAddr {
+        // use the configured bind source ip if any, else the unspecified addr
+        if let Some(ip) = Self::get_bind_source_ip(is_ipv4) {
+            return SocketAddr::new(ip, 0);
+        }
         if is_ipv4 {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         } else {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         }
+    }
+
+    fn bind_decision(is_ipv4: bool) -> BindDecision {
+        let value = Self::get_option(keys::OPTION_BIND_INTERFACE);
+        // default path: nothing configured, so don't enumerate interfaces on
+        // every socket we create
+        if value.is_empty() {
+            return BindDecision::Any;
+        }
+        decide_bind(&value, is_ipv4, local_ip_exists, interface_source_ip)
+    }
+
+    // Source ip to bind outgoing sockets to per bind-interface, or None to let
+    // the os choose. Also None when the configured interface/address is gone or
+    // has no address of this family: binding falls back to all interfaces
+    // rather than cutting the connection.
+    pub fn get_bind_source_ip(is_ipv4: bool) -> Option<IpAddr> {
+        match Self::bind_decision(is_ipv4) {
+            // PinOnly sets no source address; apply_bind_device does the work
+            BindDecision::Any | BindDecision::PinOnly => None,
+            BindDecision::Use(ip) => Some(ip),
+        }
+    }
+
+    // Ingress counterpart of get_bind_source_ip: the address a listener should
+    // bind, or None to listen on all interfaces.
+    pub fn get_bind_listen_ip(is_ipv4: bool) -> Option<IpAddr> {
+        Self::get_bind_source_ip(is_ipv4)
+    }
+
+    // Interface to pin sockets to (see bind_socket_to_interface), as the system
+    // device name -- `if_nametoindex` and SO_BINDTODEVICE do not accept the
+    // friendly names that may be configured. None when nothing is configured,
+    // when the value is an address (there is no device to pin), or when this
+    // family falls back to all interfaces, so pinning never contradicts the
+    // source address decision.
+    pub fn get_bind_device(is_ipv4: bool) -> Option<String> {
+        let v = Self::get_option(keys::OPTION_BIND_INTERFACE);
+        if v.is_empty() || v.parse::<IpAddr>().is_ok() {
+            return None;
+        }
+        if matches!(Self::bind_decision(is_ipv4), BindDecision::Any) {
+            return None;
+        }
+        Some(system_device_name(&v))
     }
 
     pub fn get_rendezvous_server() -> String {
@@ -2847,6 +2896,321 @@ pub fn allow_insecure_tls_fallback() -> bool {
     option2bool(option, &Config::get_option(option))
 }
 
+// true if `ip` is currently on a local interface (used to fall back when a
+// configured source ip is gone, e.g. vpn down or dhcp change)
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn local_ip_exists(ip: &IpAddr) -> bool {
+    netif::get_interfaces().iter().any(|i| match ip {
+        IpAddr::V4(v4) => i.ipv4.iter().any(|n| &n.addr() == v4),
+        IpAddr::V6(v6) => i.ipv6.iter().any(|n| &n.addr() == v6),
+    })
+}
+
+// no interface enumeration on mobile (default_net fork only has get_mac), so
+// trust the configured ip
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn local_ip_exists(_ip: &IpAddr) -> bool {
+    true
+}
+
+// first usable ipv4/ipv6 addr of the interface, matched by name or friendly name
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn interface_source_ip(name: &str, is_ipv4: bool) -> Option<IpAddr> {
+    let iface = netif::get_interfaces()
+        .into_iter()
+        .find(|i| i.name == name || i.friendly_name.as_deref() == Some(name))?;
+    if is_ipv4 {
+        iface.ipv4.first().map(|n| IpAddr::V4(n.addr()))
+    } else {
+        // skip link-local (fe80::/10): bound as a source without a scope id it
+        // cannot reach off-link peers. Some interfaces (docker0, bridges) have
+        // nothing else, so fall back to it rather than refusing to bind.
+        iface
+            .ipv6
+            .iter()
+            .map(|n| n.addr())
+            .find(|a| !is_link_local_v6(a))
+            .or_else(|| iface.ipv6.first().map(|n| n.addr()))
+            .map(IpAddr::V6)
+    }
+}
+
+// Ipv6Addr::is_unicast_link_local is still unstable
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn is_link_local_v6(a: &Ipv6Addr) -> bool {
+    a.segments()[0] & 0xffc0 == 0xfe80
+}
+
+// no enumeration on mobile (the default_net fork only has get_mac), so an
+// interface name cannot be resolved to a source ip there. It can still be
+// pinned with SO_BINDTODEVICE, which is what PinOnly is for.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn interface_source_ip(_name: &str, _is_ipv4: bool) -> Option<IpAddr> {
+    None
+}
+
+// whether an unresolvable interface name can still be honoured by pinning the
+// device instead of setting a source address
+const CAN_PIN_WITHOUT_SOURCE_IP: bool = cfg!(any(target_os = "android", target_os = "ios"));
+
+// What a socket should bind to, split out from the accessors so the decision is
+// testable without real interfaces.
+#[derive(Debug, PartialEq, Eq)]
+enum BindDecision {
+    // nothing configured, or the target is unusable for this family: os picks
+    Any,
+    // use this local address
+    Use(IpAddr),
+    // the interface cannot be resolved to a source address on this platform,
+    // but the socket can still be pinned to the device (see apply_bind_device)
+    PinOnly,
+}
+
+// `value` is either an ip address to use as the source, or an interface name --
+// same rule as libtorrent's outgoing_interfaces. An unusable value always falls
+// back to letting the os choose.
+fn decide_bind(
+    value: &str,
+    is_ipv4: bool,
+    ip_present: impl Fn(&IpAddr) -> bool,
+    iface_ip: impl Fn(&str, bool) -> Option<IpAddr>,
+) -> BindDecision {
+    decide_bind_with(
+        value,
+        is_ipv4,
+        ip_present,
+        iface_ip,
+        CAN_PIN_WITHOUT_SOURCE_IP,
+    )
+}
+
+fn decide_bind_with(
+    value: &str,
+    is_ipv4: bool,
+    ip_present: impl Fn(&IpAddr) -> bool,
+    iface_ip: impl Fn(&str, bool) -> Option<IpAddr>,
+    can_pin_without_source_ip: bool,
+) -> BindDecision {
+    if value.is_empty() {
+        return BindDecision::Any;
+    }
+    let Ok(ip) = value.parse::<IpAddr>() else {
+        // not an address, so it names an interface
+        return match iface_ip(value, is_ipv4) {
+            Some(ip) => BindDecision::Use(ip),
+            // where addresses cannot be enumerated we cannot tell a missing
+            // interface from an address-less one, so leave the verdict to the
+            // device pinning, which fails at bind time for a name that is gone
+            None if can_pin_without_source_ip => BindDecision::PinOnly,
+            None => BindDecision::Any,
+        };
+    };
+    if ip.is_ipv4() != is_ipv4 {
+        // wrong family for this target; an ipv4 binding doesn't constrain ipv6
+        return BindDecision::Any;
+    }
+    if ip_present(&ip) {
+        BindDecision::Use(ip)
+    } else {
+        BindDecision::Any
+    }
+}
+
+// A configured value may be a friendly name (macOS "Wi-Fi", Windows "Ethernet
+// 2"); SO_BINDTODEVICE and if_nametoindex only accept the system device name,
+// so resolve it here rather than at each call site.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn system_device_name(value: &str) -> String {
+    netif::get_interfaces()
+        .into_iter()
+        .find(|i| i.name == value || i.friendly_name.as_deref() == Some(value))
+        .map(|i| i.name)
+        .unwrap_or_else(|| value.to_owned())
+}
+
+// no enumeration on mobile; the configured value is the device name there
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn system_device_name(value: &str) -> String {
+    value.to_owned()
+}
+
+// interface name or friendly name -> kernel index, for the windows bind option
+#[cfg(target_os = "windows")]
+fn interface_index(name: &str, is_ipv4: bool) -> Option<u32> {
+    let iface = netif::get_interfaces()
+        .into_iter()
+        .find(|i| i.name == name || i.friendly_name.as_deref() == Some(name))?;
+    if is_ipv4 {
+        Some(iface.index)
+    } else {
+        // Interface.index is Windows' IPv4 IfIndex; IPV6_UNICAST_IF wants the
+        // separate Ipv6IfIndex, which netdev surfaces as the ipv6 scope id.
+        iface.ipv6_scope_ids.first().copied()
+    }
+}
+
+// pin egress to an interface regardless of the routing table, to force traffic
+// onto or off a (full-tunnel) vpn. per-os socket option:
+//   linux/android: SO_BINDTODEVICE (by name)
+//   macos/ios:     IP_BOUND_IF / IPV6_BOUND_IF (by index)
+//   windows:       IP_UNICAST_IF / IPV6_UNICAST_IF (by index)
+// err is logged and ignored: an unusable interface falls back to the os choice.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn bind_socket_to_interface(
+    fd: std::os::unix::io::RawFd,
+    device: &str,
+    _is_ipv4: bool,
+) -> std::io::Result<()> {
+    let cstr = std::ffi::CString::new(device).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid device name")
+    })?;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            cstr.as_ptr() as *const libc::c_void,
+            (device.len() + 1) as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        log::debug!("SO_BINDTODEVICE({device}) failed: {err}");
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn bind_socket_to_interface(
+    fd: std::os::unix::io::RawFd,
+    device: &str,
+    is_ipv4: bool,
+) -> std::io::Result<()> {
+    let cstr = std::ffi::CString::new(device).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid device name")
+    })?;
+    let index = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+    if index == 0 {
+        let err = std::io::Error::last_os_error();
+        log::debug!("if_nametoindex({device}) failed: {err}");
+        return Err(err);
+    }
+    let (level, optname) = if is_ipv4 {
+        (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+    } else {
+        (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+    };
+    let index: libc::c_uint = index;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            &index as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        log::debug!("IP_BOUND_IF({device}) failed: {err}");
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn bind_socket_to_interface(
+    sock: std::os::windows::io::RawSocket,
+    device: &str,
+    is_ipv4: bool,
+) -> std::io::Result<()> {
+    use winapi::um::winsock2::{setsockopt, SOCKET};
+    // from the windows sdk; winapi 0.3 doesn't expose IP_UNICAST_IF / IPPROTO_IPV6
+    const IPPROTO_IP: i32 = 0;
+    const IPPROTO_IPV6: i32 = 41;
+    const IP_UNICAST_IF: i32 = 31;
+    const IPV6_UNICAST_IF: i32 = 31;
+
+    let index = interface_index(device, is_ipv4).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("interface {device} not found"),
+        )
+    })?;
+    // ipv4 wants the index in network byte order, ipv6 in host order
+    let (level, optname, value) = if is_ipv4 {
+        (IPPROTO_IP, IP_UNICAST_IF, index.to_be())
+    } else {
+        (IPPROTO_IPV6, IPV6_UNICAST_IF, index)
+    };
+    let ret = unsafe {
+        setsockopt(
+            sock as SOCKET,
+            level,
+            optname,
+            &value as *const u32 as *const i8,
+            std::mem::size_of::<u32>() as i32,
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        log::debug!("IP_UNICAST_IF({device}) failed: {err}");
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// No-op on platforms without a per-socket interface option; source-IP binding
+/// still applies, which is enough to select the egress interface there.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows"
+)))]
+pub fn bind_socket_to_interface(
+    _fd: std::os::raw::c_int,
+    _device: &str,
+    _is_ipv4: bool,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Pin `socket` to the configured interface, if one is configured by name.
+/// A failure here is not fatal: the binding falls back to letting the os pick
+/// an interface, which is what an unusable bind-interface value does elsewhere.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+pub fn apply_bind_device<S: std::os::unix::io::AsRawFd>(socket: &S, is_ipv4: bool) {
+    let Some(device) = Config::get_bind_device(is_ipv4) else {
+        return;
+    };
+    let _ = bind_socket_to_interface(socket.as_raw_fd(), &device, is_ipv4);
+}
+
+#[cfg(target_os = "windows")]
+pub fn apply_bind_device<S: std::os::windows::io::AsRawSocket>(socket: &S, is_ipv4: bool) {
+    let Some(device) = Config::get_bind_device(is_ipv4) else {
+        return;
+    };
+    let _ = bind_socket_to_interface(socket.as_raw_socket(), &device, is_ipv4);
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows"
+)))]
+pub fn apply_bind_device<S>(_socket: &S, _is_ipv4: bool) {}
+
 pub mod keys {
     pub const OPTION_VIEW_ONLY: &str = "view_only";
     pub const OPTION_SHOW_MONITORS_TOOLBAR: &str = "show_monitors_toolbar";
@@ -2968,6 +3332,9 @@ pub mod keys {
     pub const OPTION_FILE_TRANSFER_MAX_FILES: &str = "file-transfer-max-files";
     pub const OPTION_DISABLE_UDP: &str = "disable-udp";
     pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
+    // bind incoming and outgoing sockets to a specific interface:
+    // a source ip address, or the name of the interface; empty = off
+    pub const OPTION_BIND_INTERFACE: &str = "bind-interface";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
     // joystick is the virtual mouse.
     // So `OPTION_SHOW_VIRTUAL_MOUSE` should also be set if `OPTION_SHOW_VIRTUAL_JOYSTICK` is set.
@@ -3288,6 +3655,86 @@ mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
 
     static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // ----- bind-to-interface decision logic (no real interfaces needed) -----
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn bind_empty_yields_no_binding() {
+        let no_ip = |_: &IpAddr| false;
+        let no_if = |_: &str, _: bool| None;
+        assert_eq!(decide_bind("", true, no_ip, no_if), BindDecision::Any);
+    }
+
+    #[test]
+    fn bind_ip_present_is_used() {
+        let present = |a: &IpAddr| a == &ip("192.168.1.10");
+        let no_if = |_: &str, _: bool| None;
+        assert_eq!(
+            decide_bind("192.168.1.10", true, present, no_if),
+            BindDecision::Use(ip("192.168.1.10"))
+        );
+    }
+
+    #[test]
+    fn bind_ip_absent_falls_back() {
+        let absent = |_: &IpAddr| false;
+        let no_if = |_: &str, _: bool| None;
+        assert_eq!(
+            decide_bind("10.0.0.5", true, absent, no_if),
+            BindDecision::Any
+        );
+    }
+
+    #[test]
+    fn bind_ip_family_mismatch_falls_back() {
+        let present = |_: &IpAddr| true;
+        let no_if = |_: &str, _: bool| None;
+        // configured IPv4 but the target is IPv6: the binding does not apply
+        assert_eq!(
+            decide_bind("10.0.0.5", false, present, no_if),
+            BindDecision::Any
+        );
+    }
+
+    #[test]
+    fn bind_non_address_is_an_interface_name() {
+        let no_ip = |_: &IpAddr| false;
+        let resolve = |name: &str, is_ipv4: bool| {
+            if name == "eth0" && is_ipv4 {
+                Some(ip("172.16.0.2"))
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            decide_bind("eth0", true, no_ip, resolve),
+            BindDecision::Use(ip("172.16.0.2"))
+        );
+        // unknown interface, or one with no address of this family -> fall back
+        assert_eq!(decide_bind("wg0", true, no_ip, resolve), BindDecision::Any);
+        assert_eq!(decide_bind("eth0", false, no_ip, resolve), BindDecision::Any);
+    }
+
+    #[test]
+    fn interface_name_pins_the_device_where_addresses_cannot_be_enumerated() {
+        let no_ip = |_: &IpAddr| false;
+        let no_if = |_: &str, _: bool| None;
+        // mobile: an interface name resolves to no address, but SO_BINDTODEVICE
+        // still applies, so the name must not be discarded
+        assert_eq!(
+            decide_bind_with("wlan0", true, no_ip, no_if, true),
+            BindDecision::PinOnly
+        );
+        // desktop: addresses are enumerable, so an unresolvable name falls back
+        assert_eq!(
+            decide_bind_with("wlan0", true, no_ip, no_if, false),
+            BindDecision::Any
+        );
+    }
 
     struct ConfigStateTestGuard {
         original_config: Config,

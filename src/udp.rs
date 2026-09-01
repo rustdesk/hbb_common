@@ -14,7 +14,23 @@ pub enum FramedSocket {
     ProxySocks(Socks5UdpFramed),
 }
 
-fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, std::io::Error> {
+pub(crate) fn new_socket(
+    addr: SocketAddr,
+    reuse: bool,
+    buf_size: usize,
+) -> Result<Socket, std::io::Error> {
+    new_socket_pinned(addr, reuse, buf_size, false)
+}
+
+// `pin_device` must only be set for addresses derived from bind-interface;
+// FramedSocket::new/new_reuse take caller-supplied addresses, and pinning those
+// to the configured device can filter out traffic that used to arrive fine.
+pub(crate) fn new_socket_pinned(
+    addr: SocketAddr,
+    reuse: bool,
+    buf_size: usize,
+    pin_device: bool,
+) -> Result<Socket, std::io::Error> {
     let socket = match addr {
         SocketAddr::V4(..) => Socket::new(Domain::ipv4(), Type::dgram(), None),
         SocketAddr::V6(..) => Socket::new(Domain::ipv6(), Type::dgram(), None),
@@ -40,6 +56,10 @@ fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, 
     );
     if addr.is_ipv6() && addr.ip().is_unspecified() && addr.port() > 0 {
         socket.set_only_v6(false).ok();
+    }
+    // same as tcp.rs: pin the device when an interface is named
+    if pin_device {
+        crate::config::apply_bind_device(&socket, addr.is_ipv4());
     }
     socket.bind(&addr.into())?;
     Ok(socket)
