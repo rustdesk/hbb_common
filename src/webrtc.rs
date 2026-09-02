@@ -41,6 +41,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use percent_encoding::percent_decode_str;
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant};
 use url::Url;
@@ -395,8 +396,14 @@ impl WebRTCStream {
         if host.is_empty() {
             return None;
         }
-        let username = u.username().to_string();
-        let credential = u.password().unwrap_or_default().to_string();
+        // `Url` hands userinfo back percent-encoded; the TURN server expects the value,
+        // so `p%40ss` must reach it as `p@ss` for the long-term credential to verify.
+        let username = percent_decode_str(u.username())
+            .decode_utf8_lossy()
+            .into_owned();
+        let credential = percent_decode_str(u.password().unwrap_or_default())
+            .decode_utf8_lossy()
+            .into_owned();
         // A TURN server without credentials is not merely useless: webrtc-rs validates every
         // configured server in `new_peer_connection`, so one credential-less entry makes EVERY
         // peer connection fail — including plain non-relay ones that never wanted TURN. The
@@ -1467,6 +1474,14 @@ mod tests {
                 .urls[0],
             "turn:example.com:3478"
         );
+
+        // Userinfo arrives percent-encoded from the URL parser; the TURN server wants the
+        // value, so a password written `p%40ss` authenticates as `p@ss`.
+        let encoded =
+            WebRTCStream::get_ice_server_from_url("turn://us%20er:p%40s%2Fs%25@example.com")
+                .expect("encoded credentials are usable");
+        assert_eq!(encoded.username, "us er");
+        assert_eq!(encoded.credential, "p@s/s%");
 
         // TURN without both halves of the credential is dropped rather than passed on:
         // webrtc-rs validates every configured server when the peer connection is built, so

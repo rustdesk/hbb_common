@@ -52,6 +52,7 @@ thiserror = "1.0"
 httparse = "1.10"
 base64 = "0.22"
 url = "2.5"
+percent-encoding = "2"
 sha2 = "0.10"
 whoami = "1.5"
 
