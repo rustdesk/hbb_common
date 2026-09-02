@@ -474,6 +474,12 @@ impl WebRTCStream {
     }
 
     #[inline]
+    fn get_cc_enabled() -> bool {
+        let k = config::keys::OPTION_ALLOW_WEBRTC_CC;
+        config::option2bool(k, &config::Config::get_option(k))
+    }
+
+    #[inline]
     fn get_ice_servers() -> Vec<RTCIceServer> {
         Self::parse_ice_servers(&config::Config::get_option(
             config::keys::OPTION_ICE_SERVERS,
@@ -598,6 +604,11 @@ impl WebRTCStream {
             IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 != 0xfe80,
             IpAddr::V4(_) => true,
         }));
+
+        // KCP's nc=1 profile by default, with the same opt-in to a congestion window as
+        // `allow-kcp-congestion-control`, for the reason given at `get_kcp_cc_enabled`. Set per
+        // connection so the option takes effect on the next session, not the next start.
+        webrtc::sctp::association::set_no_congestion_control(!Self::get_cc_enabled());
 
         // Create the API object
         let api = APIBuilder::new().with_setting_engine(s).build();

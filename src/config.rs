@@ -3000,6 +3000,7 @@ pub mod keys {
     pub const OPTION_ENABLE_PORT_FORWARD_MUX: &str = "enable-port-forward-mux";
     pub const OPTION_ENABLE_WEBRTC: &str = "enable-webrtc";
     pub const OPTION_ALLOW_KCP_CC: &str = "allow-kcp-congestion-control";
+    pub const OPTION_ALLOW_WEBRTC_CC: &str = "allow-webrtc-congestion-control";
     pub const OPTION_HIDE_USERNAME_ON_CARD: &str = "hide-username-on-card";
     pub const OPTION_HIDE_HELP_CARDS: &str = "hide-help-cards";
     pub const OPTION_DEFAULT_CONNECT_PASSWORD: &str = "default-connect-password";
@@ -3208,6 +3209,7 @@ pub mod keys {
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
         OPTION_ALLOW_KCP_CC,
+        OPTION_ALLOW_WEBRTC_CC,
     ];
 
     // BUILDIN_SETTINGS
