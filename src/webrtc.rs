@@ -637,14 +637,20 @@ impl WebRTCStream {
         let pc = Arc::new(api.new_peer_connection(config).await?);
         // `on_*` handlers are never cleared — not by `close()`, not by `SESSIONS` eviction — so
         // this sender outlives the pc and would park a caller's ICE forwarder on `recv()` forever,
-        // holding the pc with it. The terminal-state handler below drops this closure to break it.
-        let local_ice_tx = ice_tx.clone();
+        // holding the pc with it. Gathering complete (`None`) is the agent's last word short of an
+        // ICE restart, which nothing here does, so the sender goes with it and the forwarder ends
+        // there rather than with the session; the terminal-state handler below drops this closure
+        // for a pc that dies before it gets that far.
+        let mut local_ice_tx = Some(ice_tx);
         pc.on_ice_candidate(Box::new(move |candidate| {
-            let local_ice_tx = local_ice_tx.clone();
+            let Some(candidate) = candidate else {
+                local_ice_tx = None;
+                return Box::pin(async {});
+            };
+            let Some(local_ice_tx) = local_ice_tx.clone() else {
+                return Box::pin(async {});
+            };
             Box::pin(async move {
-                let Some(candidate) = candidate else {
-                    return;
-                };
                 match candidate.to_json() {
                     Ok(candidate) => match serde_json::to_string(&candidate) {
                         Ok(candidate_json) => {
@@ -1426,7 +1432,10 @@ impl WebRTCStream {
             }
             acc.extend_from_slice(&scratch[1..n]);
             if header == FRAG_END {
-                let msg = std::mem::take(acc);
+                // Split, not take: the caller has dropped the message by the time the next
+                // fragment lands, so `reserve` reclaims this allocation instead of regrowing it
+                // from nothing for every fragmented frame.
+                let msg = acc.split();
                 return Some(Ok(msg));
             }
         }
@@ -2070,7 +2079,9 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // The local-candidate channel must close when the pc does. Its only sender lives inside the
     // on_ice_candidate handler, which close() does not clear, so without the teardown the
     // receiver stays open forever — and the forwarder loop this API asks callers to write holds
-    // a stream clone while parked on recv(), keeping the pc alive past its own close.
+    // a stream clone while parked on recv(), keeping the pc alive past its own close. Gathering
+    // complete drops the sender as well, and may beat the close here; a pc closed before that
+    // has only the teardown, which is what this pins.
     #[tokio::test]
     async fn test_local_ice_channel_closes_with_the_peer_connection() {
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
@@ -2091,6 +2102,24 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             .await
             .expect("forwarder task outlived the peer connection")
             .unwrap();
+    }
+
+    // The channel must close when gathering does, with the pc still open: nothing can follow the
+    // agent's last candidate, and a forwarder parked on recv() until the session ends holds its
+    // signaling connection for that whole time — long after the server's idle close, as a socket
+    // left in CLOSE_WAIT.
+    #[tokio::test]
+    async fn test_local_ice_channel_closes_when_gathering_completes() {
+        let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
+        let mut ice_rx = offerer.take_local_ice_rx().unwrap();
+        let drained = timeout(Duration::from_secs(20), async {
+            while ice_rx.recv().await.is_some() {}
+        })
+        .await;
+        // Close before asserting, or a failure here strands the pc and fails
+        // `test_cancelled_new_does_not_leak_the_pc` as well.
+        offerer.close().await;
+        drained.expect("local ICE channel outlived gathering");
     }
 
     // Extra channels must not displace the bound one: the newcomer's on_open would push Open onto
