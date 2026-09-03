@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux;
 
 #[cfg(target_os = "macos")]
@@ -53,7 +53,7 @@ extern "C" fn breakdown_signal_handler(sig: i32) {
         stack.join("\n").to_string()
     );
     if !info.is_empty() {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         linux::system_message(
             "RustDesk",
             &format!("Got signal {} and exit.{}", sig, info),

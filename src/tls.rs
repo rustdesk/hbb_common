@@ -40,6 +40,11 @@ fn get_domain_and_port_from_url(url: &str) -> &str {
 
 #[inline]
 pub fn upsert_tls_cache(url: &str, tls_type: TlsType, danger_accept_invalid_cert: bool) {
+    #[cfg(target_env = "ohos")]
+    if matches!(tls_type, TlsType::NativeTls) {
+        return;
+    }
+
     if is_plain(url) {
         return;
     }

@@ -223,9 +223,9 @@ impl FingerprintingInfo {
             platform: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             id,
-            #[cfg(any(target_os = "android", target_os = "ios"))]
+            #[cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))]
             addr: "0".repeat(16),
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            #[cfg(not(any(target_os = "android", target_os = "ios", target_env = "ohos")))]
             addr: {
                 let mut addr = default_net::get_mac().map(|m| m.addr).unwrap_or_default();
                 if addr.is_empty() {
