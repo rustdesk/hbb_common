@@ -55,6 +55,7 @@ message DisplayInfo {
 message PortForward {
   string host = 1;
   int32 port = 2;
+  bool multiplex = 3;
 }
 
 message FileTransfer {
@@ -104,6 +105,7 @@ message ChatMessage { string text = 1; }
 message Features {
   bool privacy_mode = 1;
   bool terminal = 2;
+  bool port_forward_mux = 3;
 }
 
 message CodecAbility {
@@ -949,6 +951,46 @@ message TerminalResponse {
   }
 }
 
+message PortForwardOpen {
+  int32 channel_id = 1;
+  string host = 2;
+  int32 port = 3;
+  uint32 window = 4;
+}
+
+message PortForwardOpened {
+  int32 channel_id = 1;
+  bool success = 2;
+  string message = 3;
+  uint32 window = 4;
+}
+
+message PortForwardData {
+  int32 channel_id = 1;
+  bytes data = 2;
+}
+
+message PortForwardClose {
+  int32 channel_id = 1;
+}
+
+message PortForwardWindowUpdate {
+  int32 channel_id = 1;
+  uint32 add = 2;
+}
+
+// One symmetric message for both directions. `open` only travels controller -> controlled,
+// `opened` only controlled -> controller; a frame in the wrong direction is ignored.
+message PortForwardChannel {
+  oneof union {
+    PortForwardOpen open = 1;
+    PortForwardOpened opened = 2;
+    PortForwardData data = 3;
+    PortForwardClose close = 4;
+    PortForwardWindowUpdate window_update = 5;
+  }
+}
+
 message Message {
   oneof union {
     SignedId signed_id = 3;
@@ -981,5 +1023,6 @@ message Message {
     ScreenshotResponse screenshot_response= 30;
     TerminalAction terminal_action = 31;
     TerminalResponse terminal_response = 32;
+    PortForwardChannel port_forward_channel = 33;
   }
 }
