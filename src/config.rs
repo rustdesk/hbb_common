@@ -3023,6 +3023,8 @@ pub mod keys {
     pub const OPTION_FLUTTER_PEER_CARD_UI_TYLE: &str = "peer-card-ui-type";
     pub const OPTION_FLUTTER_CURRENT_AB_NAME: &str = "current-ab-name";
     pub const OPTION_ALLOW_REMOTE_CM_MODIFICATION: &str = "allow-remote-cm-modification";
+    pub const OPTION_ALLOW_SYNC_CLIPBOARD_BETWEEN_SESSIONS: &str =
+        "allow-sync-clipboard-between-sessions";
 
     pub const OPTION_PRINTER_INCOMING_JOB_ACTION: &str = "printer-incomming-job-action";
     pub const OPTION_PRINTER_ALLOW_AUTO_PRINT: &str = "allow-printer-auto-print";
@@ -3122,6 +3124,7 @@ pub mod keys {
         OPTION_DISABLE_DISCOVERY_PANEL,
         OPTION_PRE_ELEVATE_SERVICE,
         OPTION_ALLOW_REMOTE_CM_MODIFICATION,
+        OPTION_ALLOW_SYNC_CLIPBOARD_BETWEEN_SESSIONS,
         OPTION_ALLOW_AUTO_RECORD_OUTGOING,
         OPTION_HIDE_RECORDING_BUTTON,
         OPTION_VIDEO_SAVE_DIRECTORY,
