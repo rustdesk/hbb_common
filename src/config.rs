@@ -2994,9 +2994,13 @@ pub mod keys {
         "allow-command-line-settings-when-settings-disabled";
 
     // Connection punch-through / port-forward options
+    pub const OPTION_ENABLE_TCP_PUNCH: &str = "enable-tcp-punch";
     pub const OPTION_ENABLE_UDP_PUNCH: &str = "enable-udp-punch";
     pub const OPTION_ENABLE_IPV6_PUNCH: &str = "enable-ipv6-punch";
     pub const OPTION_ENABLE_PORT_FORWARD_MUX: &str = "enable-port-forward-mux";
+    pub const OPTION_ENABLE_WEBRTC: &str = "enable-webrtc";
+    pub const OPTION_ALLOW_KCP_CC: &str = "allow-kcp-congestion-control";
+    pub const OPTION_ALLOW_WEBRTC_CC: &str = "allow-webrtc-congestion-control";
     pub const OPTION_HIDE_USERNAME_ON_CARD: &str = "hide-username-on-card";
     pub const OPTION_HIDE_HELP_CARDS: &str = "hide-help-cards";
     pub const OPTION_DEFAULT_CONNECT_PASSWORD: &str = "default-connect-password";
@@ -3133,9 +3137,11 @@ pub mod keys {
         OPTION_ALLOW_AUTO_RECORD_OUTGOING,
         OPTION_HIDE_RECORDING_BUTTON,
         OPTION_VIDEO_SAVE_DIRECTORY,
+        OPTION_ENABLE_TCP_PUNCH,
         OPTION_ENABLE_UDP_PUNCH,
         OPTION_ENABLE_IPV6_PUNCH,
         OPTION_ENABLE_PORT_FORWARD_MUX,
+        OPTION_ENABLE_WEBRTC,
         OPTION_TOUCH_MODE,
         OPTION_SHOW_VIRTUAL_MOUSE,
         OPTION_SHOW_VIRTUAL_JOYSTICK,
@@ -3202,6 +3208,8 @@ pub mod keys {
         OPTION_ALLOW_INSECURE_TLS_FALLBACK,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
+        OPTION_ALLOW_KCP_CC,
+        OPTION_ALLOW_WEBRTC_CC,
     ];
 
     // BUILDIN_SETTINGS

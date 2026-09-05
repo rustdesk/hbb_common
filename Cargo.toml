@@ -52,6 +52,7 @@ thiserror = "1.0"
 httparse = "1.10"
 base64 = "0.22"
 url = "2.5"
+percent-encoding = "2"
 sha2 = "0.10"
 whoami = "1.5"
 
@@ -68,7 +69,11 @@ rustls-pki-types = "1.11"
 rustls-native-certs = "0.8"
 webpki-roots = "1.0.4"
 async-recursion = "1.1"
-webrtc = { version = "0.14.0", optional = true }
+# Pinned to 0.13: webrtc >=0.14 pulls sdp 0.10 / webrtc-util 0.12, which use
+# usize::is_multiple_of (needs rustc >=1.87), while rustdesk CI builds with Rust 1.75
+# (sciter i128 ABI pin, flutter-build.yml). Bump only after CI's Rust moves past 1.87,
+# and work through the upgrade checklist at the top of src/webrtc.rs first.
+webrtc = { version = "0.13.0", optional = true }
 libloading = "0.8"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
@@ -81,7 +86,7 @@ protobuf-codegen = { version = "3.7" }
 
 [dev-dependencies]
 clap = "4.5.51"
-webrtc = "0.14.0"
+webrtc = "0.13.0" # keep in lockstep with [dependencies] webrtc (rustc 1.75 pin, see above)
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = [

@@ -57,6 +57,7 @@ pub use toml;
 pub use uuid;
 pub mod fingerprint;
 pub use flexi_logger;
+pub mod log_throttle;
 pub mod stream;
 pub mod websocket;
 #[cfg(feature = "webrtc")]
@@ -429,10 +430,15 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
     #[allow(unused_mut)]
     let mut logger_holder: Option<flexi_logger::LoggerHandle> = None;
     INIT.call_once(|| {
+        // webrtc-rs reports the racing design's normal outcome at warn: cancelling the transport
+        // that lost closes every gathered candidate one line at a time, and trickle means the
+        // agent always checks before it holds a pair. Both read as faults beside a connection
+        // that succeeded. agent_gather keeps its warn level - a STUN server it could not reach
+        // is the one upstream signal that explains a session which never connected.
         #[cfg(debug_assertions)]
         {
             use env_logger::*;
-            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"));
+            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn,webrtc_ice::agent::agent_internal=error,webrtc::peer_connection=error"));
         }
         #[cfg(not(debug_assertions))]
         {
@@ -447,7 +453,7 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 path.push(_name);
             }
             use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn") {
+            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn,webrtc_ice::agent::agent_internal=error,webrtc::peer_connection=error") {
                 logger_holder = x
                     .log_to_file(FileSpec::default().directory(path))
                     .write_mode(if _is_async {
@@ -457,8 +463,18 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                     })
                     .format(opt_format)
                     .rotate(
-                        Criterion::Age(Age::Day),
+                        // Size as well as age: rotating only daily lets one day's file grow
+                        // without limit, so whoever can drive a hot log site — a peer sending
+                        // malformed packets, a socket erroring in a retry loop — decides how
+                        // much disk this uses. Bounding it here covers every call site at once.
+                        Criterion::AgeOrSize(Age::Day, 16 * 1024 * 1024),
                         Naming::Timestamps,
+                        // 90 files is ~90 days for any machine that stays under the
+                        // size criterion — i.e. every ordinary install, on every platform this
+                        // ships to. Raising it to protect the flood case would have bought little
+                        // (a count cannot outrun a flood; only the rate limits at the log sites
+                        // can) at the price of multiplying steady-state retention and disk for
+                        // everyone.
                         Cleanup::KeepLogFiles(90),
                     )
                     .start()

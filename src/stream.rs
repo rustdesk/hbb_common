@@ -74,6 +74,87 @@ impl Stream {
         }
     }
 
+    /// Whether this is a WebRTC transport. Used to enforce the WebRTC-only DTLS fingerprint
+    /// binding (fail closed) in the secure handshake.
+    #[inline]
+    pub fn is_webrtc(&self) -> bool {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(_) => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
+    /// Close the underlying WebRTC peer connection if this is a WebRTC stream; no-op otherwise.
+    /// A WebRTC pc is kept alive by the global session cache and its cleanup handler only fires on
+    /// a terminal ICE state, so it must be closed explicitly at session end. TCP/WebSocket streams
+    /// release their resources on drop and need nothing here.
+    ///
+    /// Deliberately not `async`: most callers sit in a `select!` arm or a future the UI can
+    /// abandon, and an awaited close that loses that race is unretryable — `close()` latches
+    /// `is_closed` before its first await, so every later attempt early-returns while the state
+    /// handler that would evict the session never runs. With no await point here there is
+    /// nothing to cancel; the teardown runs to completion on the WebRTC I/O runtime
+    /// (see `webrtc::WEBRTC_RT`) that owns the pc's sockets and pump tasks, so it reaches the
+    /// wire even after a caller's own runtime dies on return.
+    #[inline]
+    pub fn close_webrtc(&self) {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.close_detached(),
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+
+    /// Whether an established WebRTC transport runs through a TURN relay (used for the UI's
+    /// direct/relayed flag). `None` for non-WebRTC transports, and for a non-relay-policy pc
+    /// before ICE selects a pair; a Relay-policy pc answers `Some(true)` straight away — see
+    /// `WebRTCStream::is_relayed`.
+    #[inline]
+    pub async fn webrtc_relayed(&self) -> Option<bool> {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.is_relayed().await,
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// Whether an established WebRTC transport reaches the peer over IPv6 (used to name the
+    /// transport in the UI). `None` for non-WebRTC transports and before ICE selects a pair —
+    /// every other transport already carries the family in the label it was raced under.
+    #[inline]
+    pub async fn webrtc_remote_ipv6(&self) -> Option<bool> {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.is_remote_ipv6().await,
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// DTLS certificate fingerprint for a WebRTC stream (`local`=true for this endpoint's own
+    /// cert, false for the peer's), used to bind the channel to the signed peer identity.
+    /// Returns None for non-WebRTC transports, which authenticate via the secretbox key exchange.
+    #[inline]
+    #[cfg_attr(not(feature = "webrtc"), allow(unused_variables))]
+    pub async fn dtls_fingerprint(&self, local: bool) -> Option<String> {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => {
+                if local {
+                    s.local_dtls_fingerprint().await.ok()
+                } else {
+                    s.remote_dtls_fingerprint().await.ok()
+                }
+            }
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     #[inline]
     pub async fn next_timeout(
         &mut self,
@@ -137,13 +218,21 @@ impl Stream {
     pub fn from(stream: TcpStream, stream_addr: SocketAddr) -> Self {
         Self::Tcp(tcp::FramedStream::from(stream, stream_addr))
     }
+}
 
-    #[inline]
-    #[cfg(feature = "webrtc")]
-    pub fn get_webrtc_stream(&self) -> Option<webrtc::WebRTCStream> {
-        match self {
-            Self::WebRTC(s) => Some(s.clone()),
-            _ => None,
-        }
+/// Owning the stream owns the transport, WebRTC included.
+///
+/// A peer connection outlives its handle — the session cache holds a clone, and the handler that
+/// evicts it only fires on a terminal ICE state — so it has to be closed explicitly. Doing that
+/// at each exit path made it an obligation every `return`, `break` and `?` had to remember, and
+/// the long-lived side never did: `server::connection` ends its ~15 exits by dropping the stream.
+/// Nothing warned, because a missed close leaks silently and only under WebRTC.
+///
+/// `Stream` is not `Clone`, so dropping it really is the end of the transport and there is no
+/// second owner to surprise. Explicit `close_webrtc()` calls remain valid — they close sooner
+/// than scope end — but they are now an optimization rather than the thing correctness rests on.
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.close_webrtc();
     }
 }
