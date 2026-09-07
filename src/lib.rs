@@ -1,11 +1,9 @@
 pub mod compress;
-pub mod platform;
 pub mod protos;
 pub use bytes;
 use config::Config;
 pub use futures;
 pub use protobuf;
-pub use protos::message as message_proto;
 pub use protos::rendezvous as rendezvous_proto;
 use serde_derive::{Deserialize, Serialize};
 use std::{
@@ -27,7 +25,6 @@ pub mod bytes_codec;
 pub use anyhow::{self, bail};
 pub use futures_util;
 pub mod config;
-pub mod fs;
 pub mod mem;
 pub use lazy_static;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -42,7 +39,8 @@ pub mod password_security;
 pub use chrono;
 pub use directories_next;
 pub use libc;
-pub mod keyboard;
+#[cfg(target_os = "linux")]
+pub mod sh;
 pub use base64;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use dlopen;
