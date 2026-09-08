@@ -347,6 +347,10 @@ impl WebRTCStream {
     fn is_reusable_for(&self, force_relay: bool) -> bool {
         self.relay_only == force_relay
             && !self.handoff.closing.load(Ordering::Acquire)
+            // ICE has stopped hearing from the peer on this one. Not terminal, so nothing else
+            // rejects it, but handing it to a caller that is about to judge liveness starts them
+            // off already suspecting a pc they never used.
+            && !self.is_disconnected()
             && !matches!(
                 *self.state_notify.borrow(),
                 WebRTCConnectionState::Closed(_)
@@ -2314,22 +2318,24 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             assert_eq!(&answerer.next().await.unwrap().unwrap()[..], b"warmup");
             let baseline = answerer.rx_progress();
 
-            let big = vec![0x5Au8; 512 * 1024];
+            // Large enough that it cannot land inside one poll of the loop below, so a probe
+            // that only counted whole messages would leave the counter untouched throughout.
+            let big = vec![0x5Au8; 4 * 1024 * 1024];
             let expected = big.len();
             let sender = tokio::spawn(async move { offerer.send_raw(big).await.map(|_| offerer) });
 
-            // The receive loop's shape: sampling happens in a sibling arm, so the probe has to be
-            // readable while `next()` is in flight and a cancelled `next()` has to keep the
-            // partial message.
+            // `next_timeout` returning None leaves the partial message in place, so the counter
+            // is read at a point where nothing has been delivered. No select and no sleeping
+            // sibling: the assertion cannot turn on which branch a poll happened to take.
             let mut moved_early = false;
             let mut got = None;
-            for _ in 0..2_000 {
-                tokio::select! {
-                    msg = answerer.next() => {
-                        got = msg;
+            for _ in 0..600 {
+                match answerer.next_timeout(20).await {
+                    Some(msg) => {
+                        got = Some(msg);
                         break;
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    None => {
                         if answerer.rx_progress() > baseline {
                             moved_early = true;
                         }
@@ -2337,10 +2343,13 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
                 }
             }
 
-            assert_eq!(got.expect("message").unwrap().len(), expected);
             assert!(
                 moved_early,
                 "rx_progress must advance while the message is still incomplete"
+            );
+            assert_eq!(
+                got.expect("message never completed").unwrap().len(),
+                expected
             );
             let offerer = sender.await.unwrap().expect("send");
             // `WebRTCStream` has no `Drop`, so both pcs stay in `SESSIONS` unless closed here;
