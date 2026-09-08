@@ -9,9 +9,6 @@ edition = "2018"
 [features]
 default = []
 webrtc = ["dep:webrtc"]
-# The isolated Wayland socket-probe fallback (src/platform/linux/wayland_probe.rs). Off by default
-# so the base Wayland enumeration is untouched; the DRM login-screen build (scrap/drm) turns it on.
-wayland_probe = []
 
 [dependencies]
 # new flexi_logger failed on rustc 1.75
@@ -35,12 +32,10 @@ serde_json = "1.0"
 lazy_static = "1.5"
 confy = { git = "https://github.com/rustdesk-org/confy" }
 dirs-next = "2.0"
-filetime = "0.2"
 sodiumoxide = "0.2"
 regex = "1.11"
 tokio-socks = { git = "https://github.com/rustdesk-org/tokio-socks" }
 chrono = "0.4"
-backtrace = "0.3"
 libc = "0.2"
 dlopen = "0.1"
 toml = "0.7"
@@ -88,21 +83,7 @@ protobuf-codegen = { version = "3.7" }
 clap = "4.5.51"
 webrtc = "0.13.0" # keep in lockstep with [dependencies] webrtc (rustc 1.75 pin, see above)
 
-[target.'cfg(target_os = "windows")'.dependencies]
-winapi = { version = "0.3", features = [
-    "winuser",
-    "synchapi",
-    "pdh",
-    "memoryapi",
-    "sysinfoapi",
-] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-osascript = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-sctk = { package = "smithay-client-toolkit", version = "0.20.0", default-features = false, features = [
-    "calloop",
-] }
 users = { version = "0.11" }
 x11 = "2.21"
