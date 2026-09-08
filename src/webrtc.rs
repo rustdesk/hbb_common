@@ -48,6 +48,7 @@ use url::Url;
 
 use crate::config;
 use crate::protobuf::Message;
+use crate::rx_probe::RxProbe;
 use crate::sodiumoxide::crypto::secretbox::Key;
 use crate::ResultType;
 
@@ -92,6 +93,12 @@ pub struct WebRTCStream {
     // Taken once at construction: `pc.local_description()` grows with every gathered candidate
     // and this must not (why: `UDP_ENDPOINT_BUDGET`). Shared so cloning the struct stays cheap.
     local_endpoint: Arc<String>,
+    // Counts arriving fragments, which `recv_state` cannot answer for: that lock is deliberately
+    // held across the whole reassembly (see the field), so a sampler would block on it.
+    rx_probe: RxProbe,
+    // ICE has stopped hearing from the peer but the connection is not terminal yet. Kept out of
+    // `state_notify` on purpose - see where it is set.
+    disconnected: Arc<AtomicBool>,
 }
 
 /// Whether a pc `new_inner` built is still wanted, shared by every `NewStreamHandoff` handed out
@@ -240,6 +247,8 @@ impl Clone for WebRTCStream {
             peer_verified: self.peer_verified.clone(),
             handoff: self.handoff.clone(),
             local_endpoint: self.local_endpoint.clone(),
+            rx_probe: self.rx_probe.clone(),
+            disconnected: self.disconnected.clone(),
         }
     }
 }
@@ -747,12 +756,20 @@ impl WebRTCStream {
         // pc and the ICE-candidate sender's forwarding task. Upgrade inside the handler; if the pc
         // is already gone there is nothing left in SESSIONS to evict.
         let pc_for_close = Arc::downgrade(&pc);
+        // Deliberately NOT a `WebRTCConnectionState` variant: that enum gates send and receive
+        // readiness (`wait_for_connect_result`) and session-cache admissibility, so a fourth state
+        // would have to be given a meaning at each of those. `Disconnected` is transient and must
+        // change neither, so it is reported beside them instead of through them.
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let disconnected_for_state = disconnected.clone();
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             let stream_for_close2 = stream_for_close.clone();
             let on_connection_notify = notify_tx.clone();
             let pc_for_close2 = pc_for_close.clone();
+            let disconnected_for_state = disconnected_for_state.clone();
             Box::pin(async move {
                 log::debug!("WebRTC session peer connection state: {}", s);
+                Self::note_health(&disconnected_for_state, s);
                 match s {
                     // `Disconnected` is a transient, recoverable ICE state (webrtc-ice fires it
                     // after ~5s without consent and returns to `Connected` when traffic resumes).
@@ -860,6 +877,8 @@ impl WebRTCStream {
             peer_verified: Arc::new(AtomicBool::new(false)),
             handoff: Default::default(),
             local_endpoint: Arc::new(local_endpoint),
+            rx_probe: RxProbe::new(),
+            disconnected,
         };
         // Insert into the session cache, but never `await pc.close()` while holding this lock:
         // `close()` fires the peer-connection-state handler inline, which itself locks SESSIONS,
@@ -1163,6 +1182,30 @@ impl WebRTCStream {
         self.send_timeout = ms;
     }
 
+    /// See `Stream::rx_progress`.
+    #[inline]
+    pub fn rx_progress(&self) -> u64 {
+        self.rx_probe.get()
+    }
+
+    /// Track whether ICE still hears from the peer. `Disconnected` is raised about 5s after it
+    /// stops and is cleared again when traffic resumes, so it is a hint to be acted on by whoever
+    /// asks, never a terminal state; the terminal ones are handled by the caller of this and
+    /// deliberately leave the flag alone, since a closed session has no use for a hint.
+    fn note_health(disconnected: &AtomicBool, s: RTCPeerConnectionState) {
+        match s {
+            RTCPeerConnectionState::Disconnected => disconnected.store(true, Ordering::SeqCst),
+            RTCPeerConnectionState::Connected => disconnected.store(false, Ordering::SeqCst),
+            _ => {}
+        }
+    }
+
+    /// See `Stream::webrtc_disconnected`.
+    #[inline]
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::SeqCst)
+    }
+
     #[inline]
     pub fn set_key(&mut self, _key: Key) {
         // WebRTC traffic is DTLS-encrypted regardless; the secretbox key is unused.
@@ -1382,6 +1425,11 @@ impl WebRTCStream {
                     )));
                 }
             };
+            // Before the framing checks below: a fragment that turns out to be malformed still
+            // proves the peer sent it, which is all this counter claims.
+            if n > 0 {
+                self.rx_probe.add(n);
+            }
             if n == 0 {
                 // Not exclusively a stream reset: webrtc-data maps the empty-message PPIDs to
                 // n == 0 as well and `read` drops the flag that would separate them. Both mean
@@ -2206,6 +2254,103 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         timeout(Duration::from_secs(40), connect)
             .await
             .expect("gathered-endpoint WebRTC loopback did not complete in time");
+    }
+
+    // The state mapping the health flag is built from. ICE raises `Disconnected` only on a real
+    // consent failure, which an in-process loopback cannot produce, so this drives the mapping
+    // directly; the loopback test below covers the wiring from the flag out to callers.
+    #[test]
+    fn test_note_health_maps_only_the_transient_states() {
+        use crate::webrtc::RTCPeerConnectionState;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(false);
+
+        WebRTCStream::note_health(&flag, RTCPeerConnectionState::Disconnected);
+        assert!(flag.load(Ordering::SeqCst), "Disconnected must raise the hint");
+
+        WebRTCStream::note_health(&flag, RTCPeerConnectionState::Connected);
+        assert!(!flag.load(Ordering::SeqCst), "Connected must clear it");
+
+        // The terminal states have their own path and must not touch the hint: a session that
+        // ends has no use for one, and clearing it here would hide a peer that went silent first.
+        for terminal in [
+            RTCPeerConnectionState::Failed,
+            RTCPeerConnectionState::Closed,
+        ] {
+            WebRTCStream::note_health(&flag, RTCPeerConnectionState::Disconnected);
+            WebRTCStream::note_health(&flag, terminal);
+            assert!(
+                flag.load(Ordering::SeqCst),
+                "{terminal} must leave the hint as it found it"
+            );
+        }
+    }
+
+    // Pins the wiring and the polarity of the health flag: a pair that just connected must not
+    // look suspect.
+    #[tokio::test]
+    async fn test_webrtc_disconnected_is_false_on_a_live_pair() {
+        let body = async {
+            let (offerer, answerer) = connect_loopback().await;
+            assert!(!offerer.is_disconnected());
+            assert!(!answerer.is_disconnected());
+            offerer.close().await;
+            answerer.close().await;
+        };
+        timeout(Duration::from_secs(30), body)
+            .await
+            .expect("WebRTC loopback did not complete in time");
+    }
+
+    // A message far above the fragment size must show as activity while it is still arriving:
+    // `next()` yields nothing until the last fragment, so a receiver watching only completed
+    // messages cannot tell a peer mid-transfer from one that died.
+    #[tokio::test]
+    async fn test_webrtc_rx_progress_moves_before_a_large_message_completes() {
+        let body = async {
+            let (mut offerer, mut answerer) = connect_loopback().await;
+
+            offerer.send_raw(b"warmup".to_vec()).await.unwrap();
+            assert_eq!(&answerer.next().await.unwrap().unwrap()[..], b"warmup");
+            let baseline = answerer.rx_progress();
+
+            let big = vec![0x5Au8; 512 * 1024];
+            let expected = big.len();
+            let sender = tokio::spawn(async move { offerer.send_raw(big).await.map(|_| offerer) });
+
+            // The receive loop's shape: sampling happens in a sibling arm, so the probe has to be
+            // readable while `next()` is in flight and a cancelled `next()` has to keep the
+            // partial message.
+            let mut moved_early = false;
+            let mut got = None;
+            for _ in 0..2_000 {
+                tokio::select! {
+                    msg = answerer.next() => {
+                        got = msg;
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                        if answerer.rx_progress() > baseline {
+                            moved_early = true;
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(got.expect("message").unwrap().len(), expected);
+            assert!(
+                moved_early,
+                "rx_progress must advance while the message is still incomplete"
+            );
+            let offerer = sender.await.unwrap().expect("send");
+            // `WebRTCStream` has no `Drop`, so both pcs stay in `SESSIONS` unless closed here;
+            // `test_cancelled_new_does_not_leak_the_pc` scans that map and would report them.
+            offerer.close().await;
+            answerer.close().await;
+        };
+        timeout(Duration::from_secs(60), body)
+            .await
+            .expect("WebRTC loopback did not complete in time");
     }
 
     // In-process offerer<->answerer loopback exercising the send/next data plane that the framing,
