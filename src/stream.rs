@@ -64,6 +64,42 @@ impl Stream {
         }
     }
 
+    /// An opaque token that changes whenever bytes have arrived from the peer, a fragment of a
+    /// message that is still incomplete included. Compare successive samples; the value itself
+    /// means nothing. `None` where the transport reports no such thing.
+    ///
+    /// A message reaches the caller only once it is whole, so `next()` alone cannot distinguish a
+    /// peer sending a large one — a clipboard image is the case that occurs — from one that died
+    /// mid-message. Sampling this alongside the last received message tells them apart.
+    ///
+    /// TCP and WebSocket answer `None` on purpose: this change leaves their existing close, error
+    /// and 30s-timeout behaviour exactly as it was, and giving them a value would alter it.
+    #[inline]
+    pub fn rx_progress(&self) -> Option<u64> {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => Some(s.rx_progress()),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// Whether ICE has stopped hearing from the peer on a WebRTC transport. Transient and
+    /// recoverable — it says the peer is worth suspecting, never that the session is over — and
+    /// always false for transports this change leaves alone.
+    ///
+    /// Maintained by ICE's own task, so unlike anything derived from the session's read loop it
+    /// stays accurate while that loop is busy sending.
+    #[inline]
+    pub fn webrtc_disconnected(&self) -> bool {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.is_disconnected(),
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
     #[inline]
     pub fn is_secured(&self) -> bool {
         match self {
