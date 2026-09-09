@@ -2285,7 +2285,8 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             WebRTCStream::note_health(&flag, terminal);
             assert!(
                 flag.load(Ordering::SeqCst),
-                "{terminal} must leave the hint as it found it"
+                "{} must leave the hint as it found it",
+                terminal
             );
         }
     }
