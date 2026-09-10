@@ -87,3 +87,10 @@ webrtc = "0.13.0" # keep in lockstep with [dependencies] webrtc (rustc 1.75 pin,
 [target.'cfg(target_os = "linux")'.dependencies]
 users = { version = "0.11" }
 x11 = "2.21"
+
+[target.'cfg(windows)'.dependencies]
+# Only used to fold the current Windows logon session id into the
+# MAC-derived default client id (see Config::get_auto_id), so multiple
+# concurrent RDS/Citrix sessions on the same host don't all get the same
+# default id.
+winapi = { version = "0.3", features = ["processthreadsapi"] }

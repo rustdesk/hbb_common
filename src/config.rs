@@ -587,6 +587,20 @@ pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultTy
     }
 }
 
+/// The id of the Windows logon session the current process is running in,
+/// used to keep the default client id from colliding across concurrent
+/// RDS/Citrix sessions on the same host (see `Config::get_auto_id`).
+#[cfg(windows)]
+fn current_windows_session_id() -> Option<u32> {
+    use winapi::um::processthreadsapi::{GetCurrentProcessId, ProcessIdToSessionId};
+    let mut session_id: u32 = 0;
+    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) } != 0 {
+        Some(session_id)
+    } else {
+        None
+    }
+}
+
 impl Config {
     fn load_<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
         suffix: &str,
@@ -1061,6 +1075,20 @@ impl Config {
                     id = (id << 8) | (*x as u32);
                 }
                 id &= 0x1FFFFFFF;
+
+                // On a shared multi-session Windows host (RDS/Citrix), every
+                // concurrent session sees the same MAC address and would
+                // otherwise be assigned an identical default id on first
+                // run. Fold in the current Windows session id so each
+                // session gets its own, still-deterministic default id.
+                #[cfg(windows)]
+                {
+                    if let Some(session_id) = current_windows_session_id() {
+                        id ^= session_id.wrapping_mul(0x9E37_79B1);
+                        id &= 0x1FFFFFFF;
+                    }
+                }
+
                 log::info!("Generated id {}", id);
                 Some(id.to_string())
             } else {
