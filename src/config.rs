@@ -890,6 +890,32 @@ impl Config {
         format!("{parent}/ipc{postfix}")
     }
 
+    /// Windows counterpart of `ipc_path_for_uid`.
+    ///
+    /// On a shared multi-session Windows host (RDS/Citrix), several Windows
+    /// logon sessions can run the same RustDesk binary concurrently. Unlike
+    /// Unix domain sockets, Windows named pipes live in a single
+    /// machine-wide namespace, so `ipc_path()` alone (which only varies by
+    /// APP_NAME/postfix) collides across sessions: whichever session starts
+    /// first "wins" the pipe name, and every other concurrent session's
+    /// client fails to reach its own local IPC endpoint.
+    ///
+    /// Callers that want a per-session-isolated channel (main IPC, `_cm`,
+    /// `_portable_service`, ...) should use this instead of `ipc_path()`.
+    /// The privileged `_service` channel is intentionally left on the
+    /// shared `ipc_path()` - it is meant to be one instance per machine,
+    /// mirroring how `_service` is also shared across uids on Linux/macOS
+    /// (see `ipc_path_for_uid` above).
+    #[cfg(windows)]
+    pub fn ipc_path_for_session(session_id: u32, postfix: &str) -> String {
+        format!(
+            "\\\\.\\pipe\\{}\\session_{}\\query{}",
+            *APP_NAME.read().unwrap(),
+            session_id,
+            postfix
+        )
+    }
+
     pub fn icon_path() -> PathBuf {
         let mut path = Self::path("icons");
         if fs::create_dir_all(&path).is_err() {
