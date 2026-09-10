@@ -185,6 +185,8 @@ mod tests {
 
         for disabled in ["", "N"] {
             set_option(OPTION_ALLOW_PROXY_FALLBACK, disabled);
+            assert_eq!(get_socks().await, Config::get_socks());
+            assert_eq!(get_socks_sync(), Config::get_socks());
             assert!(connect_tcp(target_addr, 300).await.is_err());
             assert!(timeout(Duration::from_millis(20), target.accept())
                 .await
@@ -207,10 +209,15 @@ mod tests {
         }
 
         // An opt-out must take effect even while an unreachable result is cached.
-        set_option(OPTION_ALLOW_PROXY_FALLBACK, "N");
-        assert!(get_socks().await.is_some());
-        assert!(get_socks_sync().is_some());
-        assert!(connect_tcp(target_addr, 300).await.is_err());
+        for disabled in ["", "N"] {
+            set_option(OPTION_ALLOW_PROXY_FALLBACK, disabled);
+            assert_eq!(get_socks().await, Config::get_socks());
+            assert_eq!(get_socks_sync(), Config::get_socks());
+            assert!(connect_tcp(target_addr, 300).await.is_err());
+            assert!(timeout(Duration::from_millis(20), target.accept())
+                .await
+                .is_err());
+        }
 
         set_option(OPTION_ALLOW_PROXY_FALLBACK, "Y");
         set_option(OPTION_PROXY_URL, &http_proxy);

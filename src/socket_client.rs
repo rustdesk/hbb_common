@@ -155,12 +155,7 @@ pub async fn connect_tcp_local<
     local: Option<SocketAddr>,
     ms_timeout: u64,
 ) -> ResultType<Stream> {
-    let proxy_conf = if crate::proxy::fallback::is_fallback_enabled() {
-        crate::proxy::fallback::get_socks().await
-    } else {
-        Config::get_socks()
-    };
-    if let Some(conf) = proxy_conf {
+    if let Some(conf) = crate::proxy::fallback::get_socks().await {
         return Ok(Stream::Tcp(
             FramedStream::connect(target, local, &conf, ms_timeout).await?,
         ));
