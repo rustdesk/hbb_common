@@ -23,6 +23,8 @@ use crate::{
     ResultType,
 };
 
+pub mod fallback;
+
 #[derive(Debug, ThisError)]
 pub enum ProxyError {
     #[error("IO Error: {0}")]
