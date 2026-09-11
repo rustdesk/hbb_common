@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use webrtc::api::setting_engine::SettingEngine;
@@ -368,18 +368,21 @@ impl WebRTCStream {
 
     fn remove_sessions_for_peer(
         sessions: &mut HashMap<String, WebRTCStream>,
+        key: Option<&str>,
         pc: &Arc<RTCPeerConnection>,
-    ) -> Vec<String> {
-        let keys: Vec<String> = sessions
-            .iter()
-            .filter_map(|(key, session)| {
-                Arc::ptr_eq(&session.pc, pc).then(|| key.clone())
-            })
-            .collect();
-        for key in &keys {
+    ) -> Option<String> {
+        let key = key?;
+        // The caller holds SESSIONS across both the identity check and removal, so an old
+        // peer's delayed callback cannot evict a replacement stored under the same key.
+        if sessions
+            .get(key)
+            .map_or(false, |session| Arc::ptr_eq(&session.pc, pc))
+        {
             sessions.remove(key);
+            Some(key.to_owned())
+        } else {
+            None
         }
-        keys
     }
 
     #[inline]
@@ -754,6 +757,10 @@ impl WebRTCStream {
 
         // This will notify you when the peer has connected/disconnected
         let stream_for_close = stream.clone();
+        // The full cache key (including the role) becomes available after SDP setup.
+        // Share it with the handler without keeping a strong reference to the pc.
+        let session_cache_key = Arc::new(OnceLock::<String>::new());
+        let session_cache_key_for_close = session_cache_key.clone();
         // Weak, not strong: a handler stored inside the pc that captured a strong
         // `Arc<RTCPeerConnection>` forms a pc -> internal -> handler -> pc cycle that `close()`
         // never breaks (it only fires the handler) and no `Drop` clears, permanently leaking every
@@ -770,6 +777,7 @@ impl WebRTCStream {
             let stream_for_close2 = stream_for_close.clone();
             let on_connection_notify = notify_tx.clone();
             let pc_for_close2 = pc_for_close.clone();
+            let session_cache_key = session_cache_key_for_close.clone();
             let disconnected_for_state = disconnected_for_state.clone();
             Box::pin(async move {
                 log::debug!("WebRTC session peer connection state: {}", s);
@@ -796,13 +804,15 @@ impl WebRTCStream {
                         // ends instead of parking on `recv()` and holding this pc alive.
                         pc_for_close2.on_ice_candidate(Box::new(|_| Box::pin(async {})));
 
-                        // By pc identity, not by re-deriving the key: a duplicate offer shares
-                        // the key with the live winner, and this must not evict that one.
-                        let mut sessions_lock = SESSIONS.lock().await;
-                        for key in Self::remove_sessions_for_peer(
-                            &mut sessions_lock,
-                            &pc_for_close2,
-                        ) {
+                        let removed_key = {
+                            let mut sessions_lock = SESSIONS.lock().await;
+                            Self::remove_sessions_for_peer(
+                                &mut sessions_lock,
+                                session_cache_key.get().map(String::as_str),
+                                &pc_for_close2,
+                            )
+                        };
+                        if let Some(key) = removed_key {
                             log::debug!("WebRTC session removed key: {}", key);
                         }
                     }
@@ -888,6 +898,7 @@ impl WebRTCStream {
         // `close()` fires the peer-connection-state handler inline, which itself locks SESSIONS,
         // self-deadlocking the whole process. Resolve any duplicate off-lock.
         let cache_key = Self::cache_key(&key, start_local_offer);
+        let _ = session_cache_key.set(cache_key.clone());
         // Claim inside the lock, the insert included: with the pc cached but unclaimed, a hit
         // could take the only claim on it and release it again, closing it under this caller.
         let mut duplicate = None;
@@ -1950,23 +1961,48 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
     #[tokio::test]
     async fn test_session_cleanup_only_removes_matching_peer() {
-        let key = "test-session-cleanup".to_owned();
-        let old_key = "test-session-cleanup-old".to_owned();
+        let key = WebRTCStream::cache_key("test-session-cleanup", true);
+        let old_key = WebRTCStream::cache_key("test-session-cleanup", false);
         let old = new_test_stream().await;
         let replacement = new_test_stream().await;
+        let duplicate = new_test_stream().await;
         let mut sessions = HashMap::new();
+        sessions.insert(key.clone(), old.clone());
         sessions.insert(key.clone(), replacement.clone());
+        sessions.insert(old_key.clone(), old.clone());
 
-        assert!(WebRTCStream::remove_sessions_for_peer(&mut sessions, &old.pc).is_empty());
+        // Setup can fail before a key exists; cleanup must not fall back to scanning the map.
+        assert_eq!(
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, None, &old.pc),
+            None,
+        );
+        // A late callback for the replaced pc must leave both the replacement and other keys.
+        assert_eq!(
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, Some(&key), &old.pc),
+            None,
+        );
+        assert_eq!(
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, Some("missing"), &old.pc),
+            None,
+        );
+        // A duplicate that never entered this cache cannot evict the winner either.
+        assert_eq!(
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, Some(&key), &duplicate.pc),
+            None,
+        );
+        assert_eq!(sessions.len(), 2);
         assert!(Arc::ptr_eq(
             &sessions.get(&key).unwrap().pc,
             &replacement.pc,
         ));
 
-        sessions.insert(old_key.clone(), old.clone());
         assert_eq!(
-            WebRTCStream::remove_sessions_for_peer(&mut sessions, &old.pc),
-            vec![old_key.clone()],
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, Some(&old_key), &old.pc),
+            Some(old_key.clone()),
+        );
+        assert_eq!(
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, Some(&old_key), &old.pc),
+            None,
         );
         assert!(!sessions.contains_key(&old_key));
         assert!(Arc::ptr_eq(
@@ -1975,13 +2011,47 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         ));
 
         assert_eq!(
-            WebRTCStream::remove_sessions_for_peer(&mut sessions, &replacement.pc),
-            vec![key.clone()],
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, Some(&key), &replacement.pc),
+            Some(key.clone()),
         );
-        assert!(!sessions.contains_key(&key));
+        assert_eq!(
+            WebRTCStream::remove_sessions_for_peer(&mut sessions, Some(&key), &replacement.pc),
+            None,
+        );
+        assert!(sessions.is_empty());
 
         old.pc.close().await.ok();
         replacement.pc.close().await.ok();
+        duplicate.pc.close().await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_session_cleanup_before_cache_key_is_ready() {
+        let offerer = new_test_stream().await;
+        let mut sdp: RTCSessionDescription = serde_json::from_str(
+            &WebRTCStream::get_remote_offer(offerer.local_endpoint()).unwrap(),
+        )
+        .unwrap();
+        // Keep the fingerprint valid so setup installs its state handler, then fails while
+        // setting the remote description and closes the pc before publishing its cache key.
+        sdp.sdp = sdp
+            .sdp
+            .lines()
+            .filter(|line| !line.starts_with("a=ice-pwd:"))
+            .map(|line| format!("{}\r\n", line))
+            .collect();
+        let endpoint = WebRTCStream::sdp_to_endpoint(&serde_json::to_string(&sdp).unwrap());
+        let result = timeout(
+            Duration::from_secs(5),
+            WebRTCStream::new(&endpoint, false, 10000),
+        )
+        .await
+        .expect("closing a peer before its cache key is ready deadlocked");
+        let err = result.err().expect("the offer is missing its ICE password");
+        assert!(err.to_string().contains("no ice-pwd"), "{}", err);
+        let key = WebRTCStream::cache_key(offerer.session_key(), false);
+        assert!(!SESSIONS.lock().await.contains_key(&key));
+        offerer.close().await;
     }
 
     #[tokio::test]
@@ -2123,8 +2193,19 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             "a Relay-only request was answered with the cached All-policy peer connection"
         );
 
-        relay_only.close().await;
+        // Closing the replaced connection runs the real state callback, which must re-enter
+        // the cache without deadlocking and preserve the replacement under the same key.
+        let key = WebRTCStream::cache_key(all_ice.session_key(), false);
+        timeout(Duration::from_secs(5), all_ice.close())
+            .await
+            .expect("closing a replaced peer deadlocked");
         all_ice.close().await;
+        assert!(Arc::ptr_eq(
+            &SESSIONS.lock().await.get(&key).unwrap().pc,
+            &relay_only.pc,
+        ));
+        relay_only.close().await;
+        assert!(!SESSIONS.lock().await.contains_key(&key));
         offerer.close().await;
     }
 
