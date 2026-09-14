@@ -8,6 +8,9 @@ message IdPk {
   // a WebRTC peer's DTLS channel can be bound to its verified identity (defeats a rendezvous/relay
   // that swaps SDP fingerprints). Empty for non-WebRTC handshakes.
   string dtls_fingerprint = 3;
+  // Newest key exchange version the signer speaks; absent, i.e. 0, is the original scheme.
+  // Inside the signed identity so a rendezvous or relay cannot lower it.
+  uint32 kx_version = 4;
 }
 
 message RegisterPeer {
@@ -232,6 +235,9 @@ message OnlineResponse {
 
 message KeyExchange {
   repeated bytes keys = 1; 
+  // From the server: the newest key exchange version it speaks. From the client: the version it
+  // picked, the highest both speak. Absent, i.e. 0, is the original scheme.
+  uint32 version = 2;
 }
 
 message HealthCheck {
@@ -291,4 +297,9 @@ message RendezvousMessage {
     HttpProxyResponse http_proxy_response = 28;
     IceCandidate ice_candidate = 29;
   }
+  // From the server, on its first message after a key exchange: the version it advertised,
+  // repeated inside the encrypted channel where nothing in transit can alter it. A client that
+  // was shown a different value in the clear knows the handshake was altered and refuses the
+  // stream. Absent from servers that predate versions.
+  uint32 kx_advertised = 30;
 }

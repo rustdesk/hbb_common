@@ -5,7 +5,7 @@ use crate::{
     protobuf::Message,
     socket_client::split_host_port,
     sodiumoxide::crypto::secretbox::Key,
-    tcp::Encrypt,
+    tcp::{Encrypt, KxTranscript},
     tls::{get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,
 };
@@ -255,6 +255,24 @@ impl WsFramedStream {
     #[inline]
     pub fn set_key(&mut self, key: Key) {
         self.encrypt = Some(Encrypt::new(key));
+    }
+
+    #[inline]
+    pub fn set_key_split(
+        &mut self,
+        key: Key,
+        is_initiator: bool,
+        t: &KxTranscript,
+    ) -> ResultType<()> {
+        self.encrypt = Some(Encrypt::new_split(key, is_initiator, t)?);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn check_kx_advertised(&mut self, seen: u32) {
+        if let Some(enc) = self.encrypt.as_mut() {
+            enc.check_kx_advertised(seen);
+        }
     }
 
     #[inline]

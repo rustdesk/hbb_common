@@ -80,6 +80,38 @@ impl Stream {
         }
     }
 
+    /// Per-direction keys bound to the handshake; see `tcp::KX_VERSION_LATEST`. `is_initiator`
+    /// is the side that sent the sealed key.
+    #[inline]
+    pub fn set_key_split(
+        &mut self,
+        key: Key,
+        is_initiator: bool,
+        t: &tcp::KxTranscript,
+    ) -> ResultType<()> {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => {
+                s.set_key(key);
+                Ok(())
+            }
+            Stream::WebSocket(s) => s.set_key_split(key, is_initiator, t),
+            Stream::Tcp(s) => s.set_key_split(key, is_initiator, t),
+        }
+    }
+
+    /// Refuse the stream if the server's first encrypted message says it advertised a key
+    /// exchange version other than `seen`, the one this side received in the clear.
+    #[inline]
+    pub fn check_kx_advertised(&mut self, seen: u32) {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(_) => {}
+            Stream::WebSocket(s) => s.check_kx_advertised(seen),
+            Stream::Tcp(s) => s.check_kx_advertised(seen),
+        }
+    }
+
     /// An opaque token that changes whenever bytes have arrived from the peer, a fragment of a
     /// message that is still incomplete included. Compare successive samples; the value itself
     /// means nothing. `None` where the transport reports no such thing.

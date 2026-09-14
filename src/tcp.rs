@@ -4,7 +4,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use protobuf::Message;
 use sodiumoxide::crypto::{
-    box_,
+    box_, generichash, scalarmult,
     secretbox::{self, Key, Nonce},
 };
 use std::{
@@ -24,8 +24,47 @@ use tokio_util::codec::Framed;
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 
+/// The newest key exchange version this build speaks. Version 0 is the original scheme, and
+/// what an absent field means: one key for both directions, each direction counting its own
+/// nonce from 1, so the n-th message each way is sealed under the same (key, nonce). Version 1
+/// splits the exchanged key into one per direction, the way Noise splits its cipher states
+/// after the handshake, binds the handshake transcript into both, and keeps the nonce layout.
+pub const KX_VERSION_LATEST: u32 = 1;
+
+/// The version to run against a peer that advertised `advertised`: the highest both sides
+/// support.
+#[inline]
+pub fn kx_version_for(advertised: u32) -> u32 {
+    advertised.min(KX_VERSION_LATEST)
+}
+
+const KX_SPLIT_CONTEXT: &[u8] = b"rdkx-spl";
+const KX_SPLIT_INITIATOR: u8 = 1;
+const KX_SPLIT_RESPONDER: u8 = 2;
+
+/// What both sides saw during the key exchange, each from its own side of the wire. Mixed into
+/// the split keys, so a change to any of it in transit leaves the two sides with different keys
+/// and the first message undecryptable, without a check per field.
+pub struct KxTranscript<'a> {
+    /// The ephemeral public key of the side that sent the sealed key.
+    pub initiator_pk: &'a [u8],
+    /// The ephemeral public key the sealed key was sealed to.
+    pub responder_pk: &'a [u8],
+    /// The version the responder advertised: what it sent, what the initiator received.
+    pub advertised: u32,
+    /// The version the initiator picked.
+    pub picked: u32,
+}
+
+/// The public half of an X25519 secret key, for a responder that kept only the secret half.
+pub fn box_pk_of(sk: &box_::SecretKey) -> box_::PublicKey {
+    box_::PublicKey(scalarmult::scalarmult_base(&scalarmult::Scalar(sk.0)).0)
+}
+
+/// The sending key, the send and receive counters, the receiving key where it differs, and
+/// the server's advertised version as this side saw it, while its echo is still awaited.
 #[derive(Clone)]
-pub struct Encrypt(pub Key, pub u64, pub u64);
+pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>, Option<u32>);
 
 pub struct FramedStream(
     pub Framed<DynTcpStream, BytesCodec>,
@@ -200,6 +239,22 @@ impl FramedStream {
         self.2 = Some(Encrypt::new(key));
     }
 
+    pub fn set_key_split(
+        &mut self,
+        key: Key,
+        is_initiator: bool,
+        t: &KxTranscript,
+    ) -> ResultType<()> {
+        self.2 = Some(Encrypt::new_split(key, is_initiator, t)?);
+        Ok(())
+    }
+
+    pub fn check_kx_advertised(&mut self, seen: u32) {
+        if let Some(enc) = self.2.as_mut() {
+            enc.check_kx_advertised(seen);
+        }
+    }
+
     fn get_nonce(seqnum: u64) -> Nonce {
         let mut nonce = Nonce([0u8; secretbox::NONCEBYTES]);
         nonce.0[..std::mem::size_of_val(&seqnum)].copy_from_slice(&seqnum.to_le_bytes());
@@ -295,7 +350,69 @@ impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
-        Self(key, 0, 0)
+        Self(key, 0, 0, None, None)
+    }
+
+    /// Arm the check of the server's advertisement echo, `seen` being the version this side
+    /// received in the clear. Call once the key is set and before the first frame is read.
+    pub fn check_kx_advertised(&mut self, seen: u32) {
+        self.4 = Some(seen);
+    }
+
+    /// The server repeats what it advertised inside its first encrypted message, where it can
+    /// be neither forged nor stripped. A different value in the clear means the handshake was
+    /// altered on the way, and the stream is refused rather than run at the version it was
+    /// pushed down to. No echo is a server from before versions, whose advertisement was none.
+    fn check_kx_advertised_echo(plain: &[u8], seen: u32) -> Result<(), Error> {
+        let echoed = crate::rendezvous_proto::RendezvousMessage::parse_from_bytes(plain)
+            .map(|m| m.kx_advertised)
+            .unwrap_or(0);
+        if echoed != 0 && echoed != seen {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "key exchange advertised {} but {} arrived: altered in transit",
+                    echoed, seen
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Version 1: the initiator, the side that sent the sealed key, sends under one subkey and
+    /// receives under the other; the responder the reverse.
+    pub fn new_split(key: Key, is_initiator: bool, t: &KxTranscript) -> ResultType<Self> {
+        let initiator = Self::derive_subkey(&key, KX_SPLIT_INITIATOR, t)?;
+        let responder = Self::derive_subkey(&key, KX_SPLIT_RESPONDER, t)?;
+        Ok(if is_initiator {
+            Self(initiator, 0, 0, Some(responder), None)
+        } else {
+            Self(responder, 0, 0, Some(initiator), None)
+        })
+    }
+
+    fn derive_subkey(key: &Key, direction: u8, t: &KxTranscript) -> ResultType<Key> {
+        if t.initiator_pk.len() != box_::PUBLICKEYBYTES
+            || t.responder_pk.len() != box_::PUBLICKEYBYTES
+        {
+            bail!("key exchange transcript has a public key of the wrong length");
+        }
+        let failed = |_| anyhow::anyhow!("key derivation failed");
+        let mut h =
+            generichash::State::new(Some(secretbox::KEYBYTES), Some(&key.0)).map_err(failed)?;
+        for part in [
+            KX_SPLIT_CONTEXT,
+            &[direction],
+            &t.advertised.to_le_bytes(),
+            &t.picked.to_le_bytes(),
+            t.initiator_pk,
+            t.responder_pk,
+        ] {
+            h.update(part).map_err(failed)?;
+        }
+        let mut subkey = [0u8; secretbox::KEYBYTES];
+        subkey.copy_from_slice(h.finalize().map_err(failed)?.as_ref());
+        Ok(Key(subkey))
     }
 
     pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {
@@ -304,8 +421,11 @@ impl Encrypt {
         }
         self.2 += 1;
         let nonce = FramedStream::get_nonce(self.2);
-        match secretbox::open(bytes, &nonce, &self.0) {
+        match secretbox::open(bytes, &nonce, self.3.as_ref().unwrap_or(&self.0)) {
             Ok(res) => {
+                if let Some(seen) = self.4.take() {
+                    Self::check_kx_advertised_echo(&res, seen)?;
+                }
                 bytes.clear();
                 bytes.put_slice(&res);
                 Ok(())
@@ -340,5 +460,146 @@ impl Encrypt {
         let mut key = [0u8; secretbox::KEYBYTES];
         key[..].copy_from_slice(&symmetric_key);
         Ok(Key(key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INITIATOR_PK: [u8; 32] = [1u8; 32];
+    const RESPONDER_PK: [u8; 32] = [2u8; 32];
+
+    fn transcript(advertised: u32) -> KxTranscript<'static> {
+        KxTranscript {
+            initiator_pk: &INITIATOR_PK,
+            responder_pk: &RESPONDER_PK,
+            advertised,
+            picked: KX_VERSION_LATEST,
+        }
+    }
+
+    fn seal_and_open(a: &mut Encrypt, b: &mut Encrypt, msg: &[u8]) -> Vec<u8> {
+        let sealed = a.enc(msg);
+        let mut buf = BytesMut::from(&sealed[..]);
+        b.dec(&mut buf).unwrap();
+        assert_eq!(&buf[..], msg);
+        sealed
+    }
+
+    #[test]
+    fn test_v0_shares_one_key_across_directions() {
+        let key = secretbox::gen_key();
+        let (mut initiator, mut responder) = (Encrypt::new(key.clone()), Encrypt::new(key));
+        let sent = seal_and_open(&mut initiator, &mut responder, b"hello");
+        let back = seal_and_open(&mut responder, &mut initiator, b"hello");
+        // The n-th message each way is sealed under the same (key, nonce): the defect the split
+        // fixes, pinned here so the path a peer without versions relies on stays byte-for-byte.
+        assert_eq!(sent, back);
+    }
+
+    #[test]
+    fn test_split_directions_use_different_keys() {
+        let key = secretbox::gen_key();
+        let t = transcript(KX_VERSION_LATEST);
+        let mut initiator = Encrypt::new_split(key.clone(), true, &t).unwrap();
+        let mut responder = Encrypt::new_split(key.clone(), false, &t).unwrap();
+        let sent = seal_and_open(&mut initiator, &mut responder, b"hello");
+        let back = seal_and_open(&mut responder, &mut initiator, b"hello");
+        assert_ne!(sent, back);
+        // Neither direction's key is the exchanged key itself, so a version 0 peer cannot be
+        // paired with a split one by accident.
+        let mut v0 = Encrypt::new(key);
+        let mut buf = BytesMut::from(&sent[..]);
+        assert!(v0.dec(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_split_roles_must_differ() {
+        let key = secretbox::gen_key();
+        let t = transcript(KX_VERSION_LATEST);
+        let mut a = Encrypt::new_split(key.clone(), true, &t).unwrap();
+        let mut b = Encrypt::new_split(key, true, &t).unwrap();
+        let sealed = a.enc(b"hello");
+        let mut buf = BytesMut::from(&sealed[..]);
+        assert!(b.dec(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_kx_version_for_picks_the_highest_shared() {
+        assert_eq!(kx_version_for(0), 0);
+        assert_eq!(kx_version_for(1), 1);
+        assert_eq!(kx_version_for(KX_VERSION_LATEST), KX_VERSION_LATEST);
+        assert_eq!(kx_version_for(KX_VERSION_LATEST + 7), KX_VERSION_LATEST);
+    }
+
+    #[test]
+    fn test_split_binds_the_transcript() {
+        let key = secretbox::gen_key();
+        // The responder advertised LATEST; the initiator was handed something else in transit.
+        let mut initiator =
+            Encrypt::new_split(key.clone(), true, &transcript(KX_VERSION_LATEST + 1)).unwrap();
+        let mut responder = Encrypt::new_split(key, false, &transcript(KX_VERSION_LATEST)).unwrap();
+        let sealed = initiator.enc(b"hello");
+        let mut buf = BytesMut::from(&sealed[..]);
+        assert!(responder.dec(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_split_rejects_a_short_public_key() {
+        let t = KxTranscript {
+            initiator_pk: &[1u8; 31],
+            responder_pk: &RESPONDER_PK,
+            advertised: KX_VERSION_LATEST,
+            picked: KX_VERSION_LATEST,
+        };
+        assert!(Encrypt::new_split(secretbox::gen_key(), true, &t).is_err());
+    }
+
+    fn rendezvous_frame(kx_advertised: u32) -> Vec<u8> {
+        let mut msg = crate::rendezvous_proto::RendezvousMessage::new();
+        msg.set_hc(Default::default());
+        msg.kx_advertised = kx_advertised;
+        msg.write_to_bytes().unwrap()
+    }
+
+    fn first_frame_after(seen: u32, echoed: u32) -> Result<(), Error> {
+        let key = secretbox::gen_key();
+        let mut server = Encrypt::new(key.clone());
+        let mut client = Encrypt::new(key);
+        client.check_kx_advertised(seen);
+        // An empty heartbeat is not a frame, and must not use up the check.
+        let mut empty = BytesMut::new();
+        client.dec(&mut empty).unwrap();
+        let mut buf = BytesMut::from(&server.enc(&rendezvous_frame(echoed))[..]);
+        client.dec(&mut buf)
+    }
+
+    #[test]
+    fn test_kx_advertised_echo_must_match_what_was_seen() {
+        assert!(first_frame_after(KX_VERSION_LATEST, KX_VERSION_LATEST).is_ok());
+        // A server from before versions echoes nothing, and advertised nothing.
+        assert!(first_frame_after(0, 0).is_ok());
+        // The advertisement was lowered on the way; the echo says otherwise.
+        assert!(first_frame_after(0, KX_VERSION_LATEST).is_err());
+        assert!(first_frame_after(KX_VERSION_LATEST, KX_VERSION_LATEST + 1).is_err());
+    }
+
+    #[test]
+    fn test_kx_advertised_check_is_one_shot() {
+        let key = secretbox::gen_key();
+        let mut server = Encrypt::new(key.clone());
+        let mut client = Encrypt::new(key);
+        client.check_kx_advertised(KX_VERSION_LATEST);
+        let mut first = BytesMut::from(&server.enc(&rendezvous_frame(KX_VERSION_LATEST))[..]);
+        client.dec(&mut first).unwrap();
+        let mut later = BytesMut::from(&server.enc(&rendezvous_frame(KX_VERSION_LATEST + 9))[..]);
+        client.dec(&mut later).unwrap();
+    }
+
+    #[test]
+    fn test_box_pk_of_matches_the_generated_pair() {
+        let (pk, sk) = box_::gen_keypair();
+        assert_eq!(box_pk_of(&sk), pk);
     }
 }
