@@ -549,6 +549,17 @@ impl WebRTCStream {
         ice_servers
     }
 
+    /// How many binding requests the answerer's ICE agent sends on a pair without a response
+    /// before giving up on it: 74 at the 200ms check interval is ~14.8s, just inside the 15s
+    /// persistence libwebrtc gives a pair (`CONNECTION_WRITE_TIMEOUT`), so both ends of a
+    /// browser session keep checking for about the same time. The ICE crate's default of 7
+    /// (~1.4s) is a server-side choice that assumes the other side keeps knocking; behind an
+    /// address-restricted NAT those requests are also what keep this side's mapping open to
+    /// the remote's checks, so stopping early closes the door on a pair that would have
+    /// connected once the path cleared, however long the remote keeps trying. Bounded by
+    /// `CONNECT_TIMEOUT` (18s).
+    const ICE_MAX_BINDING_REQUESTS: u16 = 74;
+
     /// Built and driven on `WEBRTC_RT`: every socket and background task the pc creates must
     /// belong to a runtime that outlives the session (see `WEBRTC_RT`). A caller that abandons
     /// this future mid-await leaves the setup task to finish there; the abandoned result then
@@ -617,6 +628,12 @@ impl WebRTCStream {
         let mut s = SettingEngine::default();
         s.detach_data_channels();
         s.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+        // Answerer only: `remote_endpoint` is empty when this side is the offerer. The
+        // desktop controller keeps the crate default so it stays an unchanged comparison
+        // point while the persistence experiment runs on the controlled side.
+        if !remote_endpoint.is_empty() {
+            s.set_ice_max_binding_requests(Some(Self::ICE_MAX_BINDING_REQUESTS));
+        }
         // fe80::/10 can only be bound together with a scope id, which `IpAddr` cannot carry, so
         // gathering one never yields a candidate - only a failed bind and a warning per address.
         // Spelled out because `is_unicast_link_local` is not stable on our MSRV.
