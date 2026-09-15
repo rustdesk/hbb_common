@@ -16,9 +16,9 @@
 //! - `RTCIceCandidatePair`'s `Display` layout — `is_relayed()` parses it because 0.13 keeps the
 //!   candidates private. 0.17+ exposes them; switch and delete the parse.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -585,6 +585,82 @@ impl WebRTCStream {
             .ok_or_else(|| anyhow::anyhow!("WebRTC setup handoff was empty"))
     }
 
+    /// The IPv6 host candidates: of the addresses an interface holds in one /64, only the one
+    /// the OS itself sends from. Beside the temporary address that privacy extensions rotate, a
+    /// prefix usually carries a stable one the OS never picks as a source, and a candidate for
+    /// it would hand the peer an identifier that outlives every rotation and that nothing else
+    /// this machine sends out ever shows. RFC 8445 §5.1.1.1 asks for exactly this, per interface
+    /// and prefix: the other interfaces and prefixes, a VPN's ULA among them, keep their address.
+    /// Grouped on the first 64 bits rather than the netmask, which not every enumeration
+    /// reports: a global or unique-local address has a 64-bit interface identifier by
+    /// definition. `pick` asks the OS which of a group it sends from; `None` keeps the first.
+    fn ipv6_host_candidates(
+        addrs: impl IntoIterator<Item = (String, Ipv6Addr)>,
+        pick: impl Fn(&[Ipv6Addr]) -> Option<Ipv6Addr>,
+    ) -> HashSet<Ipv6Addr> {
+        let mut groups: HashMap<(String, u64), Vec<Ipv6Addr>> = HashMap::new();
+        for (iface, v6) in addrs {
+            // fe80::/10 can only be bound together with a scope id, which `IpAddr` cannot carry,
+            // so gathering one never yields a candidate - only a failed bind and a warning.
+            // Spelled out because `is_unicast_link_local` is not stable on our MSRV.
+            if v6.segments()[0] & 0xffc0 == 0xfe80 {
+                continue;
+            }
+            let prefix = (u128::from(v6) >> 64) as u64;
+            groups.entry((iface, prefix)).or_default().push(v6);
+        }
+        groups
+            .into_values()
+            .filter_map(|members| {
+                if members.len() > 1 {
+                    if let Some(chosen) = pick(&members).filter(|p| members.contains(p)) {
+                        return Some(chosen);
+                    }
+                }
+                members.first().copied()
+            })
+            .collect()
+    }
+
+    /// Which of `members`, all on one interface in one /64, the OS sends from. A UDP `connect`
+    /// runs source selection and sends nothing; a destination inside the prefix keeps the
+    /// choice on that interface, and the OS prefers its temporary address there.
+    fn ipv6_source_among(members: &[Ipv6Addr]) -> Option<Ipv6Addr> {
+        let first = u128::from(*members.first()?);
+        // An address in the prefix that is not one of ours: the first with one identifier bit
+        // flipped, whichever bit gets it off the list.
+        let dest = (0..64)
+            .map(|bit| Ipv6Addr::from(first ^ (1u128 << bit)))
+            .find(|d| !members.contains(d))?;
+        let socket = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok()?;
+        socket.connect((dest, 53)).ok()?;
+        match socket.local_addr().ok()?.ip() {
+            IpAddr::V6(v6) => Some(v6),
+            IpAddr::V4(_) => None,
+        }
+    }
+
+    /// `ipv6_host_candidates` over this machine's interfaces, enumerated the way the ICE agent
+    /// enumerates them, so the filter below sees the same addresses.
+    async fn ipv6_host_candidates_of_this_machine() -> HashSet<Ipv6Addr> {
+        let net = webrtc::util::vnet::net::Net::new(None);
+        let addrs: Vec<(String, Ipv6Addr)> = net
+            .get_interfaces()
+            .await
+            .iter()
+            .flat_map(|iface| {
+                iface
+                    .addrs()
+                    .iter()
+                    .filter_map(move |ipnet| match ipnet.addr() {
+                        IpAddr::V6(v6) => Some((iface.name().to_owned(), v6)),
+                        IpAddr::V4(_) => None,
+                    })
+            })
+            .collect();
+        Self::ipv6_host_candidates(addrs, Self::ipv6_source_among)
+    }
+
     async fn new_inner(
         remote_endpoint: String,
         force_relay: bool,
@@ -639,11 +715,12 @@ impl WebRTCStream {
         if !remote_endpoint.is_empty() {
             s.set_ice_max_binding_requests(Some(Self::ICE_MAX_BINDING_REQUESTS));
         }
-        // fe80::/10 can only be bound together with a scope id, which `IpAddr` cannot carry, so
-        // gathering one never yields a candidate - only a failed bind and a warning per address.
-        // Spelled out because `is_unicast_link_local` is not stable on our MSRV.
-        s.set_ip_filter(Box::new(|ip: IpAddr| match ip {
-            IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 != 0xfe80,
+        // Of the IPv6 addresses an interface holds in one prefix, gather only the one the OS
+        // itself sends from - `ipv6_host_candidates` says why. Worked out here rather than in
+        // the filter: the filter sees one address at a time, the rule needs the interface's set.
+        let v6_candidates = Self::ipv6_host_candidates_of_this_machine().await;
+        s.set_ip_filter(Box::new(move |ip: IpAddr| match ip {
+            IpAddr::V6(v6) => v6_candidates.contains(&v6),
             IpAddr::V4(_) => true,
         }));
 
@@ -2840,5 +2917,94 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
         timeout(Duration::from_secs(40), connect)
             .await
             .expect("concurrent WebRTC sends did not complete in time");
+    }
+
+    fn v6(s: &str) -> std::net::Ipv6Addr {
+        s.parse().unwrap()
+    }
+
+    fn candidates(
+        addrs: &[(&str, &str)],
+        pick: impl Fn(&[std::net::Ipv6Addr]) -> Option<std::net::Ipv6Addr>,
+    ) -> std::collections::HashSet<std::net::Ipv6Addr> {
+        super::WebRTCStream::ipv6_host_candidates(
+            addrs.iter().map(|(iface, a)| (iface.to_string(), v6(a))),
+            pick,
+        )
+    }
+
+    // One interface, one prefix, a stable and a temporary address: only the one the OS sends
+    // from is a candidate. The OS is asked, not the enumeration order.
+    #[test]
+    fn test_ipv6_one_candidate_per_interface_and_prefix_the_one_the_os_sends_from() {
+        let temporary = v6("2001:db8:1::a1b2:c3d4:e5f6:0708");
+        let got = candidates(
+            &[
+                ("en0", "2001:db8:1::1"),
+                ("en0", "2001:db8:1::a1b2:c3d4:e5f6:0708"),
+            ],
+            |members| {
+                assert_eq!(members.len(), 2);
+                Some(temporary)
+            },
+        );
+        assert_eq!(got, std::collections::HashSet::from([temporary]));
+    }
+
+    // The other interfaces and prefixes each keep their address: a second interface on the same
+    // prefix, a second prefix on the same interface, and a VPN's unique-local address alone on
+    // its interface are all candidates. The OS is only asked about a group of more than one.
+    #[test]
+    fn test_ipv6_every_interface_and_prefix_keeps_a_candidate() {
+        let got = candidates(
+            &[
+                ("en0", "2001:db8:1::1"),
+                ("en1", "2001:db8:1::2"),
+                ("en0", "2001:db8:2::1"),
+                ("utun3", "fd7a:115c::1"),
+            ],
+            |_| panic!("no group has more than one address"),
+        );
+        let want = [
+            "2001:db8:1::1",
+            "2001:db8:1::2",
+            "2001:db8:2::1",
+            "fd7a:115c::1",
+        ];
+        assert_eq!(got, want.iter().map(|a| v6(a)).collect());
+    }
+
+    // When the OS cannot be asked, or names an address outside the group, the first of the
+    // group stands: enumeration tends to list the preferred address first, and a candidate is
+    // better than none.
+    #[test]
+    fn test_ipv6_group_falls_back_to_its_first_address() {
+        let addrs = [("en0", "2001:db8:1::1"), ("en0", "2001:db8:1::2")];
+        let first = std::collections::HashSet::from([v6("2001:db8:1::1")]);
+        assert_eq!(candidates(&addrs, |_| None), first);
+        assert_eq!(candidates(&addrs, |_| Some(v6("2001:db8:9::9"))), first);
+    }
+
+    // Link-local is never a candidate, and an empty machine has none.
+    #[test]
+    fn test_ipv6_link_local_is_never_a_candidate() {
+        let got = candidates(&[("en0", "fe80::1"), ("en0", "fe80::2")], |_| None);
+        assert!(got.is_empty());
+        assert!(candidates(&[], |_| None).is_empty());
+    }
+
+    // The real enumeration and the real probe, on whatever this machine has: environment
+    // dependent by nature, so only that they run through and yield no link-local address is
+    // asserted - the rule itself is pinned by the pure tests above.
+    #[test]
+    fn test_ipv6_candidates_of_this_machine_carry_no_link_local() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let got = rt.block_on(super::WebRTCStream::ipv6_host_candidates_of_this_machine());
+        for v6 in got {
+            assert_ne!(v6.segments()[0] & 0xffc0, 0xfe80);
+        }
     }
 }
