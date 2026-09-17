@@ -38,8 +38,8 @@ impl Stream {
     /// legitimately sends is large, so an unauthenticated connection cannot make us hold more than
     /// that. Each transport clamps `n` to its own ceiling, so `usize::MAX` restores the default.
     ///
-    /// Set it before the first read of untrusted data: a lower bound applies from the next frame
-    /// on and does not discard one whose decoding or reassembly has already begun.
+    /// Set it before the first read of untrusted data. Lowering it later is not a way to constrain
+    /// a message already in progress: what that does to one is up to the transport.
     #[inline]
     pub fn set_max_packet_length(&mut self, n: usize) {
         match self {

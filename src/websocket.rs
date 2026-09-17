@@ -555,10 +555,11 @@ mod tests {
         assert_eq!(check_ws("127.0.0.1:34567"), "ws://127.0.0.1:34569");
         Config::set_options(options);
     }
-    // A server-to-client binary frame is unmasked, so it can be put on the wire by hand: the header
-    // alone, which is all it takes to ask tungstenite for the allocation, or with its payload.
-    fn ws_binary_frame(len: usize, with_payload: bool) -> Vec<u8> {
-        let mut f = vec![0x82];
+    // A server-to-client frame is unmasked, so it can be put on the wire by hand: the header alone,
+    // which is all it takes to ask tungstenite for the allocation, or with its payload. `head` is
+    // the first byte, FIN and opcode.
+    fn ws_frame(head: u8, len: usize, with_payload: bool) -> Vec<u8> {
+        let mut f = vec![head];
         if len < 126 {
             f.push(len as u8);
         } else if len <= u16::MAX as usize {
@@ -572,6 +573,10 @@ mod tests {
             f.resize(f.len() + len, 0xCD);
         }
         f
+    }
+
+    fn ws_binary_frame(len: usize, with_payload: bool) -> Vec<u8> {
+        ws_frame(0x82, len, with_payload)
     }
 
     async fn ws_loopback() -> (WsFramedStream, TcpStream) {
@@ -619,5 +624,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.len(), 200_000, "lifting the cap lets a large message through again");
+    }
+
+    // Two frames each under the cap that reassemble to a message over it: the frame bound lets
+    // both through, so this is what the message bound alone refuses.
+    #[tokio::test]
+    async fn max_packet_length_bounds_fragmented_message() {
+        const CAP: usize = 16 * 1024;
+        let (mut ws, mut server) = ws_loopback().await;
+        ws.set_max_packet_length(CAP);
+
+        // Binary with FIN clear, then a continuation with FIN set: 12 KiB each, 24 KiB together.
+        server.write_all(&ws_frame(0x02, 12 * 1024, true)).await.unwrap();
+        server.write_all(&ws_frame(0x80, 12 * 1024, true)).await.unwrap();
+        match timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Err(e))) => assert!(e.to_string().contains("Message too long"), "{}", e),
+            Ok(other) => panic!(
+                "expected a refusal, got {:?}",
+                other.map(|r| r.map(|b| b.len()))
+            ),
+            Err(_) => panic!("next() hung on a fragmented message over the cap"),
+        }
     }
 }
