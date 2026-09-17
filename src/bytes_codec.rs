@@ -300,4 +300,21 @@ mod tests {
         assert!(matches!(codec.decode(&mut buf), Ok(None)));
         assert!(buf.capacity() <= MAX_REASONABLE_CAPACITY);
     }
+
+    #[test]
+    fn max_packet_length_refuses_on_the_header() {
+        const CAP: usize = 128 * 1024;
+        let decode_header_for = |n: usize| {
+            let mut codec = BytesCodec::new();
+            codec.set_max_packet_length(CAP);
+            let mut buf = BytesMut::new();
+            buf.put_u32_le((n << 2) as u32 | 0x3);
+            codec.decode(&mut buf)
+        };
+
+        // At the cap the header is accepted and the payload awaited.
+        assert!(matches!(decode_header_for(CAP), Ok(None)));
+        // One byte over, and the frame dies on its header - before any of it has been buffered.
+        assert!(decode_header_for(CAP + 1).is_err());
+    }
 }

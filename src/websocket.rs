@@ -28,6 +28,11 @@ use tokio_tungstenite::{
 use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::Role;
 
+/// tungstenite's own defaults. `set_max_packet_length` clamps to these, so `usize::MAX` puts the
+/// transport back exactly where it started rather than above it.
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
+const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
+
 pub struct WsFramedStream {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     addr: SocketAddr,
@@ -209,6 +214,17 @@ impl WsFramedStream {
     #[inline]
     pub fn set_raw(&mut self) {
         self.encrypt = None;
+    }
+
+    /// Both bounds, not just the message one: tungstenite reserves the whole declared payload of a
+    /// frame as soon as it passes `max_frame_size` (`protocol/frame/mod.rs`), so that is what keeps
+    /// a frame header from buying an allocation, while `max_message_size` bounds reassembly.
+    #[inline]
+    pub fn set_max_packet_length(&mut self, n: usize) {
+        self.stream.set_config(|c| {
+            c.max_message_size = Some(n.min(DEFAULT_MAX_MESSAGE_SIZE));
+            c.max_frame_size = Some(n.min(DEFAULT_MAX_FRAME_SIZE));
+        });
     }
 
     #[inline]

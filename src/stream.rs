@@ -34,6 +34,19 @@ impl Stream {
         }
     }
 
+    /// The largest message the peer may send. Lowered before authorization, where nothing a peer
+    /// legitimately sends is large, so an unauthenticated connection cannot make us hold more than
+    /// that. Each transport clamps `n` to its own ceiling, so `usize::MAX` restores the default.
+    #[inline]
+    pub fn set_max_packet_length(&mut self, n: usize) {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.set_max_packet_length(n),
+            Stream::WebSocket(s) => s.set_max_packet_length(n),
+            Stream::Tcp(s) => s.codec_mut().set_max_packet_length(n),
+        }
+    }
+
     #[inline]
     pub async fn send_bytes(&mut self, bytes: bytes::Bytes) -> ResultType<()> {
         match self {
