@@ -2427,6 +2427,35 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
             .expect("WebRTC loopback did not complete in time");
     }
 
+    // The other half of the same lifecycle: what was refused while the bound was low arrives once
+    // it is lifted, which is what authorization does on the server.
+    #[tokio::test]
+    async fn test_webrtc_max_packet_length_restores() {
+        let body = async {
+            let (mut offerer, mut answerer) = connect_loopback().await;
+            answerer.set_max_packet_length(16 * 1024);
+
+            offerer.send_raw(vec![0xCDu8; 8 * 1024]).await.unwrap();
+            let got = answerer.next().await.unwrap().unwrap();
+            assert_eq!(got.len(), 8 * 1024);
+
+            answerer.set_max_packet_length(usize::MAX);
+            offerer.send_raw(vec![0xCDu8; 200_000]).await.unwrap();
+            let got = timeout(Duration::from_secs(10), answerer.next())
+                .await
+                .expect("answerer.next() hung after the bound was lifted")
+                .unwrap()
+                .unwrap();
+            assert_eq!(got.len(), 200_000, "lifting the bound lets a large message through again");
+
+            offerer.close().await;
+            answerer.close().await;
+        };
+        timeout(Duration::from_secs(60), body)
+            .await
+            .expect("WebRTC loopback did not complete in time");
+    }
+
     // In-process offerer<->answerer loopback exercising the send/next data plane that the framing,
     // empty-message, and EOF fixes live in. Connects over host candidates (works offline; any
     // configured/default STUN just fails in the background without blocking the host pair).

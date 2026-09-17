@@ -420,6 +420,7 @@ pub fn check_ws(endpoint: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{keys, Config};
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     #[test]
     fn test_check_ws() {
@@ -553,5 +554,70 @@ mod tests {
         assert_eq!(check_ws("127.0.0.1:23456"), "ws://127.0.0.1:23458");
         assert_eq!(check_ws("127.0.0.1:34567"), "ws://127.0.0.1:34569");
         Config::set_options(options);
+    }
+    // A server-to-client binary frame is unmasked, so it can be put on the wire by hand: the header
+    // alone, which is all it takes to ask tungstenite for the allocation, or with its payload.
+    fn ws_binary_frame(len: usize, with_payload: bool) -> Vec<u8> {
+        let mut f = vec![0x82];
+        if len < 126 {
+            f.push(len as u8);
+        } else if len <= u16::MAX as usize {
+            f.push(0x7E);
+            f.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            f.push(0x7F);
+            f.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        if with_payload {
+            f.resize(f.len() + len, 0xCD);
+        }
+        f
+    }
+
+    async fn ws_loopback() -> (WsFramedStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let ws = WsFramedStream::from_tcp_stream(client, addr).await.unwrap();
+        (ws, server)
+    }
+
+    #[tokio::test]
+    async fn max_packet_length_refuses_a_frame_on_its_header() {
+        const CAP: usize = 16 * 1024;
+        let (mut ws, mut server) = ws_loopback().await;
+        ws.set_max_packet_length(CAP);
+
+        // One byte over, header only: refused before there is any payload to buffer.
+        server.write_all(&ws_binary_frame(CAP + 1, false)).await.unwrap();
+        match timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Err(e))) => assert!(e.to_string().contains("Message too long"), "{}", e),
+            Ok(other) => panic!(
+                "expected a refusal, got {:?}",
+                other.map(|r| r.map(|b| b.len()))
+            ),
+            Err(_) => panic!("next() waited for a payload the header should have refused"),
+        }
+    }
+
+    #[tokio::test]
+    async fn max_packet_length_lowered_then_restored() {
+        const CAP: usize = 16 * 1024;
+        let (mut ws, mut server) = ws_loopback().await;
+
+        ws.set_max_packet_length(CAP);
+        server.write_all(&ws_binary_frame(8 * 1024, true)).await.unwrap();
+        let got = ws.next().await.unwrap().unwrap();
+        assert_eq!(got.len(), 8 * 1024, "a message under the cap still arrives");
+
+        ws.set_max_packet_length(usize::MAX);
+        server.write_all(&ws_binary_frame(200_000, true)).await.unwrap();
+        let got = timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("next() hung after the cap was lifted")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.len(), 200_000, "lifting the cap lets a large message through again");
     }
 }
