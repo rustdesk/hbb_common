@@ -423,6 +423,7 @@ mod tests {
 
     #[test]
     fn test_check_ws() {
+        let options = Config::get_options();
         // enable websocket
         Config::set_option(keys::OPTION_ALLOW_WEBSOCKET.to_string(), "Y".to_string());
 
@@ -551,5 +552,6 @@ mod tests {
         assert_eq!(check_ws("127.0.0.1:23455"), "ws://127.0.0.1:23458");
         assert_eq!(check_ws("127.0.0.1:23456"), "ws://127.0.0.1:23458");
         assert_eq!(check_ws("127.0.0.1:34567"), "ws://127.0.0.1:34569");
+        Config::set_options(options);
     }
 }
