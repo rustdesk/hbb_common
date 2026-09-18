@@ -22,6 +22,7 @@ enum ConnType {
   RDP = 3;
   VIEW_CAMERA = 4;
   TERMINAL = 5;
+  REMOTE_USB = 6;
 }
 
 message RegisterPeerResponse { bool request_pk = 2; }
