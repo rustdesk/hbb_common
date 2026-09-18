@@ -204,8 +204,8 @@ pub fn ipv4_to_ipv6(addr: String, ipv4: bool) -> String {
 }
 
 /// The resolver's preferred address for `target`: first in getaddrinfo's RFC 6724 order, so NAT64's
-/// synthesized IPv6 leads on a v6-only host. Preferred, not proven reachable: the per-connection
-/// UDP paths take it as is, and spare themselves the round trip that proving it costs.
+/// synthesized IPv6 leads on a v6-only host. Preferred, not proven reachable: what `test_target`
+/// falls back to, and what the controller's NAT test takes as is to spare itself the proof.
 async fn resolve_target(target: &str) -> ResultType<SocketAddr> {
     tokio::net::lookup_host(target)
         .await?
@@ -215,7 +215,7 @@ async fn resolve_target(target: &str) -> ResultType<SocketAddr> {
 
 /// The address of `target` a TCP connection reaches, the resolver's candidates tried in order until
 /// one answers: an AAAA the server refuses is passed over for its A record, which the order alone
-/// would not do. For the rendezvous registration, which lives on what this picks.
+/// would not do. For the rendezvous registration and the punch reply, which live on what it picks.
 async fn test_target(target: &str) -> ResultType<SocketAddr> {
     if let Ok(Ok(s)) = super::timeout(1000, tokio::net::TcpStream::connect(target)).await {
         if let Ok(addr) = s.peer_addr() {
@@ -227,7 +227,20 @@ async fn test_target(target: &str) -> ResultType<SocketAddr> {
 
 #[inline]
 pub async fn new_direct_udp_for(target: &str) -> ResultType<(Arc<UdpSocket>, SocketAddr)> {
-    let peer_addr = resolve_target(target).await?;
+    let peer_addr = test_target(target).await?;
+    let local_addr = Config::get_any_listen_addr(peer_addr.is_ipv4());
+    let socket = UdpSocket::bind(local_addr).await?;
+    Ok((Arc::new(socket), peer_addr))
+}
+
+/// `new_direct_udp_for` on the resolver's preferred address, with no handshake to prove it and a
+/// second at most for the lookup: for the controller's NAT test, once per connection, where the
+/// proof cost a round trip right before the connection it then opens to the same host.
+#[inline]
+pub async fn new_direct_udp_for_unverified(
+    target: &str,
+) -> ResultType<(Arc<UdpSocket>, SocketAddr)> {
+    let peer_addr = super::timeout(1000, resolve_target(target)).await??;
     let local_addr = Config::get_any_listen_addr(peer_addr.is_ipv4());
     let socket = UdpSocket::bind(local_addr).await?;
     Ok((Arc::new(socket), peer_addr))
