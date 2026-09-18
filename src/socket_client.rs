@@ -203,12 +203,10 @@ pub fn ipv4_to_ipv6(addr: String, ipv4: bool) -> String {
     addr
 }
 
+/// The address of `target` this machine sends to: the resolver's first, ordered as RFC 6724 has
+/// it with a route looked up for each, so NAT64's synthesized IPv6 comes first on a v6-only host.
+/// A handshake used to ask the server the same, a round trip a connection and 1 s past a dead v6.
 async fn test_target(target: &str) -> ResultType<SocketAddr> {
-    if let Ok(Ok(s)) = super::timeout(1000, tokio::net::TcpStream::connect(target)).await {
-        if let Ok(addr) = s.peer_addr() {
-            return Ok(addr);
-        }
-    }
     tokio::net::lookup_host(target)
         .await?
         .next()
