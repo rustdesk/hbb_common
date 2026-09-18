@@ -203,19 +203,31 @@ pub fn ipv4_to_ipv6(addr: String, ipv4: bool) -> String {
     addr
 }
 
-/// The address of `target` this machine sends to: the resolver's first, ordered as RFC 6724 has
-/// it with a route looked up for each, so NAT64's synthesized IPv6 comes first on a v6-only host.
-/// A handshake used to ask the server the same, a round trip a connection and 1 s past a dead v6.
-async fn test_target(target: &str) -> ResultType<SocketAddr> {
+/// The resolver's preferred address for `target`: first in getaddrinfo's RFC 6724 order, so NAT64's
+/// synthesized IPv6 leads on a v6-only host. Preferred, not proven reachable: the per-connection
+/// UDP paths take it as is, and spare themselves the round trip that proving it costs.
+async fn resolve_target(target: &str) -> ResultType<SocketAddr> {
     tokio::net::lookup_host(target)
         .await?
         .next()
         .context(format!("Failed to look up host for {target}"))
 }
 
+/// The address of `target` a TCP connection reaches, the resolver's candidates tried in order until
+/// one answers: an AAAA the server refuses is passed over for its A record, which the order alone
+/// would not do. For the rendezvous registration, which lives on what this picks.
+async fn test_target(target: &str) -> ResultType<SocketAddr> {
+    if let Ok(Ok(s)) = super::timeout(1000, tokio::net::TcpStream::connect(target)).await {
+        if let Ok(addr) = s.peer_addr() {
+            return Ok(addr);
+        }
+    }
+    resolve_target(target).await
+}
+
 #[inline]
 pub async fn new_direct_udp_for(target: &str) -> ResultType<(Arc<UdpSocket>, SocketAddr)> {
-    let peer_addr = test_target(target).await?;
+    let peer_addr = resolve_target(target).await?;
     let local_addr = Config::get_any_listen_addr(peer_addr.is_ipv4());
     let socket = UdpSocket::bind(local_addr).await?;
     Ok((Arc::new(socket), peer_addr))
