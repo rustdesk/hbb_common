@@ -314,6 +314,12 @@ impl WsFramedStream {
                     return Some(Ok(bytes));
                 }
                 WsMessage::Text(text) => {
+                    if self.is_secured() {
+                        return Some(Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "WebSocket text frame received after encryption was enabled",
+                        )));
+                    }
                     let bytes = BytesMut::from(text.as_bytes());
                     return Some(Ok(bytes));
                 }
@@ -421,6 +427,33 @@ mod tests {
     use super::*;
     use crate::config::{keys, Config};
     use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_secured_stream_rejects_plaintext_text() {
+        sodiumoxide::init().expect("failed to initialize sodiumoxide");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = WebSocketStream::from_raw_socket(tcp, Role::Server, None).await;
+            stream
+                .send(WsMessage::Text("plaintext".into()))
+                .await
+                .unwrap();
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut client = WsFramedStream::from_tcp_stream(tcp, addr).await.unwrap();
+        client.set_key(Key([0x42; sodiumoxide::crypto::secretbox::KEYBYTES]));
+
+        let result = client.next().await;
+        assert!(
+            matches!(result, Some(Err(ref err)) if err.kind() == ErrorKind::InvalidData),
+            "secured stream accepted plaintext Text frame: {:?}",
+            result
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn test_check_ws() {
