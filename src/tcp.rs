@@ -4,7 +4,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use protobuf::Message;
 use sodiumoxide::crypto::{
-    box_, generichash, scalarmult,
+    box_, generichash,
     secretbox::{self, Key, Nonce},
 };
 use std::{
@@ -54,11 +54,6 @@ pub struct KxTranscript<'a> {
     pub advertised: u32,
     /// The version the initiator picked.
     pub picked: u32,
-}
-
-/// The public half of an X25519 secret key, for a responder that kept only the secret half.
-pub fn box_pk_of(sk: &box_::SecretKey) -> box_::PublicKey {
-    box_::PublicKey(scalarmult::scalarmult_base(&scalarmult::Scalar(sk.0)).0)
 }
 
 /// The sending key, the send and receive counters, the receiving key where it differs, and
@@ -617,11 +612,5 @@ mod tests {
         client.dec(&mut first).unwrap();
         let mut later = BytesMut::from(&server.enc(&rendezvous_frame(KX_VERSION_LATEST + 9))[..]);
         client.dec(&mut later).unwrap();
-    }
-
-    #[test]
-    fn test_box_pk_of_matches_the_generated_pair() {
-        let (pk, sk) = box_::gen_keypair();
-        assert_eq!(box_pk_of(&sk), pk);
     }
 }
