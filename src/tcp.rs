@@ -359,15 +359,21 @@ impl Encrypt {
         self.4 = Some(seen);
     }
 
-    /// The server repeats what it advertised inside its first encrypted message, where it can
-    /// be neither forged nor stripped. A different value in the clear means the handshake was
+    /// The server repeats what it advertised inside an encrypted message, where it can be
+    /// neither forged nor stripped. A different value in the clear means the handshake was
     /// altered on the way, and the stream is refused rather than run at the version it was
-    /// pushed down to. No echo is a server from before versions, whose advertisement was none.
-    fn check_kx_advertised_echo(plain: &[u8], seen: u32) -> Result<(), Error> {
+    /// pushed down to. Returns whether the echo settled the question: a frame that carries
+    /// none says nothing either way, and must leave the check armed for the frames after it,
+    /// since a server tags what it chooses to and an attacker would otherwise only have to
+    /// let one untagged frame through to be rid of the check.
+    fn check_kx_advertised_echo(plain: &[u8], seen: u32) -> Result<bool, Error> {
         let echoed = crate::rendezvous_proto::RendezvousMessage::parse_from_bytes(plain)
             .map(|m| m.kx_advertised)
             .unwrap_or(0);
-        if echoed != 0 && echoed != seen {
+        if echoed == 0 {
+            return Ok(false);
+        }
+        if echoed != seen {
             return Err(Error::new(
                 ErrorKind::Other,
                 format!(
@@ -376,7 +382,7 @@ impl Encrypt {
                 ),
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Version 1: the initiator, the side that sent the sealed key, sends under one subkey and
@@ -423,8 +429,10 @@ impl Encrypt {
         let nonce = FramedStream::get_nonce(self.2);
         match secretbox::open(bytes, &nonce, self.3.as_ref().unwrap_or(&self.0)) {
             Ok(res) => {
-                if let Some(seen) = self.4.take() {
-                    Self::check_kx_advertised_echo(&res, seen)?;
+                if let Some(seen) = self.4 {
+                    if Self::check_kx_advertised_echo(&res, seen)? {
+                        self.4 = None;
+                    }
                 }
                 bytes.clear();
                 bytes.put_slice(&res);
@@ -583,6 +591,20 @@ mod tests {
         // The advertisement was lowered on the way; the echo says otherwise.
         assert!(first_frame_after(0, KX_VERSION_LATEST).is_err());
         assert!(first_frame_after(KX_VERSION_LATEST, KX_VERSION_LATEST + 1).is_err());
+    }
+
+    #[test]
+    fn test_kx_advertised_check_survives_an_untagged_frame() {
+        let key = secretbox::gen_key();
+        let mut server = Encrypt::new(key.clone());
+        let mut client = Encrypt::new(key);
+        client.check_kx_advertised(KX_VERSION_LATEST);
+        // A message the server does not tag says nothing about the advertisement.
+        let mut untagged = BytesMut::from(&server.enc(&rendezvous_frame(0))[..]);
+        client.dec(&mut untagged).unwrap();
+        // So the frame that does carry an echo is still held to it.
+        let mut tagged = BytesMut::from(&server.enc(&rendezvous_frame(KX_VERSION_LATEST + 1))[..]);
+        assert!(client.dec(&mut tagged).is_err());
     }
 
     #[test]
