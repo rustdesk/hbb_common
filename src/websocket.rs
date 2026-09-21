@@ -216,9 +216,10 @@ impl WsFramedStream {
         self.encrypt = None;
     }
 
-    /// Both bounds, not just the message one: tungstenite reserves the whole declared payload of a
-    /// frame as soon as it passes `max_frame_size` (`protocol/frame/mod.rs`), so that is what keeps
-    /// a frame header from buying an allocation, while `max_message_size` bounds reassembly.
+    /// Both bounds, not just the message one: `max_frame_size` refuses an oversized frame on its
+    /// header, before any of it is buffered, while `max_message_size` bounds reassembly across a
+    /// fragmented one. What a header on its own can allocate is `read_buffer_size`, the patched
+    /// fork growing the read buffer a chunk at a time rather than to the length a frame declares.
     #[inline]
     pub fn set_max_packet_length(&mut self, n: usize) {
         self.stream.set_config(|c| {
