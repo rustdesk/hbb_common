@@ -100,7 +100,7 @@ impl Stream {
         }
     }
 
-    /// Refuse the stream if the server's first encrypted message says it advertised a key
+    /// Refuse the stream if an encrypted message from the server says it advertised a key
     /// exchange version other than `seen`, the one this side received in the clear.
     #[inline]
     pub fn check_kx_advertised(&mut self, seen: u32) {
