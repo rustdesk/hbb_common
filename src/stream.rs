@@ -100,18 +100,6 @@ impl Stream {
         }
     }
 
-    /// Refuse the stream if an encrypted message from the server says it advertised a key
-    /// exchange version other than `seen`, the one this side read from the key exchange.
-    #[inline]
-    pub fn check_kx_advertised(&mut self, seen: u32) {
-        match self {
-            #[cfg(feature = "webrtc")]
-            Stream::WebRTC(_) => {}
-            Stream::WebSocket(s) => s.check_kx_advertised(seen),
-            Stream::Tcp(s) => s.check_kx_advertised(seen),
-        }
-    }
-
     /// An opaque token that changes whenever bytes have arrived from the peer, a fragment of a
     /// message that is still incomplete included. Compare successive samples; the value itself
     /// means nothing. `None` where the transport reports no such thing.

@@ -299,7 +299,4 @@ message RendezvousMessage {
     HttpProxyResponse http_proxy_response = 28;
     IceCandidate ice_candidate = 29;
   }
-  // From the server, on every message after a key exchange: the version it advertised.
-  // Absent from servers that predate versions.
-  uint32 kx_advertised = 30;
 }

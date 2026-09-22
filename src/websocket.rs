@@ -269,13 +269,6 @@ impl WsFramedStream {
     }
 
     #[inline]
-    pub fn check_kx_advertised(&mut self, seen: u32) {
-        if let Some(enc) = self.encrypt.as_mut() {
-            enc.check_kx_advertised(seen);
-        }
-    }
-
-    #[inline]
     pub fn is_secured(&self) -> bool {
         self.encrypt.is_some()
     }
