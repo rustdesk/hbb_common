@@ -237,9 +237,16 @@ message KeyExchange {
   // From the server: the newest key exchange version it speaks. From the client: the version it
   // picked, the highest both speak. Absent, i.e. 0, is the original scheme.
   uint32 version = 2;
-  // Server signature of "rdkx-ver" || on-wire ephemeral public key || little-endian uint32 version.
-  // Bit 255 of the signed X25519 public key requires this field; legacy keys leave it clear.
-  bytes signed_version = 3;
+  // Server signature of KxParams. Bit 255 of the signed X25519 public key requires this field;
+  // legacy keys leave it clear.
+  bytes signed_params = 3;
+}
+
+// Signed by the server beside its ephemeral public key: that key as it went out, so the signature
+// belongs to this exchange alone, and the newest key exchange version the server speaks.
+message KxParams {
+  bytes pk = 1;
+  uint32 version = 2;
 }
 
 message HealthCheck {
