@@ -30,6 +30,10 @@ pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 /// the handshake transcript into both, and keeps the nonce layout.
 pub const KX_VERSION_LATEST: u32 = 1;
 
+/// Prefix of what the server signs as `KxParams`. The same key signs other messages, and a
+/// protobuf carries no type of its own, so the prefix is what keeps them apart.
+pub const KX_PARAMS_DOMAIN: &[u8] = b"rdkx-params";
+
 /// The version to run against a peer that advertised `advertised`: the highest both sides
 /// support.
 #[inline]
