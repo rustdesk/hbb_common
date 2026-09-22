@@ -25,10 +25,9 @@ pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 
 /// The newest key exchange version this build speaks. Version 0 is the original scheme, and
-/// what an absent field means: one key for both directions, each direction counting its own
-/// nonce from 1, so the n-th message each way is sealed under the same (key, nonce). Version 1
-/// splits the exchanged key into one per direction, the way Noise splits its cipher states
-/// after the handshake, binds the handshake transcript into both, and keeps the nonce layout.
+/// what an absent field means: one key for both directions. Version 1 splits the exchanged key
+/// into one per direction, the way Noise splits its cipher states after the handshake, binds
+/// the handshake transcript into both, and keeps the nonce layout.
 pub const KX_VERSION_LATEST: u32 = 1;
 
 /// The version to run against a peer that advertised `advertised`: the highest both sides
@@ -42,9 +41,8 @@ const KX_SPLIT_CONTEXT: &[u8] = b"rdkx-spl";
 const KX_SPLIT_INITIATOR: u8 = 1;
 const KX_SPLIT_RESPONDER: u8 = 2;
 
-/// What both sides saw during the key exchange, each from its own side of the wire. Mixed into
-/// the split keys, so a change to any of it in transit leaves the two sides with different keys
-/// and the first message undecryptable, without a check per field.
+/// What both sides saw during the key exchange, each from its own side of the wire, mixed
+/// into the split keys.
 pub struct KxTranscript<'a> {
     /// The ephemeral public key of the side that sent the sealed key.
     pub initiator_pk: &'a [u8],
@@ -349,18 +347,14 @@ impl Encrypt {
     }
 
     /// Arm the check of the server's advertisement echo, `seen` being the version this side
-    /// received in the clear. Call once the key is set and before the first frame is read.
+    /// read from the key exchange. Call once the key is set and before the first frame is read.
     pub fn check_kx_advertised(&mut self, seen: u32) {
         self.4 = Some(seen);
     }
 
-    /// The server repeats what it advertised inside an encrypted message, where it can be
-    /// neither forged nor stripped. A different value in the clear means the handshake was
-    /// altered on the way, and the stream is refused rather than run at the version it was
-    /// pushed down to. Returns whether the echo settled the question: a frame that carries
-    /// none says nothing either way, and must leave the check armed for the frames after it,
-    /// since a server tags what it chooses to and an attacker would otherwise only have to
-    /// let one untagged frame through to be rid of the check.
+    /// The server repeats what it advertised inside its encrypted messages. Returns whether the
+    /// echo settled the question: a frame that carries none says nothing either way, and leaves
+    /// the check armed for the frames after it.
     fn check_kx_advertised_echo(plain: &[u8], seen: u32) -> Result<bool, Error> {
         let echoed = crate::rendezvous_proto::RendezvousMessage::parse_from_bytes(plain)
             .map(|m| m.kx_advertised)
@@ -496,8 +490,7 @@ mod tests {
         let (mut initiator, mut responder) = (Encrypt::new(key.clone()), Encrypt::new(key));
         let sent = seal_and_open(&mut initiator, &mut responder, b"hello");
         let back = seal_and_open(&mut responder, &mut initiator, b"hello");
-        // The n-th message each way is sealed under the same (key, nonce): the defect the split
-        // fixes, pinned here so the path a peer without versions relies on stays byte-for-byte.
+        // Pinned so the path a peer without versions relies on stays byte-for-byte.
         assert_eq!(sent, back);
     }
 
@@ -539,7 +532,7 @@ mod tests {
     #[test]
     fn test_split_binds_the_transcript() {
         let key = secretbox::gen_key();
-        // The responder advertised LATEST; the initiator was handed something else in transit.
+        // The two sides put different advertisements into the transcript.
         let mut initiator =
             Encrypt::new_split(key.clone(), true, &transcript(KX_VERSION_LATEST + 1)).unwrap();
         let mut responder = Encrypt::new_split(key, false, &transcript(KX_VERSION_LATEST)).unwrap();
@@ -583,7 +576,7 @@ mod tests {
         assert!(first_frame_after(KX_VERSION_LATEST, KX_VERSION_LATEST).is_ok());
         // A server from before versions echoes nothing, and advertised nothing.
         assert!(first_frame_after(0, 0).is_ok());
-        // The advertisement was lowered on the way; the echo says otherwise.
+        // The echo differs from what this side saw.
         assert!(first_frame_after(0, KX_VERSION_LATEST).is_err());
         assert!(first_frame_after(KX_VERSION_LATEST, KX_VERSION_LATEST + 1).is_err());
     }

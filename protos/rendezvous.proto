@@ -9,7 +9,6 @@ message IdPk {
   // that swaps SDP fingerprints). Empty for non-WebRTC handshakes.
   string dtls_fingerprint = 3;
   // Newest key exchange version the signer speaks; absent, i.e. 0, is the original scheme.
-  // Inside the signed identity so a rendezvous or relay cannot lower it.
   uint32 kx_version = 4;
 }
 
@@ -300,11 +299,7 @@ message RendezvousMessage {
     HttpProxyResponse http_proxy_response = 28;
     IceCandidate ice_candidate = 29;
   }
-  // From the server, on every message after a key exchange: the version it advertised,
-  // repeated inside the encrypted channel where nothing in transit can alter it. A client that
-  // was shown a different value in the clear knows the handshake was altered and refuses the
-  // stream. Every message and not the first alone, so that dropping one frame at a position
-  // that needs no key to find does not rid an attacker of the check; dropping them all is a
-  // plain DoS. Absent from servers that predate versions.
+  // From the server, on every message after a key exchange: the version it advertised.
+  // Absent from servers that predate versions.
   uint32 kx_advertised = 30;
 }
