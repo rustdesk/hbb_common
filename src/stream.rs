@@ -1,4 +1,4 @@
-use crate::{config, tcp, websocket, ResultType};
+use crate::{bail, config, tcp, websocket, ResultType};
 #[cfg(feature = "webrtc")]
 use crate::webrtc;
 use sodiumoxide::crypto::secretbox::Key;
@@ -77,6 +77,31 @@ impl Stream {
             Stream::WebRTC(s) => s.set_key(key),
             Stream::WebSocket(s) => s.set_key(key),
             Stream::Tcp(s) => s.set_key(key),
+        }
+    }
+
+    /// The stream key for the key exchange version in `t.picked`: version 0 is `set_key`, and
+    /// version 1 derives one key per direction from the transcript. Any other version is refused
+    /// rather than run as one of these. `is_initiator` is the side that sent the sealed key.
+    #[inline]
+    pub fn set_negotiated_key(
+        &mut self,
+        key: Key,
+        is_initiator: bool,
+        t: &tcp::KxTranscript,
+    ) -> ResultType<()> {
+        match t.picked {
+            0 => {
+                self.set_key(key);
+                Ok(())
+            }
+            1 => match self {
+                #[cfg(feature = "webrtc")]
+                Stream::WebRTC(_) => bail!("key exchange version 1 does not apply to WebRTC"),
+                Stream::WebSocket(s) => s.set_key_split(key, is_initiator, t),
+                Stream::Tcp(s) => s.set_key_split(key, is_initiator, t),
+            },
+            v => bail!("unsupported key exchange version {}", v),
         }
     }
 
@@ -286,5 +311,26 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         self.close_webrtc();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_set_negotiated_key_refuses_unknown_versions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut stream = Stream::from(TcpStream::connect(addr).await.unwrap(), addr);
+        let t = |picked| tcp::KxTranscript {
+            initiator_pk: &[1u8; 32],
+            responder_pk: &[2u8; 32],
+            advertised: 1,
+            picked,
+        };
+        let mut set = |picked| stream.set_negotiated_key(Key([0u8; 32]), true, &t(picked));
+        assert!(set(2).is_err());
+        assert!(set(1).is_ok());
     }
 }

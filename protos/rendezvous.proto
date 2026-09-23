@@ -8,6 +8,8 @@ message IdPk {
   // a WebRTC peer's DTLS channel can be bound to its verified identity (defeats a rendezvous/relay
   // that swaps SDP fingerprints). Empty for non-WebRTC handshakes.
   string dtls_fingerprint = 3;
+  // Newest key exchange version the signer speaks; absent, i.e. 0, is the original scheme.
+  uint32 kx_version = 4;
 }
 
 message RegisterPeer {
@@ -232,6 +234,19 @@ message OnlineResponse {
 
 message KeyExchange {
   repeated bytes keys = 1; 
+  // From the server: the newest key exchange version it speaks. From the client: the version it
+  // picked, the highest both speak. Absent, i.e. 0, is the original scheme.
+  uint32 version = 2;
+  // Server signature of KxParams. Bit 255 of the signed X25519 public key requires this field;
+  // legacy keys leave it clear.
+  bytes signed_params = 3;
+}
+
+// Signed by the server beside its ephemeral public key: that key as it went out, so the signature
+// belongs to this exchange alone, and the newest key exchange version the server speaks.
+message KxParams {
+  bytes pk = 1;
+  uint32 version = 2;
 }
 
 message HealthCheck {
