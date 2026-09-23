@@ -467,13 +467,13 @@ mod tests {
             hex(&Encrypt::new(key.clone()).enc(b"hello")),
             "3b768f827fdcc4af555b9e42533be6611e2c333481"
         );
-        let t = KxTranscript {
+        let mut t = KxTranscript {
             initiator_pk: &[0x22u8; 32],
             responder_pk: &[0x33u8; 32],
             advertised: 1,
             picked: 1,
         };
-        let Encrypt(send, _, _, recv) = Encrypt::new_split(key, true, &t).unwrap();
+        let Encrypt(send, _, _, recv) = Encrypt::new_split(key.clone(), true, &t).unwrap();
         assert_eq!(
             hex(&send.0),
             "c189ec6e1935c0751cfc85a0f075405cae507d7925bb19687caf56cbb54e0ecf"
@@ -481,6 +481,17 @@ mod tests {
         assert_eq!(
             hex(&recv.unwrap().0),
             "8a62648e9195cb10ea900c0a24d2a166c1e982347a2dc6833c3e756bf5715d36"
+        );
+        // With the two versions equal, swapping their order in the derivation would go unseen.
+        t.advertised = 3;
+        let Encrypt(send, _, _, recv) = Encrypt::new_split(key, true, &t).unwrap();
+        assert_eq!(
+            hex(&send.0),
+            "25b0778ae600f9731c7fa457d1cc5d40071b0aa3d34c90b53e1d5344b0e7123a"
+        );
+        assert_eq!(
+            hex(&recv.unwrap().0),
+            "5bbde0ac6a708d4cd1ff807125d79cb6030bde62f7a66b6cc1a79e31bd657756"
         );
     }
 
