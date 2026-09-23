@@ -80,15 +80,20 @@ impl Stream {
         }
     }
 
-    /// Per-direction keys bound to the handshake; see `tcp::KX_VERSION_LATEST`. `is_initiator`
-    /// is the side that sent the sealed key.
+    /// The stream key for the key exchange version in `t.picked`: version 0 is `set_key`, and
+    /// later versions derive one key per direction from the transcript. `is_initiator` is the
+    /// side that sent the sealed key.
     #[inline]
-    pub fn set_key_split(
+    pub fn set_negotiated_key(
         &mut self,
         key: Key,
         is_initiator: bool,
         t: &tcp::KxTranscript,
     ) -> ResultType<()> {
+        if t.picked == 0 {
+            self.set_key(key);
+            return Ok(());
+        }
         match self {
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => {
