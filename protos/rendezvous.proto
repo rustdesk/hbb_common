@@ -24,6 +24,7 @@ enum ConnType {
   RDP = 3;
   VIEW_CAMERA = 4;
   TERMINAL = 5;
+  REMOTE_USB = 6;
 }
 
 message RegisterPeerResponse { bool request_pk = 2; }
@@ -61,6 +62,7 @@ message ControlPermissions {
     block_input = 10;
     remote_modify = 11;
     privacy_mode = 12;
+    usb = 13;
   }
   uint64 permissions = 1;
 }
