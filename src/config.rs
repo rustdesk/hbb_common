@@ -114,15 +114,23 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-// Compile-time override for private deployments: set RENDEZVOUS_SERVER and
-// RS_PUB_KEY in the build environment to bake in a self-hosted server without
-// committing the address. Empty or unset values fall back to the public defaults.
+// Compile-time override for private deployments: set RENDEZVOUS_SERVER, RELAY_SERVER,
+// API_SERVER and RS_PUB_KEY in the build environment to bake in a self-hosted server
+// without committing the addresses. Empty or unset values keep the upstream defaults.
 pub const RENDEZVOUS_SERVERS: &[&str] = &[match option_env!("RENDEZVOUS_SERVER") {
     Some("") | None => "rs-ny.rustdesk.com",
     Some(s) => s,
 }];
 pub const RS_PUB_KEY: &str = match option_env!("RS_PUB_KEY") {
     Some("") | None => "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=",
+    Some(s) => s,
+};
+pub const RELAY_SERVER: &str = match option_env!("RELAY_SERVER") {
+    Some("") | None => "",
+    Some(s) => s,
+};
+pub const API_SERVER: &str = match option_env!("API_SERVER") {
+    Some("") | None => "",
     Some(s) => s,
 };
 
