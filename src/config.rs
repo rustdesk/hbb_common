@@ -19,7 +19,9 @@ use serde_json;
 use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
 
+mod file_storage;
 mod permanent_password;
+pub use file_storage::FileStorage;
 
 pub use permanent_password::{
     compute_permanent_password_h1, decode_permanent_password_h1_from_storage,
@@ -248,6 +250,13 @@ pub struct Config2 {
     unlock_pin: String,
     #[serde(default, deserialize_with = "deserialize_string")]
     trusted_devices: String,
+
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string",
+        skip_serializing_if = "String::is_empty"
+    )]
+    trusted_devices_v2: String,
 
     #[serde(default)]
     socks: Option<Socks5Server>,
@@ -512,8 +521,17 @@ impl Config2 {
     }
 
     fn store(&self) {
+        if let Err(error) = self.try_store() {
+            log::error!("Failed to store config2: {error}");
+        }
+    }
+
+    fn try_store(&self) -> crate::ResultType<()> {
+        let storage = FileStorage::lock(&Self::file())?;
         let mut config = self.clone();
-        let stored = Config::load_::<Config2>("2");
+        let stored: Config2 = storage.read_toml()?;
+        // Ordinary settings and stale process snapshots must never restore grants.
+        config.trusted_devices_v2 = stored.trusted_devices_v2;
         if let Some(mut socks) = config.socks {
             let stored_password = stored
                 .socks
@@ -526,7 +544,26 @@ impl Config2 {
         }
         config.unlock_pin =
             keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
-        Config::store_(&config, "2");
+        storage.write_toml(&config)
+    }
+
+    pub fn get_trusted_devices_v2() -> crate::ResultType<String> {
+        let config: Self = FileStorage::lock(&Self::file())?.read_toml()?;
+        Ok(config.trusted_devices_v2)
+    }
+
+    pub fn set_trusted_devices_v2(value: String) -> crate::ResultType<()> {
+        let storage = FileStorage::lock(&Self::file())?;
+        let mut config: Self = storage.read_toml()?;
+        config.trusted_devices_v2 = value;
+        storage.write_toml(&config)
+    }
+
+    pub fn without_trusted_devices_v2(self) -> Self {
+        Self {
+            trusted_devices_v2: String::new(),
+            ..self
+        }
     }
 
     pub fn get() -> Config2 {

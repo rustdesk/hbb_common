@@ -90,3 +90,6 @@ webrtc = "0.13.0" # keep in lockstep with [dependencies] webrtc (rustc 1.75 pin,
 [target.'cfg(target_os = "linux")'.dependencies]
 users = { version = "0.11" }
 x11 = "2.21"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security"] }
