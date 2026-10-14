@@ -10,7 +10,6 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use rand::Rng;
 use regex::Regex;
 use serde as de;
@@ -19,9 +18,7 @@ use serde_json;
 use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
 
-mod file_storage;
 mod permanent_password;
-pub use file_storage::FileStorage;
 
 pub use permanent_password::{
     compute_permanent_password_h1, decode_permanent_password_h1_from_storage,
@@ -67,7 +64,6 @@ lazy_static::lazy_static! {
     static ref CONFIG2: RwLock<Config2> = RwLock::new(Config2::load());
     static ref LOCAL_CONFIG: RwLock<LocalConfig> = RwLock::new(LocalConfig::load());
     static ref STATUS: RwLock<Status> = RwLock::new(Status::load());
-    static ref TRUSTED_DEVICES: RwLock<(Vec<TrustedDevice>, bool)> = Default::default();
     static ref ONLINE: Mutex<HashMap<String, i64>> = Default::default();
     pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("".to_owned());
     pub static ref EXE_RENDEZVOUS_SERVER: RwLock<String> = Default::default();
@@ -248,9 +244,6 @@ pub struct Config2 {
     serial: i32,
     #[serde(default, deserialize_with = "deserialize_string")]
     unlock_pin: String,
-    #[serde(default, deserialize_with = "deserialize_string")]
-    trusted_devices: String,
-
     #[serde(
         default,
         deserialize_with = "deserialize_string",
@@ -276,6 +269,8 @@ pub struct Resolution {
 pub struct PeerConfig {
     #[serde(default, deserialize_with = "deserialize_vec_u8")]
     pub password: Vec<u8>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trusted_device_v2: String,
     #[serde(default, deserialize_with = "deserialize_size")]
     pub size: Size,
     #[serde(default, deserialize_with = "deserialize_size")]
@@ -403,6 +398,7 @@ impl Default for PeerConfig {
     fn default() -> Self {
         Self {
             password: Default::default(),
+            trusted_device_v2: Default::default(),
             size: Default::default(),
             size_ft: Default::default(),
             size_pf: Default::default(),
@@ -527,10 +523,9 @@ impl Config2 {
     }
 
     fn try_store(&self) -> crate::ResultType<()> {
-        let storage = FileStorage::lock(&Self::file())?;
         let mut config = self.clone();
-        let stored: Config2 = storage.read_toml()?;
-        // Ordinary settings and stale process snapshots must never restore grants.
+        let stored: Config2 = try_load_path(Self::file())?;
+        // Ordinary settings must not restore grants from a stale snapshot.
         config.trusted_devices_v2 = stored.trusted_devices_v2;
         if let Some(mut socks) = config.socks {
             let stored_password = stored
@@ -544,19 +539,20 @@ impl Config2 {
         }
         config.unlock_pin =
             keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
-        storage.write_toml(&config)
+        store_path(Self::file(), config)
     }
 
     pub fn get_trusted_devices_v2() -> crate::ResultType<String> {
-        let config: Self = FileStorage::lock(&Self::file())?.read_toml()?;
+        let _lock = CONFIG2.read().unwrap();
+        let config: Self = try_load_path(Self::file())?;
         Ok(config.trusted_devices_v2)
     }
 
     pub fn set_trusted_devices_v2(value: String) -> crate::ResultType<()> {
-        let storage = FileStorage::lock(&Self::file())?;
-        let mut config: Self = storage.read_toml()?;
+        let _lock = CONFIG2.write().unwrap();
+        let mut config: Self = try_load_path(Self::file())?;
         config.trusted_devices_v2 = value;
-        storage.write_toml(&config)
+        store_path(Self::file(), config)
     }
 
     pub fn without_trusted_devices_v2(self) -> Self {
@@ -587,6 +583,21 @@ fn keep_encrypted_storage_if_plaintext_unchanged(plain: &str, stored: &str) -> S
         return stored.to_owned();
     }
     encrypt_str_or_original(plain, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
+}
+
+fn try_load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default>(
+    path: PathBuf,
+) -> crate::ResultType<T> {
+    match confy::load_path(path) {
+        Ok(config) => Ok(config),
+        Err(confy::ConfyError::GeneralLoadError(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(T::default())
+        }
+        Err(confy::ConfyError::BadTomlData(_)) => Err(anyhow!("Invalid configuration file")),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
@@ -1352,7 +1363,6 @@ impl Config {
         }
         config.password = stored;
         config.store();
-        Self::clear_trusted_devices();
         true
     }
 
@@ -1388,7 +1398,6 @@ impl Config {
         }
 
         config.store();
-        Self::clear_trusted_devices();
         Ok(true)
     }
 
@@ -1626,70 +1635,10 @@ impl Config {
         config.store();
     }
 
-    pub fn get_trusted_devices_json() -> String {
-        serde_json::to_string(&Self::get_trusted_devices()).unwrap_or_default()
-    }
-
-    pub fn get_trusted_devices() -> Vec<TrustedDevice> {
-        let (devices, synced) = TRUSTED_DEVICES.read().unwrap().clone();
-        if synced {
-            return devices;
-        }
-        let devices = CONFIG2.read().unwrap().trusted_devices.clone();
-        let (devices, succ, store) = decrypt_str_or_original(&devices, PASSWORD_ENC_VERSION);
-        if succ {
-            let mut devices: Vec<TrustedDevice> =
-                serde_json::from_str(&devices).unwrap_or_default();
-            let len = devices.len();
-            devices.retain(|d| !d.outdate());
-            if store || devices.len() != len {
-                Self::set_trusted_devices(devices.clone());
-            }
-            *TRUSTED_DEVICES.write().unwrap() = (devices.clone(), true);
-            devices
-        } else {
-            Default::default()
-        }
-    }
-
-    fn set_trusted_devices(mut trusted_devices: Vec<TrustedDevice>) {
-        trusted_devices.retain(|d| !d.outdate());
-        let devices = serde_json::to_string(&trusted_devices).unwrap_or_default();
-        let max_len = 1024 * 1024;
-        if devices.bytes().len() > max_len {
-            log::error!("Trusted devices too large: {}", devices.bytes().len());
-            return;
-        }
-        let devices = encrypt_str_or_original(&devices, PASSWORD_ENC_VERSION, max_len);
-        let mut config = CONFIG2.write().unwrap();
-        config.trusted_devices = devices;
-        config.store();
-        *TRUSTED_DEVICES.write().unwrap() = (trusted_devices, true);
-    }
-
-    pub fn add_trusted_device(device: TrustedDevice) {
-        let mut devices = Self::get_trusted_devices();
-        devices.retain(|d| d.hwid != device.hwid);
-        devices.push(device);
-        Self::set_trusted_devices(devices);
-    }
-
-    pub fn remove_trusted_devices(hwids: &Vec<Bytes>) {
-        let mut devices = Self::get_trusted_devices();
-        devices.retain(|d| !hwids.contains(&d.hwid));
-        Self::set_trusted_devices(devices);
-    }
-
-    pub fn clear_trusted_devices() {
-        Self::set_trusted_devices(Default::default());
-    }
-
     pub fn get() -> Config {
         return CONFIG.read().unwrap().clone();
     }
 
-    // TODO: `Config::set()` does not invalidate trusted devices when permanent password/salt changes.
-    // This matches historical behavior, but may need revisiting in a separate PR.
     pub fn set(cfg: Config) -> bool {
         let mut lock = CONFIG.write().unwrap();
         if *lock == cfg {
@@ -1734,6 +1683,7 @@ impl Config {
 }
 
 const PEERS: &str = "peers";
+static PEER_CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 impl PeerConfig {
     pub fn load(id: &str) -> PeerConfig {
@@ -1757,6 +1707,8 @@ impl PeerConfig {
                 if store {
                     config.store_(id);
                 }
+                // Credentials must not reach general-purpose peer settings or UI data.
+                config.trusted_device_v2.clear();
                 config
             }
             Err(err) => {
@@ -1785,10 +1737,34 @@ impl PeerConfig {
                 *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
             }
         }
-        if let Err(err) = store_path(Self::path(id), config) {
+        let result = (|| {
+            let _lock = PEER_CONFIG_WRITE_LOCK.lock().unwrap();
+            // A stale settings snapshot must not overwrite a newly issued credential.
+            config.trusted_device_v2 = try_load_path::<Self>(Self::path(id))?.trusted_device_v2;
+            store_path(Self::path(id), config)
+        })();
+        if let Err(err) = result {
             log::error!("Failed to store config: {}", err);
         }
         NEW_STORED_PEER_CONFIG.lock().unwrap().insert(id.to_owned());
+    }
+
+    pub fn get_trusted_device_v2(id: &str) -> crate::ResultType<String> {
+        let _lock = PEER_CONFIG_WRITE_LOCK.lock().unwrap();
+        let config: Self = try_load_path(Self::path(id))?;
+        Ok(config.trusted_device_v2)
+    }
+
+    pub fn set_trusted_device_v2(
+        id: &str,
+        value: String,
+        info: PeerInfoSerde,
+    ) -> crate::ResultType<()> {
+        let _lock = PEER_CONFIG_WRITE_LOCK.lock().unwrap();
+        let mut config: Self = try_load_path(Self::path(id))?;
+        config.trusted_device_v2 = value;
+        config.info = info;
+        store_path(Self::path(id), config)
     }
 
     pub fn remove(id: &str) {
@@ -2738,22 +2714,6 @@ impl Group {
 
     pub fn remove() {
         std::fs::remove_file(Self::path()).ok();
-    }
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct TrustedDevice {
-    pub hwid: Bytes,
-    pub time: i64,
-    pub id: String,
-    pub name: String,
-    pub platform: String,
-}
-
-impl TrustedDevice {
-    pub fn outdate(&self) -> bool {
-        const DAYS_90: i64 = 90 * 24 * 60 * 60 * 1000;
-        self.time + DAYS_90 < crate::get_time()
     }
 }
 
