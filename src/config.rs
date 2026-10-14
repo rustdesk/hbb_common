@@ -50,6 +50,7 @@ pub const READ_TIMEOUT: u64 = 18_000;
 pub const REG_INTERVAL: i64 = 15_000;
 pub const COMPRESS_LEVEL: i32 = 3;
 const SERIAL: i32 = 3;
+const CONFIG_STORE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 #[cfg(target_os = "macos")]
 lazy_static::lazy_static! {
@@ -518,7 +519,18 @@ impl Config2 {
 
     fn store(&self) {
         let mut config = self.clone();
-        let stored = Config::load_::<Config2>("2");
+        let stored: Self = match try_load_path(Self::file()) {
+            Ok(stored) => stored,
+            Err(err) => {
+                crate::throttled_log!(
+                    CONFIG_STORE_LOG_INTERVAL,
+                    error,
+                    "Failed to read config2; skipping save: {}",
+                    err
+                );
+                return;
+            }
+        };
         // Ordinary settings must not restore grants from a stale snapshot.
         config.trusted_devices_v2 = stored.trusted_devices_v2;
         if let Some(mut socks) = config.socks {
@@ -1733,7 +1745,19 @@ impl PeerConfig {
         }
         let _lock = PEER_CONFIG_WRITE_LOCK.lock().unwrap();
         // A stale settings snapshot must not overwrite a newly issued credential.
-        config.trusted_device_v2 = load_path::<Self>(Self::path(id)).trusted_device_v2;
+        config.trusted_device_v2 = match try_load_path::<Self>(Self::path(id)) {
+            Ok(stored) => stored.trusted_device_v2,
+            Err(err) => {
+                crate::throttled_log!(
+                    CONFIG_STORE_LOG_INTERVAL,
+                    error,
+                    "Failed to read peer config '{}'; skipping save: {}",
+                    id,
+                    err
+                );
+                return;
+            }
+        };
         if let Err(err) = store_path(Self::path(id), config) {
             log::error!("Failed to store config: {}", err);
         }
