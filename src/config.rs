@@ -517,14 +517,8 @@ impl Config2 {
     }
 
     fn store(&self) {
-        if let Err(error) = self.try_store() {
-            log::error!("Failed to store config2: {error}");
-        }
-    }
-
-    fn try_store(&self) -> crate::ResultType<()> {
         let mut config = self.clone();
-        let stored: Config2 = try_load_path(Self::file())?;
+        let stored = Config::load_::<Config2>("2");
         // Ordinary settings must not restore grants from a stale snapshot.
         config.trusted_devices_v2 = stored.trusted_devices_v2;
         if let Some(mut socks) = config.socks {
@@ -539,7 +533,7 @@ impl Config2 {
         }
         config.unlock_pin =
             keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
-        store_path(Self::file(), config)
+        Config::store_(&config, "2");
     }
 
     pub fn get_trusted_devices_v2() -> crate::ResultType<String> {
@@ -1737,13 +1731,10 @@ impl PeerConfig {
                 *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
             }
         }
-        let result = (|| {
-            let _lock = PEER_CONFIG_WRITE_LOCK.lock().unwrap();
-            // A stale settings snapshot must not overwrite a newly issued credential.
-            config.trusted_device_v2 = try_load_path::<Self>(Self::path(id))?.trusted_device_v2;
-            store_path(Self::path(id), config)
-        })();
-        if let Err(err) = result {
+        let _lock = PEER_CONFIG_WRITE_LOCK.lock().unwrap();
+        // A stale settings snapshot must not overwrite a newly issued credential.
+        config.trusted_device_v2 = load_path::<Self>(Self::path(id)).trusted_device_v2;
+        if let Err(err) = store_path(Self::path(id), config) {
             log::error!("Failed to store config: {}", err);
         }
         NEW_STORED_PEER_CONFIG.lock().unwrap().insert(id.to_owned());
