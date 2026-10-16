@@ -245,12 +245,15 @@ pub struct Config2 {
     serial: i32,
     #[serde(default, deserialize_with = "deserialize_string")]
     unlock_pin: String,
+    // Deprecated: retained for migration only, never used for authentication.
     #[serde(
         default,
         deserialize_with = "deserialize_string",
         skip_serializing_if = "String::is_empty"
     )]
-    trusted_devices_v2: String,
+    trusted_devices: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trusted_devices_v2: Option<toml::Value>,
 
     #[serde(default)]
     socks: Option<Socks5Server>,
@@ -519,7 +522,10 @@ impl Config2 {
 
     fn store(&self) {
         let mut config = self.clone();
-        let stored: Self = match try_load_path(Self::file()) {
+        let stored = match try_load_path(Self::file()).and_then(|stored: Self| {
+            stored.trusted_devices_v2()?;
+            Ok(stored)
+        }) {
             Ok(stored) => stored,
             Err(err) => {
                 crate::throttled_log!(
@@ -533,6 +539,7 @@ impl Config2 {
         };
         // Ordinary settings must not restore grants from a stale snapshot.
         config.trusted_devices_v2 = stored.trusted_devices_v2;
+        config.trusted_devices = stored.trusted_devices;
         if let Some(mut socks) = config.socks {
             let stored_password = stored
                 .socks
@@ -551,19 +558,43 @@ impl Config2 {
     pub fn get_trusted_devices_v2() -> crate::ResultType<String> {
         let _lock = CONFIG2.read().unwrap();
         let config: Self = try_load_path(Self::file())?;
-        Ok(config.trusted_devices_v2)
+        config.trusted_devices_v2().map(str::to_owned)
+    }
+
+    pub fn has_trusted_devices_v2() -> crate::ResultType<bool> {
+        let _lock = CONFIG2.read().unwrap();
+        let config: Self = try_load_path(Self::file())?;
+        // Explicit revocation must also replace malformed grant fields.
+        Ok(config
+            .trusted_devices_v2
+            .as_ref()
+            .is_some_and(|value| value.as_str() != Some("")))
+    }
+
+    pub fn has_legacy_trusted_devices() -> crate::ResultType<bool> {
+        let _lock = CONFIG2.read().unwrap();
+        let config: Self = try_load_path(Self::file())?;
+        Ok(!config.trusted_devices.is_empty())
+    }
+
+    fn trusted_devices_v2(&self) -> crate::ResultType<&str> {
+        match &self.trusted_devices_v2 {
+            None => Ok(""),
+            Some(toml::Value::String(value)) => Ok(value),
+            Some(_) => Err(anyhow!("Invalid trusted-device grants field")),
+        }
     }
 
     pub fn set_trusted_devices_v2(value: String) -> crate::ResultType<()> {
         let _lock = CONFIG2.write().unwrap();
         let mut config: Self = try_load_path(Self::file())?;
-        config.trusted_devices_v2 = value;
+        config.trusted_devices_v2 = (!value.is_empty()).then(|| toml::Value::String(value));
         store_path(Self::file(), config)
     }
 
     pub fn without_trusted_devices_v2(self) -> Self {
         Self {
-            trusted_devices_v2: String::new(),
+            trusted_devices_v2: None,
             ..self
         }
     }
