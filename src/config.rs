@@ -522,11 +522,18 @@ impl Config2 {
 
     fn store(&self) {
         let mut config = self.clone();
-        let stored = match try_load_path(Self::file()).and_then(|stored: Self| {
-            stored.trusted_devices_v2()?;
-            Ok(stored)
-        }) {
-            Ok(stored) => stored,
+        let stored = match try_load_path_for_store::<Self>(Self::file()) {
+            Ok(mut stored) => {
+                if stored.trusted_devices_v2().is_err() {
+                    crate::throttled_log!(
+                        CONFIG_STORE_LOG_INTERVAL,
+                        warn,
+                        "Invalid trusted-device grants field; saving settings without V2 trust credentials"
+                    );
+                    stored.trusted_devices_v2 = None;
+                }
+                stored
+            }
             Err(err) => {
                 crate::throttled_log!(
                     CONFIG_STORE_LOG_INTERVAL,
@@ -633,6 +640,32 @@ fn try_load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default>(
             Ok(T::default())
         }
         Err(confy::ConfyError::BadTomlData(_)) => Err(anyhow!("Invalid configuration file")),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn try_load_path_for_store<T: serde::Serialize + serde::de::DeserializeOwned + Default>(
+    path: PathBuf,
+) -> crate::ResultType<T> {
+    match confy::load_path(path) {
+        Ok(config) => Ok(config),
+        Err(error)
+            if matches!(&error, confy::ConfyError::BadTomlData(_))
+                || matches!(&error, confy::ConfyError::ReadConfigurationFileError(error)
+                    if error.kind() == std::io::ErrorKind::InvalidData) =>
+        {
+            crate::throttled_log!(
+                CONFIG_STORE_LOG_INTERVAL,
+                warn,
+                "Invalid configuration file; saving settings without trust credentials"
+            );
+            Ok(T::default())
+        }
+        Err(confy::ConfyError::GeneralLoadError(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(T::default())
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -1776,7 +1809,7 @@ impl PeerConfig {
         }
         let _lock = PEER_CONFIG_WRITE_LOCK.lock().unwrap();
         // A stale settings snapshot must not overwrite a newly issued credential.
-        config.trusted_device_v2 = match try_load_path::<Self>(Self::path(id)) {
+        config.trusted_device_v2 = match try_load_path_for_store::<Self>(Self::path(id)) {
             Ok(stored) => stored.trusted_device_v2,
             Err(err) => {
                 crate::throttled_log!(
