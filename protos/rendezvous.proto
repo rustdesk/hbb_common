@@ -61,6 +61,7 @@ message ControlPermissions {
     block_input = 10;
     remote_modify = 11;
     privacy_mode = 12;
+    usb = 13;
   }
   uint64 permissions = 1;
 }

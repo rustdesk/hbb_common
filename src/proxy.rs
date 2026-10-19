@@ -1,7 +1,4 @@
-use std::{
-    io::Error as IoError,
-    net::{SocketAddr, ToSocketAddrs},
-};
+use std::{io::Error as IoError, net::SocketAddr};
 
 use anyhow::bail;
 use async_recursion::async_recursion;
@@ -234,12 +231,10 @@ impl ProxyScheme {
     }
 
     async fn resolve_host(&self, host: &str, default_port: u16) -> Result<SocketAddr, ProxyError> {
-        let (host_str, port) = match host.split_once(':') {
-            Some((h, p)) => (h, p.parse::<u16>().ok()),
-            None => (host, None),
-        };
-        let addr = (host_str, port.unwrap_or(default_port))
-            .to_socket_addrs()?
+        let addr = self
+            .http_url(host)?
+            .socket_addrs(|| Some(default_port))?
+            .into_iter()
             .next()
             .ok_or_else(|| ProxyError::AddressResolutionFailed(host.to_string()))?;
         Ok(addr)
@@ -248,11 +243,11 @@ impl ProxyScheme {
     pub fn get_domain(&self) -> Result<String, ProxyError> {
         match self {
             ProxyScheme::Http { host, .. } | ProxyScheme::Https { host, .. } => {
-                let domain = host
-                    .split(':')
-                    .next()
-                    .ok_or_else(|| ProxyError::AddressResolutionFailed(host.clone()))?;
-                Ok(domain.to_string())
+                match self.http_url(host)?.host() {
+                    Some(url::Host::Ipv6(ip)) => Ok(ip.to_string()),
+                    Some(host) => Ok(host.to_string()),
+                    None => Err(ProxyError::AddressResolutionFailed(host.clone())),
+                }
             }
             ProxyScheme::Socks5 { addr, .. } => match addr {
                 SocketAddr::V4(addr_v4) => Ok(addr_v4.ip().to_string()),
@@ -262,17 +257,30 @@ impl ProxyScheme {
     }
     pub fn get_host_and_port(&self) -> Result<String, ProxyError> {
         match self {
-            ProxyScheme::Http { host, .. } => Ok(self.append_default_port(host, 80)),
-            ProxyScheme::Https { host, .. } => Ok(self.append_default_port(host, 443)),
+            ProxyScheme::Http { host, .. } => self.append_default_port(host, 80),
+            ProxyScheme::Https { host, .. } => self.append_default_port(host, 443),
             ProxyScheme::Socks5 { addr, .. } => Ok(format!("{}", addr)),
         }
     }
-    fn append_default_port(&self, host: &str, default_port: u16) -> String {
-        if host.contains(':') {
-            host.to_string()
+    fn append_default_port(&self, host: &str, default_port: u16) -> Result<String, ProxyError> {
+        let url = self.http_url(host)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| ProxyError::AddressResolutionFailed(host.to_string()))?;
+        Ok(format!(
+            "{}:{}",
+            host,
+            url.port_or_known_default().unwrap_or(default_port)
+        ))
+    }
+
+    fn http_url(&self, host: &str) -> Result<Url, ProxyError> {
+        let scheme = if matches!(self, Self::Https { .. }) {
+            "https"
         } else {
-            format!("{}:{}", host, default_port)
-        }
+            "http"
+        };
+        Ok(Url::parse(&format!("{scheme}://{host}"))?)
     }
 }
 
@@ -428,8 +436,7 @@ impl Proxy {
                     TlsType::NativeTls => {
                         self.https_connect_nativetls_wrap_danger(
                             &url,
-                            local,
-                            proxy,
+                            stream,
                             &target_addr,
                             danger_accept_invalid_cert,
                         )
@@ -480,12 +487,10 @@ impl Proxy {
     async fn https_connect_nativetls_wrap_danger<'a>(
         &self,
         url: &str,
-        local: SocketAddr,
-        proxy: SocketAddr,
+        stream: tokio::net::TcpStream,
         target_addr: &TargetAddr<'a>,
         danger_accept_invalid_cert: Option<bool>,
     ) -> ResultType<DynTcpStream> {
-        let stream = self.new_stream(local, proxy).await?;
         let s = super::timeout(
             self.ms_timeout,
             self.https_connect_nativetls(
@@ -535,7 +540,10 @@ impl Proxy {
         danger_accept_invalid_cert: Option<bool>,
         origin_danger_accept_invalid_cert: Option<bool>,
     ) -> ResultType<DynTcpStream> {
-        let stream = stream.unwrap_or(self.new_stream(local, proxy).await?);
+        let stream = match stream {
+            Some(stream) => stream,
+            None => self.new_stream(local, proxy).await?,
+        };
         match super::timeout(
             self.ms_timeout,
             self.https_connect_rustls(
@@ -587,8 +595,7 @@ impl Proxy {
                     log::warn!("Falling back to native-tls for HTTPS proxy server.");
                     self.https_connect_nativetls_wrap_danger(
                         &url,
-                        local,
-                        proxy,
+                        self.new_stream(local, proxy).await?,
                         &target_addr,
                         origin_danger_accept_invalid_cert,
                     )
@@ -663,6 +670,10 @@ impl Proxy {
 
 fn get_domain_and_port<'a>(target_addr: &TargetAddr<'a>) -> Result<(String, u16), ProxyError> {
     match target_addr {
+        // CONNECT requires brackets around IPv6 literals in both the target and Host header.
+        tokio_socks::TargetAddr::Ip(SocketAddr::V6(addr)) => {
+            Ok((format!("[{}]", addr.ip()), addr.port()))
+        }
         tokio_socks::TargetAddr::Ip(addr) => Ok((addr.ip().to_string(), addr.port())),
         tokio_socks::TargetAddr::Domain(name, port) => Ok((name.to_string(), *port)),
     }
@@ -713,4 +724,103 @@ where
         }
         None => Err(ProxyError::NoHttpCode),
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyScheme;
+
+    #[test]
+    fn http_url_parses_hosts_and_ports() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            for (proxy, scheme, default_port) in [
+                (ProxyScheme::http(host).unwrap(), "http", 80),
+                (ProxyScheme::https(host).unwrap(), "https", 443),
+            ] {
+                for port in [None, Some(80), Some(443), Some(8443)] {
+                    let authority = match port {
+                        Some(port) => format!("{host}:{port}"),
+                        None => host.to_owned(),
+                    };
+                    let url = proxy.http_url(&authority).unwrap();
+                    assert_eq!(url.scheme(), scheme);
+                    assert_eq!(url.host_str(), Some(host));
+                    assert_eq!(
+                        url.port_or_known_default(),
+                        Some(port.unwrap_or(default_port))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn append_default_port_formats_hosts_and_ports() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            for (proxy, default_port) in [
+                (ProxyScheme::http(host).unwrap(), 80),
+                (ProxyScheme::https(host).unwrap(), 443),
+            ] {
+                for port in [None, Some(80), Some(443), Some(8443)] {
+                    let authority = match port {
+                        Some(port) => format!("{host}:{port}"),
+                        None => host.to_owned(),
+                    };
+                    assert_eq!(
+                        proxy.append_default_port(&authority, default_port).unwrap(),
+                        format!("{host}:{}", port.unwrap_or(default_port))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_host_resolves_hosts_and_ports() {
+        for (host, expected_ip) in [
+            ("localhost", None),
+            ("127.0.0.1", Some("127.0.0.1")),
+            ("[::1]", Some("::1")),
+        ] {
+            for (proxy, default_port) in [
+                (ProxyScheme::http(host).unwrap(), 80),
+                (ProxyScheme::https(host).unwrap(), 443),
+            ] {
+                for port in [None, Some(80), Some(443), Some(8443)] {
+                    let authority = match port {
+                        Some(port) => format!("{host}:{port}"),
+                        None => host.to_owned(),
+                    };
+                    let addr = proxy.resolve_host(&authority, default_port).await.unwrap();
+                    assert_eq!(addr.port(), port.unwrap_or(default_port));
+                    assert!(addr.ip().is_loopback());
+                    if let Some(ip) = expected_ip {
+                        assert_eq!(addr.ip().to_string(), ip);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn get_domain_strips_ports_and_ipv6_brackets() {
+        for (host, domain) in [
+            ("localhost", "localhost"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("[::1]", "::1"),
+        ] {
+            for port in [None, Some(80), Some(443), Some(8443)] {
+                let authority = match port {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_owned(),
+                };
+                for proxy in [
+                    ProxyScheme::http(&authority).unwrap(),
+                    ProxyScheme::https(&authority).unwrap(),
+                ] {
+                    assert_eq!(proxy.get_domain().unwrap(), domain);
+                }
+            }
+        }
+    }
 }

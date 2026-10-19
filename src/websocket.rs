@@ -5,36 +5,82 @@ use crate::{
     protobuf::Message,
     socket_client::split_host_port,
     sodiumoxide::crypto::secretbox::Key,
-    tcp::{Encrypt, KxTranscript},
+    tcp::{DynTcpStream, Encrypt, KxTranscript},
     tls::{get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,
 };
 use anyhow::bail;
 use async_recursion::async_recursion;
 use bytes::{Bytes, BytesMut};
-use futures::{SinkExt, StreamExt};
+use futures::{future::Either, SinkExt, StreamExt};
 use std::{
-    io::{Error, ErrorKind},
+    io::{self, Error, ErrorKind},
     net::SocketAddr,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+    time::timeout,
+};
 use tokio_native_tls::native_tls::TlsConnector;
 use tokio_tungstenite::{
-    connect_async_tls_with_config, tungstenite::protocol::Message as WsMessage, Connector,
-    MaybeTlsStream, WebSocketStream,
+    client_async_tls_with_config, connect_async_tls_with_config,
+    tungstenite::protocol::Message as WsMessage, Connector, MaybeTlsStream, WebSocketStream,
 };
 use tungstenite::client::IntoClientRequest;
-use tungstenite::protocol::Role;
 
 /// tungstenite's own defaults. `set_max_packet_length` clamps to these, so `usize::MAX` puts the
 /// transport back exactly where it started rather than above it.
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 << 20;
 const DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
 
+// macOS/iOS Native TLS may wait for a response without flushing the proxy tunnel's write buffer.
+struct FlushBeforeRead(DynTcpStream);
+
+impl AsyncRead for FlushBeforeRead {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // A blocked writer must not prevent reading data that lets the peer make progress.
+        if let Poll::Ready(Err(err)) = Pin::new(&mut self.0).poll_flush(cx) {
+            return Poll::Ready(Err(err));
+        }
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for FlushBeforeRead {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+// Keep the original non-proxy connection path while supporting proxy streams.
+type WsStream = Either<
+    WebSocketStream<MaybeTlsStream<TcpStream>>,
+    WebSocketStream<MaybeTlsStream<DynTcpStream>>,
+>;
+
 pub struct WsFramedStream {
-    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    stream: WsStream,
     addr: SocketAddr,
     encrypt: Option<Encrypt>,
     send_timeout: u64,
@@ -72,16 +118,18 @@ impl WsFramedStream {
 
     async fn connect(
         url: &str,
+        local_addr: Option<SocketAddr>,
+        proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
-    ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        // to-do: websocket proxy.
-
+    ) -> ResultType<(WsStream, SocketAddr)> {
         let tls_type = get_cached_tls_type(url);
         let is_tls_type_cached = tls_type.is_some();
         let tls_type = tls_type.unwrap_or(TlsType::Rustls);
         let danger_accept_invalid_cert = get_cached_tls_accept_invalid_cert(&url);
         Self::try_connect(
             url,
+            local_addr,
+            proxy_conf,
             ms_timeout,
             tls_type,
             is_tls_type_cached,
@@ -94,28 +142,83 @@ impl WsFramedStream {
     #[async_recursion]
     async fn try_connect(
         url: &str,
+        local_addr: Option<SocketAddr>,
+        proxy_conf: Option<&Socks5Server>,
         ms_timeout: u64,
         tls_type: TlsType,
         is_tls_type_cached: bool,
         danger_accept_invalid_cert: Option<bool>,
         original_danger_accept_invalid_certs: Option<bool>,
-    ) -> ResultType<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    ) -> ResultType<(WsStream, SocketAddr)> {
         let ws_config = None;
-        let disable_nagle = false;
         let request = url
             .into_client_request()
             .map_err(|e| Error::new(ErrorKind::Other, e))?;
         let connector =
             Self::get_connector(&tls_type, danger_accept_invalid_cert.unwrap_or(false))?;
-        match timeout(
-            Duration::from_millis(ms_timeout),
-            connect_async_tls_with_config(request, ws_config, disable_nagle, connector),
-        )
-        .await?
-        {
-            Ok((ws_stream, _)) => {
+        let result = if let Some(proxy_conf) = proxy_conf {
+            let host = request.uri().host().ok_or_else(|| {
+                Error::new(ErrorKind::InvalidInput, "Invalid WebSocket URL: no host")
+            })?;
+            let port = request
+                .uri()
+                .port_u16()
+                .or_else(|| match request.uri().scheme_str() {
+                    Some("wss") => Some(443),
+                    Some("ws") => Some(80),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidInput, "Invalid WebSocket URL scheme")
+                })?;
+            let target = format!("{host}:{port}");
+            timeout(Duration::from_millis(ms_timeout), async {
+                let stream = crate::tcp::FramedStream::connect(
+                    target.as_str(),
+                    local_addr,
+                    proxy_conf,
+                    ms_timeout,
+                )
+                .await?;
+                let addr = stream.1;
+                let mut stream = stream.0.into_inner();
+                if cfg!(any(target_os = "macos", target_os = "ios"))
+                    && url.starts_with("wss://")
+                    && matches!(tls_type, TlsType::NativeTls)
+                    && url::Url::parse(&proxy_conf.proxy)
+                        .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+                {
+                    stream = DynTcpStream(Box::new(FlushBeforeRead(stream)));
+                }
+                Ok::<_, anyhow::Error>(
+                    client_async_tls_with_config(request, stream, ws_config, connector)
+                        .await
+                        .map(|(stream, _)| (stream, addr)),
+                )
+            })
+            .await??
+            .map(Either::Right)
+        } else {
+            let disable_nagle = false;
+            timeout(
+                Duration::from_millis(ms_timeout),
+                connect_async_tls_with_config(request, ws_config, disable_nagle, connector),
+            )
+            .await?
+            .map(|(stream, _)| Either::Left(stream))
+        };
+        match result {
+            Ok(stream) => {
                 upsert_tls_cache(url, tls_type, danger_accept_invalid_cert.unwrap_or(false));
-                Ok(ws_stream)
+                match stream {
+                    Either::Left(stream) => {
+                        // MaybeTlsStream::get_ref() handles Plain, NativeTls and Rustls,
+                        // returning the underlying TcpStream for local_addr().
+                        let addr = stream.get_ref().get_ref().local_addr()?;
+                        Ok((Either::Left(stream), addr))
+                    }
+                    Either::Right((stream, addr)) => Ok((Either::Right(stream), addr)),
+                }
             }
             Err(e) => match (tls_type, is_tls_type_cached, danger_accept_invalid_cert) {
                 (TlsType::Rustls, _, None) => {
@@ -126,6 +229,8 @@ impl WsFramedStream {
                         );
                     Self::try_connect(
                         url,
+                        local_addr,
+                        proxy_conf,
                         ms_timeout,
                         tls_type,
                         is_tls_type_cached,
@@ -142,6 +247,8 @@ impl WsFramedStream {
                     );
                     Self::try_connect(
                         url,
+                        local_addr,
+                        proxy_conf,
                         ms_timeout,
                         TlsType::NativeTls,
                         is_tls_type_cached,
@@ -158,6 +265,8 @@ impl WsFramedStream {
                         );
                     Self::try_connect(
                         url,
+                        local_addr,
+                        proxy_conf,
                         ms_timeout,
                         tls_type,
                         is_tls_type_cached,
@@ -189,17 +298,12 @@ impl WsFramedStream {
 
     pub async fn new<T: AsRef<str>>(
         url: T,
-        _local_addr: Option<SocketAddr>,
-        _proxy_conf: Option<&Socks5Server>,
+        local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
-        let stream = Self::connect(url.as_ref(), ms_timeout).await?;
-        let addr = match stream.get_ref() {
-            MaybeTlsStream::Plain(tcp) => tcp.peer_addr()?,
-            MaybeTlsStream::NativeTls(tls) => tls.get_ref().get_ref().get_ref().peer_addr()?,
-            MaybeTlsStream::Rustls(tls) => tls.get_ref().0.peer_addr()?,
-            _ => return Err(Error::new(ErrorKind::Other, "Unsupported stream type").into()),
-        };
+        let proxy_conf = Config::get_socks();
+        let (stream, addr) =
+            Self::connect(url.as_ref(), local_addr, proxy_conf.as_ref(), ms_timeout).await?;
 
         let ws = Self {
             stream,
@@ -222,24 +326,14 @@ impl WsFramedStream {
     /// fork growing the read buffer a chunk at a time rather than to the length a frame declares.
     #[inline]
     pub fn set_max_packet_length(&mut self, n: usize) {
-        self.stream.set_config(|c| {
+        let set_config = |c: &mut tungstenite::protocol::WebSocketConfig| {
             c.max_message_size = Some(n.min(DEFAULT_MAX_MESSAGE_SIZE));
             c.max_frame_size = Some(n.min(DEFAULT_MAX_FRAME_SIZE));
-        });
-    }
-
-    #[inline]
-    pub async fn from_tcp_stream(stream: TcpStream, addr: SocketAddr) -> ResultType<Self> {
-        let ws_stream =
-            WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(stream), Role::Client, None)
-                .await;
-
-        Ok(Self {
-            stream: ws_stream,
-            addr,
-            encrypt: None,
-            send_timeout: 0,
-        })
+        };
+        match &mut self.stream {
+            Either::Left(stream) => stream.set_config(set_config),
+            Either::Right(stream) => stream.set_config(set_config),
+        }
     }
 
     #[inline]
@@ -435,10 +529,27 @@ pub fn check_ws(endpoint: &str) -> String {
 }
 
 #[cfg(test)]
+mod proxy_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{keys, Config};
     use tokio::{io::AsyncWriteExt, net::TcpListener};
+    use tungstenite::protocol::Role;
+
+    async fn ws_from_tcp(stream: TcpStream, addr: SocketAddr) -> WsFramedStream {
+        let ws_stream =
+            WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(stream), Role::Client, None)
+                .await;
+
+        WsFramedStream {
+            stream: Either::Left(ws_stream),
+            addr,
+            encrypt: None,
+            send_timeout: 0,
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_secured_stream_rejects_plaintext_text() {
@@ -455,7 +566,7 @@ mod tests {
         });
 
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let mut client = WsFramedStream::from_tcp_stream(tcp, addr).await.unwrap();
+        let mut client = ws_from_tcp(tcp, addr).await;
         client.set_key(Key([0x42; sodiumoxide::crypto::secretbox::KEYBYTES]));
 
         let result = client.next().await;
@@ -629,7 +740,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let client = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
-        let ws = WsFramedStream::from_tcp_stream(client, addr).await.unwrap();
+        let ws = ws_from_tcp(client, addr).await;
         (ws, server)
     }
 
@@ -640,7 +751,10 @@ mod tests {
         ws.set_max_packet_length(CAP);
 
         // One byte over, header only: refused before there is any payload to buffer.
-        server.write_all(&ws_binary_frame(CAP + 1, false)).await.unwrap();
+        server
+            .write_all(&ws_binary_frame(CAP + 1, false))
+            .await
+            .unwrap();
         match timeout(Duration::from_secs(5), ws.next()).await {
             Ok(Some(Err(e))) => assert!(e.to_string().contains("Message too long"), "{}", e),
             Ok(other) => panic!(
@@ -657,18 +771,28 @@ mod tests {
         let (mut ws, mut server) = ws_loopback().await;
 
         ws.set_max_packet_length(CAP);
-        server.write_all(&ws_binary_frame(8 * 1024, true)).await.unwrap();
+        server
+            .write_all(&ws_binary_frame(8 * 1024, true))
+            .await
+            .unwrap();
         let got = ws.next().await.unwrap().unwrap();
         assert_eq!(got.len(), 8 * 1024, "a message under the cap still arrives");
 
         ws.set_max_packet_length(usize::MAX);
-        server.write_all(&ws_binary_frame(200_000, true)).await.unwrap();
+        server
+            .write_all(&ws_binary_frame(200_000, true))
+            .await
+            .unwrap();
         let got = timeout(Duration::from_secs(5), ws.next())
             .await
             .expect("next() hung after the cap was lifted")
             .unwrap()
             .unwrap();
-        assert_eq!(got.len(), 200_000, "lifting the cap lets a large message through again");
+        assert_eq!(
+            got.len(),
+            200_000,
+            "lifting the cap lets a large message through again"
+        );
     }
 
     // Two frames each under the cap that reassemble to a message over it: the frame bound lets
@@ -680,8 +804,14 @@ mod tests {
         ws.set_max_packet_length(CAP);
 
         // Binary with FIN clear, then a continuation with FIN set: 12 KiB each, 24 KiB together.
-        server.write_all(&ws_frame(0x02, 12 * 1024, true)).await.unwrap();
-        server.write_all(&ws_frame(0x80, 12 * 1024, true)).await.unwrap();
+        server
+            .write_all(&ws_frame(0x02, 12 * 1024, true))
+            .await
+            .unwrap();
+        server
+            .write_all(&ws_frame(0x80, 12 * 1024, true))
+            .await
+            .unwrap();
         match timeout(Duration::from_secs(5), ws.next()).await {
             Ok(Some(Err(e))) => assert!(e.to_string().contains("Message too long"), "{}", e),
             Ok(other) => panic!(
