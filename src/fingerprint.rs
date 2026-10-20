@@ -2,7 +2,7 @@ use serde_derive::{Deserialize, Serialize};
 use sha2::digest::Update;
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
-use std::sync::Once;
+use std::sync::{Mutex, OnceLock};
 use sysinfo::System;
 
 const TABLE: [u8; 256] = [
@@ -190,9 +190,8 @@ pub struct FingerprintingInfo {
     addr: String,
 }
 
-static mut FINGERPRINTING_INFO: Option<FingerprintingInfo> = None;
-static INIT: Once = Once::new();
-static mut CACHED_FINGERPRINTS: Option<HashMap<String, Vec<u8>>> = None;
+static FINGERPRINTING_INFO: OnceLock<FingerprintingInfo> = OnceLock::new();
+static CACHED_FINGERPRINTS: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
 
 impl FingerprintingInfo {
     fn new() -> Self {
@@ -243,14 +242,7 @@ impl FingerprintingInfo {
 }
 
 pub fn get_fingerprinting_info() -> FingerprintingInfo {
-    unsafe {
-        INIT.call_once(|| {
-            FINGERPRINTING_INFO = Some(FingerprintingInfo::new());
-            CACHED_FINGERPRINTS = Some(HashMap::new());
-        });
-        #[allow(static_mut_refs)]
-        FINGERPRINTING_INFO.clone().unwrap_or_default()
-    }
+    FINGERPRINTING_INFO.get_or_init(FingerprintingInfo::new).clone()
 }
 
 pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -> Vec<u8> {
@@ -279,20 +271,14 @@ pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -
 
     let cache_key = parameters.join("");
 
-    unsafe {
-        #[allow(static_mut_refs)]
-        if let Some(cache) = &mut CACHED_FINGERPRINTS {
-            if let Some(fingerprint) = cache.get(&cache_key) {
-                return fingerprint.clone();
-            }
-
-            let fingerprint = calculate_fingerprint(&parameters);
-            cache.insert(cache_key, fingerprint.clone());
-            fingerprint
-        } else {
-            calculate_fingerprint(&parameters)
-        }
+    let mut cache = CACHED_FINGERPRINTS.get_or_init(Default::default)
+        .lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(fingerprint) = cache.get(&cache_key) {
+        return fingerprint.clone();
     }
+    let fingerprint = calculate_fingerprint(&parameters);
+    cache.insert(cache_key, fingerprint.clone());
+    fingerprint
 }
 
 struct Sha512Hasher {
@@ -378,4 +364,28 @@ fn calculate_fingerprint(parameters: &[String]) -> Vec<u8> {
         .join("");
     hasher.update(fingerprint_string.as_bytes());
     hasher.finalize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_cache_reads_and_inserts_preserve_fingerprints() {
+        // Avoid reading or creating a real user's configuration in this test.
+        let _ = FINGERPRINTING_INFO.set(FingerprintingInfo {
+            platform: "test-platform".to_owned(), arch: "test-arch".to_owned(),
+            ..Default::default()
+        });
+        let jobs: Vec<_> = (0..16).map(|thread| std::thread::spawn(move || {
+            for iteration in 0..128 {
+                let parameters = if (thread + iteration) % 2 == 0 {
+                    vec!["platform".to_owned()]
+                } else { vec!["platform".to_owned(), "arch".to_owned()] };
+                let expected = calculate_fingerprint(&parameters);
+                assert_eq!(get_fingerprint(Some(parameters), None), expected);
+            }
+        })).collect();
+        for job in jobs { job.join().unwrap(); }
+    }
 }
