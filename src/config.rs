@@ -245,7 +245,7 @@ pub struct Config2 {
     serial: i32,
     #[serde(default, deserialize_with = "deserialize_string")]
     unlock_pin: String,
-    // Deprecated: retained for migration only, never used for authentication.
+    // Imported by clients that support legacy trusted-device compatibility.
     #[serde(
         default,
         deserialize_with = "deserialize_string",
@@ -563,9 +563,13 @@ impl Config2 {
     }
 
     pub fn get_trusted_devices_v2() -> crate::ResultType<String> {
+        Self::get_trusted_device_stores().map(|(current, _)| current)
+    }
+
+    pub fn get_trusted_device_stores() -> crate::ResultType<(String, String)> {
         let _lock = CONFIG2.read().unwrap();
         let config: Self = try_load_path(Self::file())?;
-        config.trusted_devices_v2().map(str::to_owned)
+        Ok((config.trusted_devices_v2()?.to_owned(), config.trusted_devices))
     }
 
     pub fn has_trusted_devices_v2() -> crate::ResultType<bool> {
@@ -590,6 +594,7 @@ impl Config2 {
         let _lock = CONFIG2.write().unwrap();
         let mut config: Self = try_load_path(Self::file())?;
         config.trusted_devices_v2 = (!value.is_empty()).then(|| toml::Value::String(value));
+        config.trusted_devices.clear();
         store_path(Self::file(), config)
     }
 
