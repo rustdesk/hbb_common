@@ -96,5 +96,5 @@ osascript = "0.3"
 sctk = { package = "smithay-client-toolkit", version = "0.20.0", default-features = false, features = [
     "calloop",
 ] }
-users = { version = "0.11" }
+users = { package = "uzers", version = "0.12.2" }
 x11 = "2.21"
