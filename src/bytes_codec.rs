@@ -4,6 +4,8 @@ use tokio_util::codec::{Decoder, Encoder};
 
 // Bound speculative allocation from untrusted frame headers.
 const MAX_PREALLOCATED_PAYLOAD_LEN: usize = 256 * 1024;
+/// Largest payload representable by the four-byte RustDesk frame header.
+pub const MAX_FRAME_LENGTH: usize = 0x3FFF_FFFF;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BytesCodec {
@@ -132,7 +134,7 @@ impl Encoder<Bytes> for BytesCodec {
             let h = (data.len() << 2) as u32 | 0x2;
             buf.put_u16_le((h & 0xFFFF) as u16);
             buf.put_u8((h >> 16) as u8);
-        } else if data.len() <= 0x3FFFFFFF {
+        } else if data.len() <= MAX_FRAME_LENGTH {
             buf.put_u32_le((data.len() << 2) as u32 | 0x3);
         } else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Overflow"));
@@ -290,12 +292,29 @@ mod tests {
     fn decode_large_frame_header_caps_preallocation() {
         let mut codec = BytesCodec::new();
         let mut buf = BytesMut::new();
-        let n = 0x3FFFFFFFusize;
+        let n = MAX_FRAME_LENGTH;
         const MAX_REASONABLE_CAPACITY: usize = MAX_PREALLOCATED_PAYLOAD_LEN * 4;
 
         buf.put_u32_le((n << 2) as u32 | 0x3);
 
         assert!(matches!(codec.decode(&mut buf), Ok(None)));
         assert!(buf.capacity() <= MAX_REASONABLE_CAPACITY);
+    }
+
+    #[test]
+    fn max_packet_length_refuses_on_the_header() {
+        const CAP: usize = 128 * 1024;
+        let decode_header_for = |n: usize| {
+            let mut codec = BytesCodec::new();
+            codec.set_max_packet_length(CAP);
+            let mut buf = BytesMut::new();
+            buf.put_u32_le((n << 2) as u32 | 0x3);
+            codec.decode(&mut buf)
+        };
+
+        // At the cap the header is accepted and the payload awaited.
+        assert!(matches!(decode_header_for(CAP), Ok(None)));
+        // One byte over, and the frame dies on its header - before any of it has been buffered.
+        assert!(decode_header_for(CAP + 1).is_err());
     }
 }
