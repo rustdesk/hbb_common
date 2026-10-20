@@ -88,7 +88,7 @@ webrtc = "0.13.0" # keep in lockstep with [dependencies] webrtc (rustc 1.75 pin,
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
-users = { version = "0.11" }
+users = { package = "uzers", version = "0.12.2" }
 x11 = "2.21"
 
 # Only takes effect when this crate is built on its own (tests, examples); a consumer's own
