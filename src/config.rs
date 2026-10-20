@@ -578,12 +578,6 @@ impl Config2 {
             .is_some_and(|value| value.as_str() != Some("")))
     }
 
-    pub fn has_legacy_trusted_devices() -> crate::ResultType<bool> {
-        let _lock = CONFIG2.read().unwrap();
-        let config: Self = try_load_path(Self::file())?;
-        Ok(!config.trusted_devices.is_empty())
-    }
-
     fn trusted_devices_v2(&self) -> crate::ResultType<&str> {
         match &self.trusted_devices_v2 {
             None => Ok(""),
