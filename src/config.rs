@@ -598,13 +598,6 @@ impl Config2 {
         store_path(Self::file(), config)
     }
 
-    pub fn without_trusted_devices_v2(self) -> Self {
-        Self {
-            trusted_devices_v2: None,
-            ..self
-        }
-    }
-
     pub fn get() -> Config2 {
         return CONFIG2.read().unwrap().clone();
     }
