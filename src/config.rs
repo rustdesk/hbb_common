@@ -591,11 +591,40 @@ impl Config2 {
     }
 
     pub fn set_trusted_devices_v2(value: String) -> crate::ResultType<()> {
-        let _lock = CONFIG2.write().unwrap();
-        let mut config: Self = try_load_path(Self::file())?;
-        config.trusted_devices_v2 = (!value.is_empty()).then(|| toml::Value::String(value));
-        config.trusted_devices.clear();
-        store_path(Self::file(), config)
+        Self {
+            trusted_devices_v2: (!value.is_empty()).then(|| toml::Value::String(value)),
+            ..Default::default()
+        }
+        .sync_trusted_devices()
+    }
+
+    pub fn sync_trusted_devices(&self) -> crate::ResultType<()> {
+        self.trusted_devices_v2()?;
+        let mut current = CONFIG2.write().unwrap();
+        let mut stored: Self = try_load_path(Self::file())?;
+        if stored.trusted_devices != self.trusted_devices
+            || stored.trusted_devices_v2 != self.trusted_devices_v2
+        {
+            stored.trusted_devices.clone_from(&self.trusted_devices);
+            stored
+                .trusted_devices_v2
+                .clone_from(&self.trusted_devices_v2);
+            store_path(Self::file(), &stored)?;
+        }
+        current.trusted_devices = stored.trusted_devices;
+        current.trusted_devices_v2 = stored.trusted_devices_v2;
+        Ok(())
+    }
+
+    pub fn get_for_sync() -> crate::ResultType<Self> {
+        let current = CONFIG2.read().unwrap();
+        // The login-screen server can share this file with the system service.
+        let stored: Self = try_load_path(Self::file())?;
+        Ok(Self {
+            trusted_devices: stored.trusted_devices,
+            trusted_devices_v2: stored.trusted_devices_v2,
+            ..current.clone()
+        })
     }
 
     pub fn get() -> Config2 {
