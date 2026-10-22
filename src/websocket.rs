@@ -1,7 +1,8 @@
 use crate::{
     config::{
         keys::{OPTION_RELAY_SERVER, OPTION_WEBSOCKET_PORT},
-        use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT,
+        use_ws, Config, Socks5Server, EXE_RENDEZVOUS_SERVER, PROD_RENDEZVOUS_SERVER, RELAY_PORT,
+        RENDEZVOUS_PORT,
     },
     protobuf::Message,
     socket_client::split_host_port,
@@ -514,7 +515,7 @@ pub fn check_ws(endpoint: &str) -> String {
         (format!("{}:{}", endpoint_host, dst_port), false)
     } else {
         let domain_path = if relay { "/ws/relay" } else { "/ws/id" };
-        let port = websocket_port(&endpoint_host, &[&custom_rendezvous_server, &relay_server])
+        let port = websocket_port(&endpoint_host, &relay_server)
             .map(|port| format!(":{}", port))
             .unwrap_or_default();
         (format!("{}{}{}", endpoint_host, port, domain_path), true)
@@ -535,11 +536,18 @@ pub fn check_ws(endpoint: &str) -> String {
 /// Port of the reverse proxy serving `/ws/id` and `/ws/relay` on this client's own servers, for
 /// when it cannot listen on the scheme's default port. Any other host, such as a peer's server or
 /// a relay on another machine, keeps the default port. IP endpoints never get here.
-fn websocket_port(host: &str, own_servers: &[&str]) -> Option<u16> {
+fn websocket_port(host: &str, relay_server: &str) -> Option<u16> {
     let port = Config::get_option(OPTION_WEBSOCKET_PORT);
     if port.is_empty() {
         return None;
     }
+    // Only servers this client is set up with, not the public fallback of get_rendezvous_server().
+    let own_servers = [
+        EXE_RENDEZVOUS_SERVER.read().unwrap().clone(),
+        Config::get_option("custom-rendezvous-server"),
+        PROD_RENDEZVOUS_SERVER.read().unwrap().clone(),
+        relay_server.to_owned(),
+    ];
     let is_own = own_servers.iter().any(|server| {
         split_host_port(server)
             .map(|(h, _)| h)
@@ -773,6 +781,14 @@ mod tests {
         assert_eq!(check_ws("example.com:21116"), "wss://example.com/ws/id");
         assert_eq!(check_ws("example.com:21117"), "wss://example.com/ws/relay");
         assert_eq!(check_ws("127.0.0.1:21116"), "ws://127.0.0.1:21118");
+        // with no rendezvous server set, the public fallback is not one of ours
+        Config::set_option("custom-rendezvous-server".to_string(), "".to_string());
+        let fallback = Config::get_rendezvous_server();
+        let (fallback_host, _) = split_host_port(&fallback).unwrap();
+        assert_eq!(
+            check_ws(&fallback),
+            format!("wss://{}/ws/id", fallback_host)
+        );
         Config::set_options(options);
     }
     // A server-to-client frame is unmasked, so it can be put on the wire by hand: the header alone,
