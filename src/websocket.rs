@@ -1,6 +1,7 @@
 use crate::{
     config::{
-        keys::OPTION_RELAY_SERVER, use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT,
+        keys::{OPTION_RELAY_SERVER, OPTION_WEBSOCKET_PORT},
+        use_ws, Config, Socks5Server, RELAY_PORT, RENDEZVOUS_PORT,
     },
     protobuf::Message,
     socket_client::split_host_port,
@@ -535,7 +536,6 @@ pub fn check_ws(endpoint: &str) -> String {
 /// when it cannot listen on the scheme's default port. Any other host, such as a peer's server or
 /// a relay on another machine, keeps the default port. IP endpoints never get here.
 fn websocket_port(host: &str, own_servers: &[&str]) -> Option<u16> {
-    use crate::config::keys::OPTION_WEBSOCKET_PORT;
     let port = Config::get_option(OPTION_WEBSOCKET_PORT);
     if port.is_empty() {
         return None;
@@ -552,7 +552,13 @@ fn websocket_port(host: &str, own_servers: &[&str]) -> Option<u16> {
     match port.parse::<u16>() {
         Ok(port) if port > 0 => Some(port),
         _ => {
-            log::warn!("Ignoring invalid {}: {}", OPTION_WEBSOCKET_PORT, port);
+            crate::throttled_log!(
+                Duration::from_secs(60),
+                warn,
+                "Ignoring invalid {}: {}",
+                OPTION_WEBSOCKET_PORT,
+                port
+            );
             None
         }
     }
