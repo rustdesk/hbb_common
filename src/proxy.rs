@@ -300,6 +300,10 @@ impl<S: IntoUrl> IntoProxyScheme for S {
                         let try_this = format!("socks5://{}", self.as_str());
                         try_this.into_url()?
                     }
+                    // `localhost:1080` parses as scheme `localhost` without a host.
+                    ProxyError::UrlBadScheme(_) => {
+                        format!("socks5://{}", self.as_str()).into_url()?
+                    }
                     _ => {
                         return Err(e);
                     }
@@ -729,6 +733,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::ProxyScheme;
+
+    #[test]
+    fn host_and_port_without_scheme_use_socks5() {
+        use super::IntoProxyScheme;
+        for proxy in ["127.0.0.1:1080", "localhost:1080"] {
+            assert!(
+                matches!(
+                    proxy.into_proxy_scheme(),
+                    Ok(ProxyScheme::Socks5 { addr, .. }) if addr.port() == 1080
+                ),
+                "{proxy}"
+            );
+        }
+    }
 
     #[test]
     fn http_url_parses_hosts_and_ports() {
