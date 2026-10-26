@@ -1868,6 +1868,7 @@ impl PeerConfig {
     }
 
     pub fn remove(id: &str) {
+        let _lock = PEER_CONFIG_WRITE_LOCK.lock().unwrap();
         fs::remove_file(Self::path(id)).ok();
     }
 
