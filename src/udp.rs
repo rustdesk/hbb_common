@@ -14,6 +14,36 @@ pub enum FramedSocket {
     ProxySocks(Socks5UdpFramed),
 }
 
+#[cfg(test)]
+mod send_recovery_tests {
+    use super::*;
+    use crate::rendezvous_proto::{RegisterPeerResponse, RendezvousMessage};
+
+    #[tokio::test]
+    async fn failed_datagram_does_not_block_the_next_destination() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sender = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let original_address = sender.local_addr();
+        let mut response = RendezvousMessage::new();
+        response.set_register_peer_response(RegisterPeerResponse {
+            request_pk: true,
+            ..Default::default()
+        });
+        let invalid_destination: SocketAddr = "[::1]:9".parse().unwrap();
+        assert!(sender.send(&response, invalid_destination).await.is_err());
+        sender.send(&response, receiver.local_addr().unwrap()).await.unwrap();
+        let mut bytes = [0; 64];
+        let (length, source) = crate::timeout(1000, receiver.recv_from(&mut bytes)).await.unwrap().unwrap();
+        assert_eq!(&bytes[..length], response.write_to_bytes().unwrap());
+        assert_eq!(Some(source), original_address);
+        assert!(sender.send_raw(b"bad destination", invalid_destination).await.is_err());
+        sender.send_raw(b"next datagram", receiver.local_addr().unwrap()).await.unwrap();
+        let (length, source) = crate::timeout(1000, receiver.recv_from(&mut bytes)).await.unwrap().unwrap();
+        assert_eq!(&bytes[..length], b"next datagram");
+        assert_eq!(Some(source), original_address);
+    }
+}
+
 fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, std::io::Error> {
     let socket = match addr {
         SocketAddr::V4(..) => Socket::new(Domain::ipv4(), Type::dgram(), None),
@@ -100,7 +130,7 @@ impl FramedSocket {
         match self {
             Self::Direct(f) => {
                 if let TargetAddr::Ip(addr) = addr {
-                    f.send((send_data, addr)).await?
+                    f.get_ref().send_to(&send_data, addr).await?;
                 }
             }
             Self::ProxySocks(f) => f.send((send_data, addr)).await?,
@@ -120,7 +150,7 @@ impl FramedSocket {
         match self {
             Self::Direct(f) => {
                 if let TargetAddr::Ip(addr) = addr {
-                    f.send((Bytes::from(msg), addr)).await?
+                    f.get_ref().send_to(msg, addr).await?;
                 }
             }
             Self::ProxySocks(f) => f.send((Bytes::from(msg), addr)).await?,
