@@ -19,6 +19,7 @@ mod send_recovery_tests {
     use super::*;
     use crate::rendezvous_proto::{RegisterPeerResponse, RendezvousMessage};
 
+    /// Checks typed and raw UDP recovery after an incompatible destination.
     #[tokio::test]
     async fn failed_datagram_does_not_block_the_next_destination() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -44,6 +45,7 @@ mod send_recovery_tests {
     }
 }
 
+/// Creates and binds a nonblocking UDP socket with optional reuse and receive buffering.
 fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, std::io::Error> {
     let socket = match addr {
         SocketAddr::V4(..) => Socket::new(Domain::ipv4(), Type::dgram(), None),
@@ -119,6 +121,7 @@ impl FramedSocket {
         Ok(Self::ProxySocks(framed))
     }
 
+    /// Sends a serialized message through the selected UDP transport.
     #[inline]
     pub async fn send(
         &mut self,
@@ -139,6 +142,7 @@ impl FramedSocket {
     }
 
     // https://stackoverflow.com/a/68733302/1926020
+    /// Sends raw bytes through the selected relay or UDP transport.
     #[inline]
     pub async fn send_raw(
         &mut self,
