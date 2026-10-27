@@ -194,6 +194,7 @@ static FINGERPRINTING_INFO: OnceLock<FingerprintingInfo> = OnceLock::new();
 static CACHED_FINGERPRINTS: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
 
 impl FingerprintingInfo {
+    /// Collects the system and configured identity attributes used for fingerprinting.
     fn new() -> Self {
         let mut sys = System::new();
         sys.refresh_cpu();
@@ -241,10 +242,12 @@ impl FingerprintingInfo {
     }
 }
 
+/// Returns a clone of the lazily initialized fingerprinting information.
 pub fn get_fingerprinting_info() -> FingerprintingInfo {
     FINGERPRINTING_INFO.get_or_init(FingerprintingInfo::new).clone()
 }
 
+/// Returns a cached fingerprint for the selected system-information fields.
 pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -> Vec<u8> {
     let all_parameters = vec![
         "eol".to_string(),
@@ -339,6 +342,7 @@ impl Sha512Hasher {
     }
 }
 
+/// Hashes the selected fingerprinting fields into a fingerprint.
 fn calculate_fingerprint(parameters: &[String]) -> Vec<u8> {
     let info = get_fingerprinting_info();
 
@@ -370,6 +374,7 @@ fn calculate_fingerprint(parameters: &[String]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Checks fingerprint cache reads and inserts across concurrent threads.
     #[test]
     fn parallel_cache_reads_and_inserts_preserve_fingerprints() {
         // Avoid reading or creating a real user's configuration in this test.
