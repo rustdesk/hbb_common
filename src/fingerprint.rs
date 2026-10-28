@@ -1,8 +1,7 @@
 use serde_derive::{Deserialize, Serialize};
 use sha2::digest::Update;
 use sha2::{Digest, Sha512};
-use std::collections::HashMap;
-use std::sync::Once;
+use std::sync::OnceLock;
 use sysinfo::System;
 
 const TABLE: [u8; 256] = [
@@ -190,11 +189,10 @@ pub struct FingerprintingInfo {
     addr: String,
 }
 
-static mut FINGERPRINTING_INFO: Option<FingerprintingInfo> = None;
-static INIT: Once = Once::new();
-static mut CACHED_FINGERPRINTS: Option<HashMap<String, Vec<u8>>> = None;
+static FINGERPRINTING_INFO: OnceLock<FingerprintingInfo> = OnceLock::new();
 
 impl FingerprintingInfo {
+    /// Collects the system and configured identity attributes used for fingerprinting.
     fn new() -> Self {
         let mut sys = System::new();
         sys.refresh_cpu();
@@ -242,17 +240,12 @@ impl FingerprintingInfo {
     }
 }
 
+/// Returns a clone of the lazily initialized fingerprinting information.
 pub fn get_fingerprinting_info() -> FingerprintingInfo {
-    unsafe {
-        INIT.call_once(|| {
-            FINGERPRINTING_INFO = Some(FingerprintingInfo::new());
-            CACHED_FINGERPRINTS = Some(HashMap::new());
-        });
-        #[allow(static_mut_refs)]
-        FINGERPRINTING_INFO.clone().unwrap_or_default()
-    }
+    FINGERPRINTING_INFO.get_or_init(FingerprintingInfo::new).clone()
 }
 
+/// Calculates a fingerprint for the selected system-information fields.
 pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -> Vec<u8> {
     let all_parameters = vec![
         "eol".to_string(),
@@ -277,22 +270,7 @@ pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -
         (None, None) => all_parameters,
     };
 
-    let cache_key = parameters.join("");
-
-    unsafe {
-        #[allow(static_mut_refs)]
-        if let Some(cache) = &mut CACHED_FINGERPRINTS {
-            if let Some(fingerprint) = cache.get(&cache_key) {
-                return fingerprint.clone();
-            }
-
-            let fingerprint = calculate_fingerprint(&parameters);
-            cache.insert(cache_key, fingerprint.clone());
-            fingerprint
-        } else {
-            calculate_fingerprint(&parameters)
-        }
-    }
+    calculate_fingerprint(&parameters)
 }
 
 struct Sha512Hasher {
@@ -353,6 +331,7 @@ impl Sha512Hasher {
     }
 }
 
+/// Hashes the selected fingerprinting fields into a fingerprint.
 fn calculate_fingerprint(parameters: &[String]) -> Vec<u8> {
     let info = get_fingerprinting_info();
 
@@ -378,4 +357,35 @@ fn calculate_fingerprint(parameters: &[String]) -> Vec<u8> {
         .join("");
     hasher.update(fingerprint_string.as_bytes());
     hasher.finalize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Checks fingerprint calculation across concurrent threads.
+    #[test]
+    fn parallel_calculations_preserve_fingerprints() {
+        // Avoid reading or creating a real user's configuration in this test.
+        let _ = FINGERPRINTING_INFO.set(FingerprintingInfo {
+            platform: "test-platform".to_owned(), arch: "test-arch".to_owned(),
+            ..Default::default()
+        });
+        let jobs: Vec<_> = (0..16).map(|thread| std::thread::spawn(move || {
+            for iteration in 0..128 {
+                let parameters = if (thread + iteration) % 2 == 0 {
+                    vec!["platform".to_owned()]
+                } else { vec!["platform".to_owned(), "arch".to_owned()] };
+                let expected = calculate_fingerprint(&parameters);
+                assert_eq!(get_fingerprint(Some(parameters), None), expected);
+            }
+        })).collect();
+        for job in jobs { job.join().unwrap(); }
+        // These lists used to have the same concatenated cache key.
+        let joined = vec!["platformarch".to_owned()];
+        let separate = vec!["platform".to_owned(), "arch".to_owned()];
+        assert_eq!(get_fingerprint(Some(joined.clone()), None), calculate_fingerprint(&joined));
+        assert_eq!(get_fingerprint(Some(separate.clone()), None), calculate_fingerprint(&separate));
+        assert_ne!(get_fingerprint(Some(joined), None), get_fingerprint(Some(separate), None));
+    }
 }
