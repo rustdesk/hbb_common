@@ -1,8 +1,7 @@
 use serde_derive::{Deserialize, Serialize};
 use sha2::digest::Update;
 use sha2::{Digest, Sha512};
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use sysinfo::System;
 
 const TABLE: [u8; 256] = [
@@ -191,7 +190,6 @@ pub struct FingerprintingInfo {
 }
 
 static FINGERPRINTING_INFO: OnceLock<FingerprintingInfo> = OnceLock::new();
-static CACHED_FINGERPRINTS: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
 
 impl FingerprintingInfo {
     /// Collects the system and configured identity attributes used for fingerprinting.
@@ -247,7 +245,7 @@ pub fn get_fingerprinting_info() -> FingerprintingInfo {
     FINGERPRINTING_INFO.get_or_init(FingerprintingInfo::new).clone()
 }
 
-/// Returns a cached fingerprint for the selected system-information fields.
+/// Calculates a fingerprint for the selected system-information fields.
 pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -> Vec<u8> {
     let all_parameters = vec![
         "eol".to_string(),
@@ -272,16 +270,7 @@ pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -
         (None, None) => all_parameters,
     };
 
-    let cache_key = parameters.join("");
-
-    let mut cache = CACHED_FINGERPRINTS.get_or_init(Default::default)
-        .lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(fingerprint) = cache.get(&cache_key) {
-        return fingerprint.clone();
-    }
-    let fingerprint = calculate_fingerprint(&parameters);
-    cache.insert(cache_key, fingerprint.clone());
-    fingerprint
+    calculate_fingerprint(&parameters)
 }
 
 struct Sha512Hasher {
@@ -374,9 +363,9 @@ fn calculate_fingerprint(parameters: &[String]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// Checks fingerprint cache reads and inserts across concurrent threads.
+    /// Checks fingerprint calculation across concurrent threads.
     #[test]
-    fn parallel_cache_reads_and_inserts_preserve_fingerprints() {
+    fn parallel_calculations_preserve_fingerprints() {
         // Avoid reading or creating a real user's configuration in this test.
         let _ = FINGERPRINTING_INFO.set(FingerprintingInfo {
             platform: "test-platform".to_owned(), arch: "test-arch".to_owned(),
@@ -392,5 +381,11 @@ mod tests {
             }
         })).collect();
         for job in jobs { job.join().unwrap(); }
+        // These lists used to have the same concatenated cache key.
+        let joined = vec!["platformarch".to_owned()];
+        let separate = vec!["platform".to_owned(), "arch".to_owned()];
+        assert_eq!(get_fingerprint(Some(joined.clone()), None), calculate_fingerprint(&joined));
+        assert_eq!(get_fingerprint(Some(separate.clone()), None), calculate_fingerprint(&separate));
+        assert_ne!(get_fingerprint(Some(joined), None), get_fingerprint(Some(separate), None));
     }
 }
