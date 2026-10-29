@@ -71,7 +71,7 @@ pub use async_recursion;
 #[cfg(target_os = "linux")]
 pub use users;
 pub use libloading;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use x11;
 
 pub type SessionID = uuid::Uuid;
