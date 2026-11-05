@@ -481,6 +481,16 @@ impl ClientSeal {
         }
     }
 
+    /// Whether hellos are signed by the device key whose public half is `pk`.
+    pub fn signs_as(&self, pk: &[u8]) -> bool {
+        self.device.as_ref().is_some_and(|sk| sk.0[32..] == *pk)
+    }
+
+    /// The device key changed: later hellos are signed by `device`. The session stays.
+    pub fn set_device(&mut self, device: Option<sign::SecretKey>) {
+        self.device = device;
+    }
+
     /// Forgets the session, so the next datagram is a hello.
     pub fn reset(&mut self) {
         self.hello = None;
@@ -836,6 +846,20 @@ mod tests {
             .map(|(x, y)| x ^ y)
             .collect();
         assert_ne!(sealed, keys);
+    }
+
+    #[test]
+    fn a_new_device_key_signs_the_hellos_after_it() {
+        let (pk, sk) = sign::gen_keypair();
+        let server = ServerKey::new(&sk, [7u8; 32]).unwrap();
+        let (old_pk, old_sk) = sign::gen_keypair();
+        let (new_pk, new_sk) = sign::gen_keypair();
+        let mut client = ClientSeal::new(&pk, Some(old_sk)).unwrap();
+        assert!(client.signs_as(old_pk.as_ref()) && !client.signs_as(new_pk.as_ref()));
+        client.set_device(Some(new_sk));
+        let (opened, _) = server.open(&client.seal(b"r").unwrap(), || 1).unwrap();
+        assert!(opened.signed_by(new_pk.as_ref()).is_some());
+        assert!(opened.signed_by(old_pk.as_ref()).is_none());
     }
 
     #[test]
