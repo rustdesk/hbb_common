@@ -5,6 +5,7 @@ use futures::{SinkExt, StreamExt};
 use protobuf::Message;
 use sodiumoxide::crypto::{
     box_,
+    generichash,
     secretbox::{self, Key, Nonce},
 };
 use std::{
@@ -21,11 +22,30 @@ use tokio::{
 use tokio_socks::IntoTargetAddr;
 use tokio_util::codec::Framed;
 
+pub const KX_VERSION_LATEST: u32 = 1;
+pub const KX_PARAMS_DOMAIN: &[u8] = b"rdkx-params";
+const KX_SPLIT_CONTEXT: &[u8] = b"rdkx-spl";
+const KX_SPLIT_INITIATOR: u8 = 1;
+const KX_SPLIT_RESPONDER: u8 = 2;
+
+/// What both sides saw during the key exchange, each from its own side of the wire, mixed
+/// into the split keys.
+pub struct KxTranscript<'a> {
+    /// The ephemeral public key of the side that sent the sealed key.
+    pub initiator_pk: &'a [u8],
+    /// The ephemeral public key the sealed key was sealed to.
+    pub responder_pk: &'a [u8],
+    /// The version the responder advertised: what it sent, what the initiator received.
+    pub advertised: u32,
+    /// The version the initiator picked.
+    pub picked: u32,
+}
+
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub(crate) Box<dyn TcpStreamTrait + Send + Sync>);
 
 #[derive(Clone)]
-pub struct Encrypt(Key, u64, u64);
+pub struct Encrypt(Key, u64, u64, Option<Key>);
 
 pub struct FramedStream(
     pub(crate) Framed<DynTcpStream, BytesCodec>,
@@ -295,7 +315,43 @@ impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
-        Self(key, 0, 0)
+        Self(key, 0, 0, None)
+    }
+
+    /// Version 1: the initiator, the side that sent the sealed key, sends under one subkey and
+    /// receives under the other; the responder the reverse.
+    pub fn new_split(key: Key, is_initiator: bool, t: &KxTranscript) -> ResultType<Self> {
+        let initiator = Self::derive_subkey(&key, KX_SPLIT_INITIATOR, t)?;
+        let responder = Self::derive_subkey(&key, KX_SPLIT_RESPONDER, t)?;
+        Ok(if is_initiator {
+            Self(initiator, 0, 0, Some(responder))
+        } else {
+            Self(responder, 0, 0, Some(initiator))
+        })
+    }
+
+    fn derive_subkey(key: &Key, direction: u8, t: &KxTranscript) -> ResultType<Key> {
+        if t.initiator_pk.len() != box_::PUBLICKEYBYTES
+            || t.responder_pk.len() != box_::PUBLICKEYBYTES
+        {
+            bail!("key exchange transcript has a public key of the wrong length");
+        }
+        let failed = |_| crate::anyhow::anyhow!("key derivation failed");
+        let mut h =
+            generichash::State::new(Some(secretbox::KEYBYTES), Some(&key.0)).map_err(failed)?;
+        for part in [
+            KX_SPLIT_CONTEXT,
+            &[direction],
+            &t.advertised.to_le_bytes(),
+            &t.picked.to_le_bytes(),
+            t.initiator_pk,
+            t.responder_pk,
+        ] {
+            h.update(part).map_err(failed)?;
+        }
+        let mut subkey = [0u8; secretbox::KEYBYTES];
+        subkey.copy_from_slice(h.finalize().map_err(failed)?.as_ref());
+        Ok(Key(subkey))
     }
 
     pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {
@@ -304,7 +360,7 @@ impl Encrypt {
         }
         self.2 += 1;
         let nonce = FramedStream::get_nonce(self.2);
-        match secretbox::open(bytes, &nonce, &self.0) {
+        match secretbox::open(bytes, &nonce, self.3.as_ref().unwrap_or(&self.0)) {
             Ok(res) => {
                 bytes.clear();
                 bytes.put_slice(&res);
@@ -340,5 +396,92 @@ impl Encrypt {
         let mut key = [0u8; secretbox::KEYBYTES];
         key[..].copy_from_slice(&symmetric_key);
         Ok(Key(key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transcript<'a>(initiator_pk: &'a [u8], responder_pk: &'a [u8]) -> KxTranscript<'a> {
+        KxTranscript {
+            initiator_pk,
+            responder_pk,
+            advertised: KX_VERSION_LATEST,
+            picked: 1,
+        }
+    }
+
+    fn split(key: &Key, is_initiator: bool, t: &KxTranscript) -> Encrypt {
+        Encrypt::new_split(key.clone(), is_initiator, t).expect("split keys")
+    }
+
+    #[test]
+    fn split_keys_pair_the_directions() {
+        let key = Key([7u8; secretbox::KEYBYTES]);
+        let initiator_pk = [1u8; box_::PUBLICKEYBYTES];
+        let responder_pk = [2u8; box_::PUBLICKEYBYTES];
+        let t = transcript(&initiator_pk, &responder_pk);
+        let client = split(&key, true, &t);
+        let server = split(&key, false, &t);
+        // what the initiator sends under is what the responder reads with, and vice versa
+        assert_eq!(client.0 .0, server.3.as_ref().expect("responder recv").0);
+        assert_eq!(server.0 .0, client.3.as_ref().expect("initiator recv").0);
+        // neither subkey is the exchanged key itself, nor each other
+        assert_ne!(client.0 .0, key.0);
+        assert_ne!(server.0 .0, key.0);
+        assert_ne!(client.0 .0, server.0 .0);
+    }
+
+    #[test]
+    fn split_roundtrip() {
+        let key = Key([9u8; secretbox::KEYBYTES]);
+        let initiator_pk = [3u8; box_::PUBLICKEYBYTES];
+        let responder_pk = [4u8; box_::PUBLICKEYBYTES];
+        let t = transcript(&initiator_pk, &responder_pk);
+        let mut client = split(&key, true, &t);
+        let mut server = split(&key, false, &t);
+        let sealed = client.enc(b"hello kx v1");
+        let mut buf = BytesMut::from(&sealed[..]);
+        server.dec(&mut buf).expect("decrypt v1");
+        assert_eq!(&buf[..], b"hello kx v1");
+    }
+
+    #[test]
+    fn v0_uses_one_key_for_both_directions() {
+        let key = Key([5u8; secretbox::KEYBYTES]);
+        let mut client = Encrypt::new(key.clone());
+        let mut server = Encrypt::new(key);
+        assert!(client.3.is_none());
+        let sealed = client.enc(b"v0 payload");
+        let mut buf = BytesMut::from(&sealed[..]);
+        server.dec(&mut buf).expect("decrypt v0");
+        assert_eq!(&buf[..], b"v0 payload");
+    }
+
+    #[test]
+    fn decode_unseals_the_client_key() {
+        let (our_pk, our_sk) = box_::gen_keypair();
+        let (their_pk, their_sk) = box_::gen_keypair();
+        let symmetric = secretbox::gen_key();
+        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+        let sealed = box_::seal(&symmetric.0, &nonce, &our_pk, &their_sk);
+        let key = Encrypt::decode(&sealed, &their_pk.0, &our_sk).expect("decode");
+        assert_eq!(key.0, symmetric.0);
+    }
+
+    #[test]
+    fn decode_rejects_a_wrong_public_key_length() {
+        let (_our_pk, our_sk) = box_::gen_keypair();
+        assert!(Encrypt::decode(&[0u8; 8], &[0u8; 8], &our_sk).is_err());
+    }
+
+    #[test]
+    fn split_rejects_a_truncated_transcript() {
+        let key = Key([1u8; secretbox::KEYBYTES]);
+        let short = [0u8; 8];
+        let long = [2u8; box_::PUBLICKEYBYTES];
+        let t = transcript(&short, &long);
+        assert!(Encrypt::new_split(key, true, &t).is_err());
     }
 }
