@@ -2,18 +2,21 @@
 //! handshake to lose or reorder.
 //!
 //! A client with no session sends a hello: an HPKE (RFC 9180) base-mode single shot to the
-//! server's X25519 key, which is its signing key converted, so a client that trusts the server
-//! key trusts this one. A hello carries a signature by the device key the server keeps on record
-//! for the ID, which is how the server tells the device from anyone else sending under its ID.
-//! The server answers with a welcome sealed under a key exported from that HPKE context and a
-//! fresh nonce, the way Oblivious HTTP (RFC 9458) answers a request, and the welcome hands the
-//! client a session key. The server derives that key from a process secret and the key id, the
-//! way PSP derives receive keys from the SPI, so it stores no key per client. Every later
-//! datagram in either direction is data: the key id, a packet number and an AEAD under the
-//! session key's subkey for that direction.
+//! server's X25519 key, which is its signing key converted (a joint use IACR ePrint 2021/509
+//! analyses), so a client that trusts the server key trusts this one. A hello carries a signature
+//! by the device key the server keeps on record for the ID, which is how the server tells the
+//! device from anyone else sending under its ID. The server answers with a welcome sealed under a
+//! key exported from that HPKE context and a fresh nonce, the way Oblivious HTTP answers a request
+//! (RFC 9458 §4.4), and the welcome hands the client a session key. The server derives that key
+//! from a process secret and the key id, the way PSP derives receive keys from the SPI, so it
+//! stores no key per client. Every later datagram in either direction is data: the key id, a
+//! packet number and an AEAD under the session key's subkey for that direction. A sender never
+//! repeats a packet number under a key (RFC 8439 §4), and a receiver checks it against a window
+//! of the latest 1024 (RFC 4303 §3.4.3, kept as the bit ring of RFC 6479).
 //!
 //! Every datagram starts with `MAGIC`, whose zero byte is a protobuf field number no message
-//! can have, so a build without this module fails to parse one and drops it.
+//! can have, so a build without this module fails to parse one and drops it: the first-byte split
+//! RFC 9443 makes between QUIC, DTLS and STUN on one port.
 
 use sodiumoxide::{
     crypto::{
@@ -119,6 +122,7 @@ fn labeled_expand(prk: &[u8; 32], suite: &[u8], label: &[u8], info: &[u8], len: 
     )
 }
 
+/// Keyed BLAKE2b (RFC 7693) as the PRF the session and direction keys come from.
 fn blake(key: &[u8], parts: &[&[u8]]) -> Option<[u8; 32]> {
     let mut state = generichash::State::new(Some(32), Some(key)).ok()?;
     for part in parts {
