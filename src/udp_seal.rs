@@ -49,6 +49,8 @@ const KEY: usize = 32;
 const NONCE: usize = 32;
 const TS: usize = 8;
 const SIG: usize = 64;
+/// The shortest hello: unsigned, with no payload.
+const MIN_HELLO: usize = HDR + ENC + 1 + aead::TAGBYTES;
 
 const KEM_SUITE: &[u8] = b"KEM\x00\x20";
 const HPKE_SUITE: &[u8] = b"HPKE\x00\x20\x00\x01\x00\x03";
@@ -66,7 +68,7 @@ pub fn is_sealed(datagram: &[u8]) -> bool {
 
 /// Whether a datagram is a hello, the one kind that costs the server an X25519.
 pub fn is_hello(datagram: &[u8]) -> bool {
-    kind(datagram) == Some(KIND_HELLO)
+    kind(datagram) == Some(KIND_HELLO) && datagram.len() >= MIN_HELLO
 }
 
 fn kind(datagram: &[u8]) -> Option<u8> {
@@ -353,7 +355,7 @@ impl ServerKey {
         new_key_id: impl FnOnce() -> u64,
     ) -> Option<(Opened, Reply)> {
         match kind(datagram)? {
-            KIND_HELLO => {
+            KIND_HELLO if is_hello(datagram) => {
                 let enc = array(datagram.get(HDR..HDR + ENC)?)?;
                 let hpke = Hpke::new(&dh(&self.sk, &enc)?, &enc, &self.pk, &hello_info());
                 let plain = open_aead(&hpke.key, hpke.nonce, &[], &datagram[HDR + ENC..])?;
@@ -796,6 +798,20 @@ mod tests {
         for d in [hello, welcome, up, down] {
             assert!(crate::rendezvous_proto::RendezvousMessage::parse_from_bytes(&d).is_err());
         }
+    }
+
+    #[test]
+    fn a_datagram_shorter_than_any_hello_is_not_taken_for_one() {
+        let (pk, sk) = sign::gen_keypair();
+        let server = ServerKey::new(&sk, [7u8; 32]).unwrap();
+        let shortest = ClientSeal::new(&pk, None).unwrap().seal(b"").unwrap();
+        assert!(is_hello(&shortest) && server.open(&shortest, || 1).is_some());
+        let short = &shortest[..shortest.len() - 1];
+        assert!(
+            !is_hello(short),
+            "the server would charge its hello budget for it"
+        );
+        assert!(server.open(short, || unreachable!()).is_none());
     }
 
     #[test]
