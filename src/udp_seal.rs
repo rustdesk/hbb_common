@@ -232,11 +232,14 @@ fn open_data(session: &[u8; 32], kind: u8, datagram: &[u8]) -> Option<(u64, Vec<
     open_aead(&key, pn_nonce(pn), ad, &datagram[HDR + ID + PN..]).map(|payload| (pn, payload))
 }
 
-/// The packet numbers a receiver has accepted under one key: the highest and the 63 below it.
+const WINDOW: u64 = 1024;
+
+/// The packet numbers a receiver has accepted under one key: the highest and the 1023 below it,
+/// one bit each in a ring indexed by the number.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReplayWindow {
     top: u64,
-    bits: u64,
+    bits: [u64; WINDOW as usize / 64],
 }
 
 impl ReplayWindow {
@@ -247,21 +250,32 @@ impl ReplayWindow {
             None => return false,
         };
         if n > self.top {
-            let shift = n - self.top;
-            self.bits = if shift >= 64 {
-                1
+            if n - self.top >= WINDOW {
+                self.bits = Default::default();
             } else {
-                (self.bits << shift) | 1
-            };
+                for m in self.top + 1..n {
+                    self.set(m, false);
+                }
+            }
             self.top = n;
-            return true;
-        }
-        let back = self.top - n;
-        if back >= 64 || (self.bits >> back) & 1 == 1 {
+        } else if self.top - n >= WINDOW || self.get(n) {
             return false;
         }
-        self.bits |= 1 << back;
+        self.set(n, true);
         true
+    }
+
+    fn get(&self, n: u64) -> bool {
+        self.bits[(n % WINDOW / 64) as usize] >> (n % 64) & 1 == 1
+    }
+
+    fn set(&mut self, n: u64, seen: bool) {
+        let word = &mut self.bits[(n % WINDOW / 64) as usize];
+        if seen {
+            *word |= 1 << (n % 64);
+        } else {
+            *word &= !(1 << (n % 64));
+        }
     }
 }
 
@@ -819,11 +833,15 @@ mod tests {
     }
 
     #[test]
-    fn the_replay_window_keeps_64_numbers() {
+    fn the_replay_window_keeps_1024_numbers() {
         let mut w = ReplayWindow::default();
         assert!(w.accept(0) && !w.accept(0));
-        assert!(w.accept(100) && w.accept(37) && !w.accept(37) && !w.accept(36));
-        assert!(w.accept(99) && !w.accept(100) && !w.accept(u64::MAX));
+        assert!(w.accept(2000) && w.accept(977) && !w.accept(977) && !w.accept(976));
+        assert!(w.accept(1999) && !w.accept(2000) && !w.accept(u64::MAX));
+        assert!(
+            w.accept(3000) && w.accept(2001) && !w.accept(2001),
+            "a number the window moved past does not shadow one 1024 above it"
+        );
     }
 
     // A restart starts the key ids over, so a hello replayed into the same slot gets the same
