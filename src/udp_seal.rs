@@ -463,6 +463,9 @@ pub struct ClientSeal {
     last_ts: u64,
     hello: Option<Hello>,
     session: Option<Session>,
+    /// The session a welcome replaced, still opened until the new one is: the server pushes
+    /// under it until it sees the new one used (key confirmation, as WireGuard's `next_keypair`).
+    previous: Option<Session>,
 }
 
 impl ClientSeal {
@@ -474,6 +477,7 @@ impl ClientSeal {
             last_ts: 0,
             hello: None,
             session: None,
+            previous: None,
         })
     }
 
@@ -515,6 +519,7 @@ impl ClientSeal {
     pub fn reset(&mut self) {
         self.hello = None;
         self.session = None;
+        self.previous = None;
     }
 
     /// Data under the session, or else a fresh hello, which replaces any hello still unanswered.
@@ -580,6 +585,7 @@ impl ClientSeal {
                 if plain.len() < 1 + KEY {
                     return None;
                 }
+                self.previous = self.session.take();
                 self.session = Some(Session {
                     key_id: key_id_of(datagram)?,
                     key: array(&plain[1..1 + KEY])?,
@@ -592,16 +598,21 @@ impl ClientSeal {
                 Some(plain[1 + KEY..].to_vec())
             }
             KIND_TO_CLIENT => {
-                let s = self.session.as_mut()?;
-                if key_id_of(datagram)? != s.key_id {
+                let key_id = key_id_of(datagram)?;
+                let current = self.session.as_ref()?.key_id == key_id;
+                let s = if current {
+                    self.session.as_mut()?
+                } else {
+                    self.previous.as_mut().filter(|p| p.key_id == key_id)?
+                };
+                let (pn, payload) = open_data(&s.key, KIND_TO_CLIENT, datagram)?;
+                if !s.window.accept(pn) {
                     return None;
                 }
-                let (pn, payload) = open_data(&s.key, KIND_TO_CLIENT, datagram)?;
-                if s.window.accept(pn) {
-                    Some(payload)
-                } else {
-                    None
+                if current {
+                    self.previous = None;
                 }
+                Some(payload)
             }
             _ => None,
         }
@@ -849,6 +860,34 @@ mod tests {
         assert!(
             client.open(&current).is_none(),
             "a duplicate welcome does not restart the session"
+        );
+    }
+
+    #[test]
+    fn a_push_under_the_session_a_welcome_replaced_still_opens() {
+        let (pk, sk) = sign::gen_keypair();
+        let server = ServerKey::new(&sk, [7u8; 32]).unwrap();
+        let mut client = ClientSeal::new(&pk, None).unwrap();
+        for key_id in [1, 2] {
+            let hello = client.hello(b"").unwrap();
+            let (_, mut reply) = server.open(&hello, || key_id).unwrap();
+            let welcome = server
+                .seal(&mut reply, CAP_PUSHES_SEALED, b"", || 0)
+                .unwrap();
+            assert!(client.open(&welcome).is_some());
+        }
+        let push = |key_id, pn| {
+            let payload = [key_id as u8, pn as u8];
+            server.seal(&mut Reply::push(key_id), CAP_PUSHES_SEALED, &payload, || pn)
+        };
+        assert!(
+            client.open(&push(1, 5).unwrap()).is_some(),
+            "the server pushes under the old key until it sees the new one used"
+        );
+        assert!(client.open(&push(2, 6).unwrap()).is_some());
+        assert!(
+            client.open(&push(1, 7).unwrap()).is_none(),
+            "the new session opened, so the old one is gone"
         );
     }
 
