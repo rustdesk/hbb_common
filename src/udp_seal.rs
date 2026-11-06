@@ -504,6 +504,11 @@ impl ClientSeal {
             s.next_pn += 1;
             return seal_data(&s.key, KIND_TO_SERVER, s.key_id, pn, payload);
         }
+        self.hello(payload)
+    }
+
+    /// A fresh hello even under a session, which stays in use until the welcome replaces it.
+    pub fn hello(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
