@@ -7,7 +7,10 @@
 //! by the device key the server keeps on record for the ID, which is how the server tells the
 //! device from anyone else sending under its ID. The server answers with a welcome sealed under a
 //! key exported from that HPKE context and a fresh nonce, the way Oblivious HTTP answers a request
-//! (RFC 9458 §4.4), and the welcome hands the client a session key. The server derives that key
+//! (RFC 9458 §4.4), and the welcome hands the client a session key. The welcome also carries a
+//! fresh server ephemeral whose DH with the hello's is mixed into its key, Noise NK's `← e, ee`,
+//! so a server key taken later opens no recorded welcome, nor the session after it; the hello,
+//! like WireGuard's first message, stays readable to it. The server derives the session key
 //! from a process secret and the key id, the way PSP derives receive keys from the SPI, so it
 //! stores no key per client. Every later datagram in either direction is data: the key id, a
 //! packet number and an AEAD under the session key's subkey for that direction. A sender never
@@ -203,6 +206,12 @@ fn welcome_keys(secret: &[u8; 32], enc: &[u8; 32], nonce: &[u8]) -> ([u8; 32], [
     let mut aead_nonce = [0u8; 12];
     aead_nonce.copy_from_slice(&hmac(&prk, &[b"nonce", &[1]])[..12]);
     (hmac(&prk, &[b"key", &[1]]), aead_nonce)
+}
+
+// Noise's MixKey, an HKDF-Extract salted with the secret so far, folds in the DH of the two
+// ephemerals.
+fn mix(secret: &[u8; 32], dh: &[u8; 32]) -> [u8; 32] {
+    hmac(secret, &[dh])
 }
 
 fn session_key(master: &[u8; 32], key_id: u64) -> Option<[u8; 32]> {
@@ -427,10 +436,14 @@ impl ServerKey {
             Some(welcome) => {
                 let mut nonce = [0u8; NONCE];
                 randombytes_into(&mut nonce);
+                let mut ephemeral = [0u8; 32];
+                randombytes_into(&mut ephemeral);
+                let secret = mix(&welcome.secret, &dh(&ephemeral, &welcome.enc)?);
                 let mut out = header(KIND_WELCOME).to_vec();
                 out.extend_from_slice(&reply.key_id.to_be_bytes());
                 out.extend_from_slice(&nonce);
-                let (key, aead_nonce) = welcome_keys(&welcome.secret, &welcome.enc, &nonce);
+                out.extend_from_slice(&x25519::scalarmult_base(&x25519::Scalar(ephemeral)).0);
+                let (key, aead_nonce) = welcome_keys(&secret, &welcome.enc, &nonce);
                 let plain = [&[caps][..], &session, payload].concat();
                 let sealed = seal_aead(&key, aead_nonce, &out, &plain);
                 out.extend_from_slice(&sealed);
@@ -442,6 +455,8 @@ impl ServerKey {
 }
 
 struct Hello {
+    /// The ephemeral behind `enc`, kept for the welcome's DH.
+    sk: [u8; 32],
     enc: [u8; 32],
     hpke: Hpke,
     signed: bool,
@@ -563,6 +578,7 @@ impl ClientSeal {
         out.extend_from_slice(&enc);
         out.extend_from_slice(&seal_aead(&hpke.key, hpke.nonce, &[], &plain));
         self.hello = Some(Hello {
+            sk,
             enc,
             hpke,
             signed: self.device.is_some() && !payload.is_empty(),
@@ -575,13 +591,15 @@ impl ClientSeal {
         match kind(datagram)? {
             KIND_WELCOME => {
                 let hello = self.hello.as_ref()?;
-                let ad = datagram.get(..HDR + ID + NONCE)?;
-                let (key, nonce) = welcome_keys(
+                let ad = datagram.get(..HDR + ID + NONCE + ENC)?;
+                let ephemeral = array(&ad[HDR + ID + NONCE..])?;
+                let secret = mix(
                     &hello.hpke.export(WELCOME_EXPORT),
-                    &hello.enc,
-                    &ad[HDR + ID..],
+                    &dh(&hello.sk, &ephemeral)?,
                 );
-                let plain = open_aead(&key, nonce, ad, &datagram[HDR + ID + NONCE..])?;
+                let (key, nonce) =
+                    welcome_keys(&secret, &hello.enc, &ad[HDR + ID..HDR + ID + NONCE]);
+                let plain = open_aead(&key, nonce, ad, &datagram[HDR + ID + NONCE + ENC..])?;
                 if plain.len() < 1 + KEY {
                     return None;
                 }
@@ -921,13 +939,37 @@ mod tests {
             .zip(&session_key(&[2u8; 32], 1).unwrap())
             .map(|(x, y)| x ^ y)
             .collect();
-        let start = HDR + ID + NONCE + 1;
+        let start = HDR + ID + NONCE + ENC + 1;
         let sealed: Vec<u8> = a[start..start + KEY]
             .iter()
             .zip(&b[start..start + KEY])
             .map(|(x, y)| x ^ y)
             .collect();
         assert_ne!(sealed, keys);
+    }
+
+    // Whoever later takes the server's key redoes a recorded hello's HPKE, as the server did, but
+    // the welcome also needs a secret both ephemerals made and then dropped.
+    #[test]
+    fn a_recorded_welcome_does_not_open_with_the_server_key_alone() {
+        let (pk, sk) = sign::gen_keypair();
+        let server = ServerKey::new(&sk, [7u8; 32]).unwrap();
+        let mut client = ClientSeal::new(&pk, None).unwrap();
+        let hello = client.seal(b"r").unwrap();
+        let (_, mut reply) = server.open(&hello, || 1).unwrap();
+        let welcome = server.seal(&mut reply, 0, b"", || unreachable!()).unwrap();
+        let enc: [u8; 32] = array(&hello[HDR..HDR + ENC]).unwrap();
+        let hpke = Hpke::new(
+            &dh(&server.sk, &enc).unwrap(),
+            &enc,
+            &server.pk,
+            &hello_info(),
+        );
+        let nonce = &welcome[HDR + ID..HDR + ID + NONCE];
+        let (key, aead_nonce) = welcome_keys(&hpke.export(WELCOME_EXPORT), &enc, nonce);
+        let head = welcome.len() - (1 + KEY + aead::TAGBYTES);
+        assert!(open_aead(&key, aead_nonce, &welcome[..head], &welcome[head..]).is_none());
+        assert!(client.open(&welcome).is_some());
     }
 
     #[test]
