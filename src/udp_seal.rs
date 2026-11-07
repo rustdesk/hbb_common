@@ -17,6 +17,11 @@
 //! repeats a packet number under a key (RFC 8439 §4), and a receiver checks it against a window
 //! of the latest 1024 (RFC 4303 §3.4.3, kept as the bit ring of RFC 6479).
 //!
+//! A server past its hello budget answers a hello with a cookie instead, a MAC of the client's
+//! address, and takes that hello again with the cookie attached, which proves the address can
+//! receive: WireGuard's cookie reply under load, QUIC's Retry (RFC 9000 §8.1.2). A flood from
+//! forged addresses then cannot keep a client from its welcome, nor make it give up on sealing.
+//!
 //! Every datagram starts with `MAGIC`, whose zero byte is a protobuf field number no message
 //! can have, so a build without this module fails to parse one and drops it: the first-byte split
 //! RFC 9443 makes between QUIC, DTLS and STUN on one port.
@@ -28,7 +33,7 @@ use sodiumoxide::{
     },
     randombytes::randombytes_into,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAGIC: [u8; 3] = [0x00, b'R', b'Z'];
 /// A capability level, not a format id: a sender never uses a higher one than its peer has
@@ -41,6 +46,8 @@ const KIND_HELLO: u8 = 1;
 const KIND_WELCOME: u8 = 2;
 const KIND_TO_SERVER: u8 = 3;
 const KIND_TO_CLIENT: u8 = 4;
+const KIND_COOKIE: u8 = 5;
+const KIND_HELLO_COOKIE: u8 = 6;
 
 // How a hello says who sent it. A later version may add kinds, a post-quantum signature among
 // them; this one drops a hello with a kind it does not know.
@@ -55,6 +62,11 @@ const KEY: usize = 32;
 const NONCE: usize = 32;
 const TS: usize = 8;
 const SIG: usize = 64;
+const COOKIE: usize = 16;
+/// The part of a hello's `enc` a cookie reply echoes, so only one who saw the hello can forge it.
+const ECHO: usize = 16;
+/// The server keeps a cookie secret for two minutes and the one before it (WireGuard's).
+const COOKIE_LIFE: Duration = Duration::from_secs(120);
 /// The shortest hello: unsigned, with no payload.
 const MIN_HELLO: usize = HDR + ENC + 1 + aead::TAGBYTES;
 
@@ -74,7 +86,40 @@ pub fn is_sealed(datagram: &[u8]) -> bool {
 
 /// Whether a datagram is a hello, the one kind that costs the server an X25519.
 pub fn is_hello(datagram: &[u8]) -> bool {
-    kind(datagram) == Some(KIND_HELLO) && datagram.len() >= MIN_HELLO
+    hello_body(datagram).is_some_and(|body| body.len() >= MIN_HELLO - HDR)
+}
+
+/// Whether a datagram is a server's cookie reply.
+pub fn is_cookie(datagram: &[u8]) -> bool {
+    kind(datagram) == Some(KIND_COOKIE) && datagram.len() == HDR + ECHO + COOKIE
+}
+
+/// A hello's `enc` and ciphertext, after the cookie if it carries one.
+fn hello_body(datagram: &[u8]) -> Option<&[u8]> {
+    match kind(datagram)? {
+        KIND_HELLO => datagram.get(HDR..),
+        KIND_HELLO_COOKIE => datagram.get(HDR + COOKIE..),
+        _ => None,
+    }
+}
+
+/// The cookie a hello carries, for the server to check against the address it came from.
+pub fn hello_cookie(datagram: &[u8]) -> Option<[u8; COOKIE]> {
+    if kind(datagram)? != KIND_HELLO_COOKIE {
+        return None;
+    }
+    array(datagram.get(HDR..HDR + COOKIE)?)
+}
+
+/// The server's answer to a hello past its budget: shorter than any hello, so it amplifies
+/// nothing.
+pub fn cookie_reply(hello: &[u8], cookie: [u8; COOKIE]) -> Option<Vec<u8>> {
+    let echo = hello_body(hello)?.get(..ECHO)?;
+    Some([&header(KIND_COOKIE)[..], echo, &cookie].concat())
+}
+
+fn with_cookie(cookie: &[u8; COOKIE], body: &[u8]) -> Vec<u8> {
+    [&header(KIND_HELLO_COOKIE)[..], cookie, body].concat()
 }
 
 fn kind(datagram: &[u8]) -> Option<u8> {
@@ -82,7 +127,7 @@ fn kind(datagram: &[u8]) -> Option<u8> {
         return None;
     }
     match datagram[4] {
-        k @ KIND_HELLO..=KIND_TO_CLIENT => Some(k),
+        k @ KIND_HELLO..=KIND_HELLO_COOKIE => Some(k),
         _ => None,
     }
 }
@@ -368,10 +413,11 @@ impl ServerKey {
         new_key_id: impl FnOnce() -> u64,
     ) -> Option<(Opened, Reply)> {
         match kind(datagram)? {
-            KIND_HELLO if is_hello(datagram) => {
-                let enc = array(datagram.get(HDR..HDR + ENC)?)?;
+            KIND_HELLO | KIND_HELLO_COOKIE if is_hello(datagram) => {
+                let body = hello_body(datagram)?;
+                let enc = array(&body[..ENC])?;
                 let hpke = Hpke::new(&dh(&self.sk, &enc)?, &enc, &self.pk, &hello_info());
-                let plain = open_aead(&hpke.key, hpke.nonce, &[], &datagram[HDR + ENC..])?;
+                let plain = open_aead(&hpke.key, hpke.nonce, &[], &body[ENC..])?;
                 let (auth, payload) = match plain.split_first()? {
                     (&AUTH_NONE, rest) => (None, rest),
                     (&AUTH_DEVICE, rest) if rest.len() >= TS + SIG => {
@@ -460,6 +506,16 @@ struct Hello {
     enc: [u8; 32],
     hpke: Hpke,
     signed: bool,
+    /// `enc` and the ciphertext, to send again with a cookie.
+    body: Vec<u8>,
+    retried: bool,
+}
+
+/// A server's cookie for this client's address, not its socket.
+#[derive(Clone, Copy)]
+pub struct Cookie {
+    bytes: [u8; COOKIE],
+    at: Instant,
 }
 
 struct Session {
@@ -481,6 +537,7 @@ pub struct ClientSeal {
     /// The session a welcome replaced, still opened until the new one is: the server pushes
     /// under it until it sees the new one used (key confirmation, as WireGuard's `next_keypair`).
     previous: Option<Session>,
+    cookie: Option<Cookie>,
 }
 
 impl ClientSeal {
@@ -493,6 +550,7 @@ impl ClientSeal {
             hello: None,
             session: None,
             previous: None,
+            cookie: None,
         })
     }
 
@@ -528,6 +586,37 @@ impl ClientSeal {
     /// The device key changed: later hellos are signed by `device`. The session stays.
     pub fn set_device(&mut self, device: Option<sign::SecretKey>) {
         self.device = device;
+    }
+
+    /// The cookie later hellos carry, for a one-off socket to the same server to carry too.
+    pub fn cookie(&self) -> Option<Cookie> {
+        self.cookie.filter(|c| c.at.elapsed() < COOKIE_LIFE)
+    }
+
+    pub fn set_cookie(&mut self, cookie: Option<Cookie>) {
+        self.cookie = cookie;
+    }
+
+    /// A cookie reply to the latest hello: the hello to send again with it, once per hello. The
+    /// cookie is kept for the hellos after it either way.
+    pub fn on_cookie(&mut self, datagram: &[u8]) -> Option<Vec<u8>> {
+        if !is_cookie(datagram) {
+            return None;
+        }
+        let hello = self.hello.as_mut()?;
+        if hello.enc[..ECHO] != datagram[HDR..HDR + ECHO] {
+            return None;
+        }
+        let bytes = array(&datagram[HDR + ECHO..])?;
+        self.cookie = Some(Cookie {
+            bytes,
+            at: Instant::now(),
+        });
+        if hello.retried {
+            return None;
+        }
+        hello.retried = true;
+        Some(with_cookie(&bytes, &hello.body))
     }
 
     /// Forgets the session, so the next datagram is a hello.
@@ -574,14 +663,18 @@ impl ClientSeal {
             None => plain.push(AUTH_NONE),
         }
         plain.extend_from_slice(payload);
-        let mut out = header(KIND_HELLO).to_vec();
-        out.extend_from_slice(&enc);
-        out.extend_from_slice(&seal_aead(&hpke.key, hpke.nonce, &[], &plain));
+        let body = [&enc[..], &seal_aead(&hpke.key, hpke.nonce, &[], &plain)].concat();
+        let out = match self.cookie() {
+            Some(cookie) => with_cookie(&cookie.bytes, &body),
+            None => [&header(KIND_HELLO)[..], &body].concat(),
+        };
         self.hello = Some(Hello {
             sk,
             enc,
             hpke,
             signed: self.device.is_some() && !payload.is_empty(),
+            body,
+            retried: false,
         });
         Some(out)
     }
@@ -970,6 +1063,40 @@ mod tests {
         let head = welcome.len() - (1 + KEY + aead::TAGBYTES);
         assert!(open_aead(&key, aead_nonce, &welcome[..head], &welcome[head..]).is_none());
         assert!(client.open(&welcome).is_some());
+    }
+
+    #[test]
+    fn a_hello_past_the_budget_goes_again_with_its_cookie_once() {
+        let (mut client, server) = pair();
+        let hello = client.seal(b"register").unwrap();
+        let cookie = [9u8; 16];
+        let again = client
+            .on_cookie(&cookie_reply(&hello, cookie).unwrap())
+            .unwrap();
+        assert!(is_hello(&again) && hello_cookie(&again) == Some(cookie));
+        assert!(client
+            .on_cookie(&cookie_reply(&hello, cookie).unwrap())
+            .is_none());
+        let (opened, mut reply) = server.open(&again, || 1).unwrap();
+        assert_eq!(opened.payload, b"register");
+        let welcome = server.seal(&mut reply, 0, b"", || 0).unwrap();
+        assert!(client.open(&welcome).is_some());
+        assert_eq!(hello_cookie(&client.hello(b"r").unwrap()), Some(cookie));
+        assert_eq!(hello_cookie(&hello), None);
+    }
+
+    #[test]
+    fn a_cookie_for_another_hello_is_ignored() {
+        let (mut client, _) = pair();
+        let other = ClientSeal::new(&sign::gen_keypair().0, None)
+            .unwrap()
+            .seal(b"")
+            .unwrap();
+        client.seal(b"register").unwrap();
+        assert!(client
+            .on_cookie(&cookie_reply(&other, [9u8; 16]).unwrap())
+            .is_none());
+        assert_eq!(hello_cookie(&client.hello(b"r").unwrap()), None);
     }
 
     #[test]
