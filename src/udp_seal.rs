@@ -3,19 +3,23 @@
 //!
 //! A client with no session sends a hello: an HPKE (RFC 9180) base-mode single shot to the
 //! server's X25519 key, which is its signing key converted (a joint use IACR ePrint 2021/509
-//! analyses), so a client that trusts the server key trusts this one. A hello carries a signature
-//! by the device key the server keeps on record for the ID, which is how the server tells the
-//! device from anyone else sending under its ID. The server answers with a welcome sealed under a
-//! key exported from that HPKE context and a fresh nonce, the way Oblivious HTTP answers a request
-//! (RFC 9458 §4.4), and the welcome hands the client a session key. The welcome also carries a
-//! fresh server ephemeral whose DH with the hello's is mixed into its key, Noise NK's `← e, ee`,
-//! so a server key taken later opens no recorded welcome, nor the session after it; the hello,
-//! like WireGuard's first message, stays readable to it. The server derives the session key
+//! analyses), so a client that trusts the server key trusts this one. A hello says nothing of who
+//! sent it. The server answers with a welcome sealed under a key exported from that HPKE context
+//! and a fresh nonce, the way Oblivious HTTP answers a request (RFC 9458 §4.4), and the welcome
+//! hands the client a session key. The welcome also carries a fresh server ephemeral whose DH with
+//! the hello's is mixed into its key, Noise NK's `← e, ee`, so a server key taken later opens no
+//! recorded welcome, nor the session after it. The server derives the session key
 //! from a process secret and the key id, the way PSP derives receive keys from the SPI, so it
 //! stores no key per client. Every later datagram in either direction is data: the key id, a
 //! packet number and an AEAD under the session key's subkey for that direction. A sender never
 //! repeats a packet number under a key (RFC 8439 §4), and a receiver checks it against a window
 //! of the latest 1024 (RFC 4303 §3.4.3, kept as the bit ring of RFC 6479).
+//!
+//! Data to the server may carry a proof: a signature, by the device key the server keeps on record
+//! for the ID, of a value only the two ends of this session can compute (RFC 9266's tls-exporter).
+//! That is how the server tells the device from anyone else sending under its ID. The identity
+//! goes after the key exchange and under its keys, as in SIGMA-I and TLS 1.3's CertificateVerify
+//! (RFC 8446 §4.4.3), so a recorded hello names no device to a server key taken later either.
 //!
 //! A server past its hello budget answers a hello with a cookie instead, a MAC of the client's
 //! address, and takes that hello again with the cookie attached, which proves the address can
@@ -33,7 +37,13 @@ use sodiumoxide::{
     },
     randombytes::randombytes_into,
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 pub const MAGIC: [u8; 3] = [0x00, b'R', b'Z'];
 /// A capability level, not a format id: a sender never uses a higher one than its peer has
@@ -49,8 +59,8 @@ const KIND_TO_CLIENT: u8 = 4;
 const KIND_COOKIE: u8 = 5;
 const KIND_HELLO_COOKIE: u8 = 6;
 
-// How a hello says who sent it. A later version may add kinds, a post-quantum signature among
-// them; this one drops a hello with a kind it does not know.
+// How data to the server says who sent it. A later version may add kinds, a post-quantum
+// signature among them; this one drops data with a kind it does not know.
 const AUTH_NONE: u8 = 0;
 const AUTH_DEVICE: u8 = 1;
 
@@ -60,15 +70,14 @@ const ID: usize = 8;
 const PN: usize = 8;
 const KEY: usize = 32;
 const NONCE: usize = 32;
-const TS: usize = 8;
 const SIG: usize = 64;
 const COOKIE: usize = 16;
 /// The part of a hello's `enc` a cookie reply echoes, so only one who saw the hello can forge it.
 const ECHO: usize = 16;
 /// The server keeps a cookie secret for two minutes and the one before it (WireGuard's).
 const COOKIE_LIFE: Duration = Duration::from_secs(120);
-/// The shortest hello: unsigned, with no payload.
-const MIN_HELLO: usize = HDR + ENC + 1 + aead::TAGBYTES;
+/// The shortest hello: one with no payload.
+const MIN_HELLO: usize = HDR + ENC + aead::TAGBYTES;
 
 const KEM_SUITE: &[u8] = b"KEM\x00\x20";
 const HPKE_SUITE: &[u8] = b"HPKE\x00\x20\x00\x01\x00\x03";
@@ -76,6 +85,7 @@ const HELLO_INFO: &[u8] = b"rustdesk udp seal\x00";
 const WELCOME_EXPORT: &[u8] = b"rustdesk udp seal welcome";
 const DEVICE_LABEL: &[u8] = b"rustdesk udp seal device";
 const SESSION_LABEL: &[u8] = b"rustdesk udp seal session";
+const BINDING_LABEL: &[u8] = b"rustdesk udp seal binding";
 const DIRECTION_LABEL: &[u8] = b"rustdesk udp seal direction";
 
 /// Whether a datagram is one of ours. One that is but does not open is dropped, never read as
@@ -239,8 +249,11 @@ fn hello_info() -> Vec<u8> {
     [HELLO_INFO, &header(KIND_HELLO)].concat()
 }
 
-fn device_message(server: &[u8; 32], enc: &[u8; 32], ts: u64) -> Vec<u8> {
-    [DEVICE_LABEL, server, enc, &ts.to_be_bytes()].concat()
+// RFC 9266's tls-exporter: a value only the two ends of this session can compute, so a proof made
+// for one session proves nothing in another.
+fn proof_message(server: &[u8; 32], key_id: u64, session: &[u8; 32]) -> Option<Vec<u8>> {
+    let binding = blake(session, &[BINDING_LABEL])?;
+    Some([DEVICE_LABEL, server, &key_id.to_be_bytes(), &binding].concat())
 }
 
 // RFC 9458 4.4: the response key comes from the request's exported secret, its `enc` and a
@@ -340,8 +353,7 @@ impl ReplayWindow {
 }
 
 #[derive(Debug)]
-struct DeviceAuth {
-    ts: u64,
+struct Proof {
     sig: [u8; SIG],
     message: Vec<u8>,
 }
@@ -353,17 +365,27 @@ pub struct Opened {
     /// `None` for a hello, which carries no packet number.
     pub pn: Option<u64>,
     pub payload: Vec<u8>,
-    auth: Option<DeviceAuth>,
+    proof: Option<Proof>,
 }
 
 impl Opened {
-    /// The time a hello was signed at, if `device`, the key on record for the ID it registers,
-    /// signed it.
-    pub fn signed_by(&self, device: &[u8]) -> Option<u64> {
-        let auth = self.auth.as_ref()?;
-        let device = sign::PublicKey::from_slice(device)?;
-        let sig = sign::Signature::from_bytes(&auth.sig).ok()?;
-        sign::verify_detached(&sig, &auth.message, &device).then_some(auth.ts)
+    /// Whether checking `proven_by` costs an Ed25519 verification.
+    pub fn carries_proof(&self) -> bool {
+        self.proof.is_some()
+    }
+
+    /// Whether `device`, the key on record for the ID this registers, proved this session.
+    pub fn proven_by(&self, device: &[u8]) -> bool {
+        let Some(proof) = self.proof.as_ref() else {
+            return false;
+        };
+        let (Some(device), Ok(sig)) = (
+            sign::PublicKey::from_slice(device),
+            sign::Signature::from_bytes(&proof.sig),
+        ) else {
+            return false;
+        };
+        sign::verify_detached(&sig, &proof.message, &device)
     }
 }
 
@@ -417,20 +439,7 @@ impl ServerKey {
                 let body = hello_body(datagram)?;
                 let enc = array(&body[..ENC])?;
                 let hpke = Hpke::new(&dh(&self.sk, &enc)?, &enc, &self.pk, &hello_info());
-                let plain = open_aead(&hpke.key, hpke.nonce, &[], &body[ENC..])?;
-                let (auth, payload) = match plain.split_first()? {
-                    (&AUTH_NONE, rest) => (None, rest),
-                    (&AUTH_DEVICE, rest) if rest.len() >= TS + SIG => {
-                        let ts = u64::from_be_bytes(array(&rest[..TS])?);
-                        let auth = DeviceAuth {
-                            ts,
-                            sig: array(&rest[TS..TS + SIG])?,
-                            message: device_message(&self.pk, &enc, ts),
-                        };
-                        (Some(auth), &rest[TS + SIG..])
-                    }
-                    _ => return None,
-                };
+                let payload = open_aead(&hpke.key, hpke.nonce, &[], &body[ENC..])?;
                 let key_id = new_key_id();
                 let welcome = WelcomeSecret {
                     secret: hpke.export(WELCOME_EXPORT),
@@ -440,8 +449,8 @@ impl ServerKey {
                     Opened {
                         key_id,
                         pn: None,
-                        payload: payload.to_vec(),
-                        auth,
+                        payload,
+                        proof: None,
                     },
                     Reply {
                         key_id,
@@ -451,16 +460,24 @@ impl ServerKey {
             }
             KIND_TO_SERVER => {
                 let key_id = key_id_of(datagram)?;
-                let (pn, payload) = open_data(
-                    &session_key(&self.master, key_id)?,
-                    KIND_TO_SERVER,
-                    datagram,
-                )?;
+                let session = session_key(&self.master, key_id)?;
+                let (pn, plain) = open_data(&session, KIND_TO_SERVER, datagram)?;
+                let (proof, payload) = match plain.split_first()? {
+                    (&AUTH_NONE, rest) => (None, rest),
+                    (&AUTH_DEVICE, rest) if rest.len() >= SIG => {
+                        let proof = Proof {
+                            sig: array(&rest[..SIG])?,
+                            message: proof_message(&self.pk, key_id, &session)?,
+                        };
+                        (Some(proof), &rest[SIG..])
+                    }
+                    _ => return None,
+                };
                 let opened = Opened {
                     key_id,
                     pn: Some(pn),
-                    payload,
-                    auth: None,
+                    payload: payload.to_vec(),
+                    proof,
                 };
                 Some((opened, Reply::push(key_id)))
             }
@@ -505,7 +522,6 @@ struct Hello {
     sk: [u8; 32],
     enc: [u8; 32],
     hpke: Hpke,
-    signed: bool,
     /// `enc` and the ciphertext, to send again with a cookie.
     body: Vec<u8>,
     retried: bool,
@@ -522,16 +538,31 @@ struct Session {
     key_id: u64,
     key: [u8; 32],
     caps: u8,
-    next_pn: u64,
+    /// Shared with the one-shots sealed under this session: one counter per key (RFC 8439 §4).
+    next_pn: Arc<AtomicU64>,
     window: ReplayWindow,
-    signed: bool,
+}
+
+/// Seals one-off datagrams, from another socket, under a client's session; they carry no proof.
+#[derive(Clone)]
+pub struct OneShot {
+    key_id: u64,
+    key: [u8; 32],
+    next_pn: Arc<AtomicU64>,
+}
+
+impl OneShot {
+    pub fn seal(&self, payload: &[u8]) -> Option<Vec<u8>> {
+        let pn = self.next_pn.fetch_add(1, Ordering::Relaxed);
+        let plain = [&[AUTH_NONE][..], payload].concat();
+        seal_data(&self.key, KIND_TO_SERVER, self.key_id, pn, &plain)
+    }
 }
 
 /// One client socket's side: the hello in flight, then the session it got.
 pub struct ClientSeal {
     pk: [u8; 32],
     device: Option<sign::SecretKey>,
-    last_ts: u64,
     hello: Option<Hello>,
     session: Option<Session>,
     /// The session a welcome replaced, still opened until the new one is: the server pushes
@@ -541,12 +572,12 @@ pub struct ClientSeal {
 }
 
 impl ClientSeal {
-    /// `device` signs hellos, so the server can tell this device from others using its ID.
+    /// `device` proves this device inside each session, so the server can tell it from others
+    /// using its ID.
     pub fn new(server: &sign::PublicKey, device: Option<sign::SecretKey>) -> Option<Self> {
         Some(Self {
             pk: sign::ed25519::to_curve25519_pk(server).ok()?.0,
             device,
-            last_ts: 0,
             hello: None,
             session: None,
             previous: None,
@@ -564,26 +595,21 @@ impl ClientSeal {
             .is_some_and(|s| s.caps & CAP_PUSHES_SEALED != 0)
     }
 
-    /// Whether the session came from a hello the server could not tie to this device, an empty
-    /// one, which a signed hello should replace.
-    pub fn needs_signed_hello(&self) -> bool {
-        self.device.is_some() && self.session.as_ref().is_some_and(|s| !s.signed)
+    /// The session, for one-off datagrams from another socket to the same server.
+    pub fn one_shot(&self) -> Option<OneShot> {
+        self.session.as_ref().map(|s| OneShot {
+            key_id: s.key_id,
+            key: s.key,
+            next_pn: s.next_pn.clone(),
+        })
     }
 
-    /// The next RegisterPeer goes as a signed hello even though this session came from one: the
-    /// server may not have had the device's key to check it against then.
-    pub fn require_signed_hello(&mut self) {
-        if let Some(s) = self.session.as_mut() {
-            s.signed = false;
-        }
-    }
-
-    /// Whether hellos are signed by the device key whose public half is `pk`.
+    /// Whether data is proven by the device key whose public half is `pk`.
     pub fn signs_as(&self, pk: &[u8]) -> bool {
         self.device.as_ref().is_some_and(|sk| sk.0[32..] == *pk)
     }
 
-    /// The device key changed: later hellos are signed by `device`. The session stays.
+    /// The device key changed: later data is proven by `device`. The session stays.
     pub fn set_device(&mut self, device: Option<sign::SecretKey>) {
         self.device = device;
     }
@@ -626,44 +652,33 @@ impl ClientSeal {
         self.previous = None;
     }
 
-    /// Data under the session, or else a fresh hello, which replaces any hello still unanswered.
+    /// Data under the session, proven by the device key if there is one, or else a fresh hello,
+    /// which replaces any hello still unanswered.
     pub fn seal(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
-        if let Some(s) = self.session.as_mut() {
-            let pn = s.next_pn;
-            s.next_pn += 1;
-            return seal_data(&s.key, KIND_TO_SERVER, s.key_id, pn, payload);
+        if let Some(s) = self.session.as_ref() {
+            let pn = s.next_pn.fetch_add(1, Ordering::Relaxed);
+            let mut plain = Vec::with_capacity(1 + SIG + payload.len());
+            match &self.device {
+                Some(device) => {
+                    plain.push(AUTH_DEVICE);
+                    let message = proof_message(&self.pk, s.key_id, &s.key)?;
+                    plain.extend_from_slice(sign::sign_detached(&message, device).as_ref());
+                }
+                None => plain.push(AUTH_NONE),
+            }
+            plain.extend_from_slice(payload);
+            return seal_data(&s.key, KIND_TO_SERVER, s.key_id, pn, &plain);
         }
         self.hello(payload)
     }
 
     /// A fresh hello even under a session, which stays in use until the welcome replaces it.
     pub fn hello(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
-        // Strictly rising: the server takes a signed hello over a live seal only when newer.
-        let ts = now.max(self.last_ts + 1);
-        self.last_ts = ts;
         let mut sk = [0u8; 32];
         randombytes_into(&mut sk);
-        self.hello_with(sk, payload, ts)
-    }
-
-    fn hello_with(&mut self, sk: [u8; 32], payload: &[u8], ts: u64) -> Option<Vec<u8>> {
         let enc = x25519::scalarmult_base(&x25519::Scalar(sk)).0;
         let hpke = Hpke::new(&dh(&sk, &self.pk)?, &enc, &self.pk, &hello_info());
-        let mut plain = Vec::with_capacity(1 + TS + SIG + payload.len());
-        match &self.device {
-            Some(device) => {
-                plain.push(AUTH_DEVICE);
-                plain.extend_from_slice(&ts.to_be_bytes());
-                let message = device_message(&self.pk, &enc, ts);
-                plain.extend_from_slice(sign::sign_detached(&message, device).as_ref());
-            }
-            None => plain.push(AUTH_NONE),
-        }
-        plain.extend_from_slice(payload);
-        let body = [&enc[..], &seal_aead(&hpke.key, hpke.nonce, &[], &plain)].concat();
+        let body = [&enc[..], &seal_aead(&hpke.key, hpke.nonce, &[], payload)].concat();
         let out = match self.cookie() {
             Some(cookie) => with_cookie(&cookie.bytes, &body),
             None => [&header(KIND_HELLO)[..], &body].concat(),
@@ -672,7 +687,6 @@ impl ClientSeal {
             sk,
             enc,
             hpke,
-            signed: self.device.is_some() && !payload.is_empty(),
             body,
             retried: false,
         });
@@ -701,9 +715,8 @@ impl ClientSeal {
                     key_id: key_id_of(datagram)?,
                     key: array(&plain[1..1 + KEY])?,
                     caps: plain[0],
-                    next_pn: 0,
+                    next_pn: Arc::new(AtomicU64::new(0)),
                     window: ReplayWindow::default(),
-                    signed: hello.signed,
                 });
                 self.hello = None;
                 Some(plain[1 + KEY..].to_vec())
@@ -941,21 +954,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_hello_still_gets_a_session_but_asks_for_a_signed_one() {
-        let (mut client, server) = pair();
-        let hello = client.seal(b"").unwrap();
-        let (opened, mut reply) = server.open(&hello, || 5).unwrap();
-        assert!(opened.payload.is_empty());
-        let welcome = server.seal(&mut reply, 0, b"", || unreachable!()).unwrap();
-        assert!(client.open(&welcome).unwrap().is_empty());
-        assert!(client.has_session() && client.needs_signed_hello());
-        let (mut client, _, _) = established();
-        assert!(!client.needs_signed_hello());
-        client.require_signed_hello();
-        assert!(client.needs_signed_hello());
-    }
-
-    #[test]
     fn only_the_latest_hello_is_welcomed_and_only_once() {
         let (mut client, server) = pair();
         let first = client.seal(b"a").unwrap();
@@ -1100,32 +1098,80 @@ mod tests {
     }
 
     #[test]
-    fn a_new_device_key_signs_the_hellos_after_it() {
+    fn a_new_device_key_proves_the_data_after_it() {
         let (pk, sk) = sign::gen_keypair();
         let server = ServerKey::new(&sk, [7u8; 32]).unwrap();
         let (old_pk, old_sk) = sign::gen_keypair();
         let (new_pk, new_sk) = sign::gen_keypair();
         let mut client = ClientSeal::new(&pk, Some(old_sk)).unwrap();
         assert!(client.signs_as(old_pk.as_ref()) && !client.signs_as(new_pk.as_ref()));
+        let (_, mut reply) = server.open(&client.seal(b"").unwrap(), || 1).unwrap();
+        client
+            .open(&server.seal(&mut reply, 0, b"", || 0).unwrap())
+            .unwrap();
         client.set_device(Some(new_sk));
-        let (opened, _) = server.open(&client.seal(b"r").unwrap(), || 1).unwrap();
-        assert!(opened.signed_by(new_pk.as_ref()).is_some());
-        assert!(opened.signed_by(old_pk.as_ref()).is_none());
+        let data = client.seal(b"r").unwrap();
+        let (opened, _) = server.open(&data, || unreachable!()).unwrap();
+        assert!(opened.proven_by(new_pk.as_ref()));
+        assert!(!opened.proven_by(old_pk.as_ref()));
     }
 
     #[test]
-    fn a_hello_names_the_device_that_signed_it_and_a_rising_time() {
+    fn a_hello_carries_nothing_but_its_payload() {
+        let (mut client, server) = pair();
+        let hello = client.seal(b"").unwrap();
+        assert_eq!(hello.len(), MIN_HELLO, "no device key, signature or time");
+        let (opened, _) = server.open(&hello, || 1).unwrap();
+        assert!(opened.payload.is_empty() && !opened.carries_proof());
+    }
+
+    #[test]
+    fn a_proof_holds_for_its_own_session_only() {
         let (pk, sk) = sign::gen_keypair();
         let (device_pk, device_sk) = sign::gen_keypair();
         let server = ServerKey::new(&sk, [7u8; 32]).unwrap();
-        let mut client = ClientSeal::new(&pk, Some(device_sk)).unwrap();
-        let (first, _) = server.open(&client.seal(b"r").unwrap(), || 1).unwrap();
-        let (second, _) = server.open(&client.seal(b"r").unwrap(), || 2).unwrap();
-        let first_ts = first.signed_by(device_pk.as_ref()).unwrap();
-        assert!(second.signed_by(device_pk.as_ref()).unwrap() > first_ts);
-        assert!(first.signed_by(sign::gen_keypair().0.as_ref()).is_none());
-        let unsigned = ClientSeal::new(&pk, None).unwrap().seal(b"r").unwrap();
-        let (unsigned, _) = server.open(&unsigned, || 3).unwrap();
-        assert!(unsigned.signed_by(device_pk.as_ref()).is_none());
+        let mut client = ClientSeal::new(&pk, Some(device_sk.clone())).unwrap();
+        let (_, mut reply) = server.open(&client.seal(b"").unwrap(), || 1).unwrap();
+        client
+            .open(&server.seal(&mut reply, 0, b"", || 0).unwrap())
+            .unwrap();
+        let data = client.seal(b"r").unwrap();
+        let (opened, _) = server.open(&data, || unreachable!()).unwrap();
+        assert_eq!(opened.payload, b"r");
+        assert!(opened.proven_by(device_pk.as_ref()));
+        assert!(!opened.proven_by(sign::gen_keypair().0.as_ref()));
+        let first = session_key(&[7u8; 32], 1).unwrap();
+        let sig = sign::sign_detached(&proof_message(&server.pk, 1, &first).unwrap(), &device_sk);
+        let plain = [&[AUTH_DEVICE][..], sig.as_ref(), b"r"].concat();
+        let second = session_key(&[7u8; 32], 2).unwrap();
+        let moved = seal_data(&second, KIND_TO_SERVER, 2, 0, &plain).unwrap();
+        let (opened, _) = server.open(&moved, || unreachable!()).unwrap();
+        assert!(opened.carries_proof() && !opened.proven_by(device_pk.as_ref()));
+    }
+
+    #[test]
+    fn a_one_shot_shares_the_session_counter() {
+        assert!(pair().0.one_shot().is_none());
+        let (mut client, server, key_id) = established();
+        let one_shot = client.one_shot().unwrap();
+        let sent = [
+            client.seal(b"r"),
+            one_shot.seal(b"p"),
+            client.seal(b"r"),
+            one_shot.seal(b"p"),
+        ];
+        let opened: Vec<_> = sent
+            .iter()
+            .map(|d| {
+                server
+                    .open(d.as_ref().unwrap(), || unreachable!())
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        assert!(opened.iter().all(|o| o.key_id == key_id));
+        let pns: Vec<_> = opened.iter().map(|o| o.pn.unwrap()).collect();
+        assert_eq!(pns, [0, 1, 2, 3]);
+        assert!(!opened[1].carries_proof() && opened[1].payload == b"p");
     }
 }
