@@ -121,16 +121,20 @@ impl FramedStream {
         local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        let mut last_error = None;
         for remote_addr in lookup_host(&remote_addr).await? {
             let local = if let Some(addr) = local_addr {
                 addr
             } else {
                 crate::config::Config::get_any_listen_addr(remote_addr.is_ipv4())
             };
-            if let Ok(socket) = new_socket(local, true) {
-                if let Ok(Ok(stream)) =
-                    super::timeout(ms_timeout, socket.connect(remote_addr)).await
-                {
+            let result: ResultType<_> = async {
+                let socket = new_socket(local, true)?;
+                Ok(super::timeout(ms_timeout, socket.connect(remote_addr)).await??)
+            }
+            .await;
+            match result {
+                Ok(stream) => {
                     stream.set_nodelay(true).ok();
                     let addr = stream.local_addr()?;
                     return Ok(Self(
@@ -140,7 +144,12 @@ impl FramedStream {
                         0,
                     ));
                 }
+                Err(err) => last_error = Some(err),
             }
+        }
+        if let Some(err) = last_error {
+            let message = format!("Failed to connect to {remote_addr}: {err}");
+            return Err(err.context(message));
         }
         bail!(format!("Failed to connect to {remote_addr}"));
     }

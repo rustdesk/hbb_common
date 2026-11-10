@@ -11,7 +11,6 @@ use crate::{
     tls::{get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,
 };
-use anyhow::bail;
 use async_recursion::async_recursion;
 use bytes::{Bytes, BytesMut};
 use futures::{future::Either, SinkExt, StreamExt};
@@ -286,13 +285,15 @@ impl WsFramedStream {
                     );
                     if let tungstenite::Error::Http(response) = &e {
                         if response.status().is_redirection() {
-                            bail!(
+                            let message = format!(
                                 "WebSocket connection failed ({}). The server may not support WebSocket.",
                                 e
-                            )
+                            );
+                            return Err(anyhow::Error::new(e).context(message));
                         }
                     }
-                    bail!("WebSocket error: {}", e)
+                    let message = format!("WebSocket error: {e}");
+                    Err(anyhow::Error::new(e).context(message))
                 }
             },
         }
@@ -404,10 +405,10 @@ impl WsFramedStream {
                 Ok(msg) => msg,
                 Err(e) => {
                     log::error!("{}", e);
-                    return Some(Err(Error::new(
-                        ErrorKind::Other,
-                        format!("WebSocket protocol error: {}", e),
-                    )));
+                    return Some(Err(match e {
+                        tungstenite::Error::Io(err) => err,
+                        err => Error::new(ErrorKind::Other, err),
+                    }));
                 }
             };
 
