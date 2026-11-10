@@ -17,7 +17,8 @@
 //!
 //! Data to the server may carry a proof: a signature, by the device key the server keeps on record
 //! for the ID, of a value only the two ends of this session can compute (RFC 9266's tls-exporter).
-//! That is how the server tells the device from anyone else sending under its ID. The identity
+//! That is how the server tells the device from anyone else sending under its ID. Data to the
+//! client says whether the server holds the proof, and the client sends it until then. The identity
 //! goes after the key exchange and under its keys, as in SIGMA-I and TLS 1.3's CertificateVerify
 //! (RFC 8446 §4.4.3), so a recorded hello names no device to a server key taken later either.
 //!
@@ -63,6 +64,11 @@ const KIND_HELLO_COOKIE: u8 = 6;
 // signature among them; this one drops data with a kind it does not know.
 const AUTH_NONE: u8 = 0;
 const AUTH_DEVICE: u8 = 1;
+// What data to the client says of the session's proof. Only WANTED and HELD change what a client
+// believes, so a push says neither and a later version may add values.
+const PROOF_UNSAID: u8 = 0;
+const PROOF_WANTED: u8 = 1;
+const PROOF_HELD: u8 = 2;
 
 const HDR: usize = 5;
 const ENC: usize = 32;
@@ -398,6 +404,7 @@ struct WelcomeSecret {
 pub struct Reply {
     key_id: u64,
     welcome: Option<WelcomeSecret>,
+    proven: Option<bool>,
 }
 
 impl Reply {
@@ -406,7 +413,14 @@ impl Reply {
         Self {
             key_id,
             welcome: None,
+            proven: None,
         }
+    }
+
+    /// Whether the device has proven this session: the client stops sending its proof once it
+    /// has, which saves a signature in every registration.
+    pub fn set_proven(&mut self, proven: bool) {
+        self.proven = Some(proven);
     }
 }
 
@@ -455,6 +469,7 @@ impl ServerKey {
                     Reply {
                         key_id,
                         welcome: Some(welcome),
+                        proven: None,
                     },
                 ))
             }
@@ -512,7 +527,15 @@ impl ServerKey {
                 out.extend_from_slice(&sealed);
                 Some(out)
             }
-            None => seal_data(&session, KIND_TO_CLIENT, reply.key_id, pn(), payload),
+            None => {
+                let proof = match reply.proven {
+                    None => PROOF_UNSAID,
+                    Some(false) => PROOF_WANTED,
+                    Some(true) => PROOF_HELD,
+                };
+                let plain = [&[proof][..], payload].concat();
+                seal_data(&session, KIND_TO_CLIENT, reply.key_id, pn(), &plain)
+            }
         }
     }
 }
@@ -541,6 +564,8 @@ struct Session {
     /// Shared with the one-shots sealed under this session: one counter per key (RFC 8439 §4).
     next_pn: Arc<AtomicU64>,
     window: ReplayWindow,
+    /// The server said it holds the device's proof of this session.
+    proven: bool,
 }
 
 /// Seals one-off datagrams, from another socket, under a client's session; they carry no proof.
@@ -609,7 +634,7 @@ impl ClientSeal {
         self.device.as_ref().is_some_and(|sk| sk.0[32..] == *pk)
     }
 
-    /// The device key changed: later data is proven by `device`. The session stays.
+    /// The device key changed: a proof sent after this is signed by `device`. The session stays.
     pub fn set_device(&mut self, device: Option<sign::SecretKey>) {
         self.device = device;
     }
@@ -652,13 +677,13 @@ impl ClientSeal {
         self.previous = None;
     }
 
-    /// Data under the session, proven by the device key if there is one, or else a fresh hello,
-    /// which replaces any hello still unanswered.
+    /// Data under the session, proven by the device key until the server holds the proof, or else
+    /// a fresh hello, which replaces any hello still unanswered.
     pub fn seal(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
         if let Some(s) = self.session.as_ref() {
             let pn = s.next_pn.fetch_add(1, Ordering::Relaxed);
             let mut plain = Vec::with_capacity(1 + SIG + payload.len());
-            match &self.device {
+            match self.device.as_ref().filter(|_| !s.proven) {
                 Some(device) => {
                     plain.push(AUTH_DEVICE);
                     let message = proof_message(&self.pk, s.key_id, &s.key)?;
@@ -717,6 +742,7 @@ impl ClientSeal {
                     caps: plain[0],
                     next_pn: Arc::new(AtomicU64::new(0)),
                     window: ReplayWindow::default(),
+                    proven: false,
                 });
                 self.hello = None;
                 Some(plain[1 + KEY..].to_vec())
@@ -729,14 +755,22 @@ impl ClientSeal {
                 } else {
                     self.previous.as_mut().filter(|p| p.key_id == key_id)?
                 };
-                let (pn, payload) = open_data(&s.key, KIND_TO_CLIENT, datagram)?;
+                let (pn, plain) = open_data(&s.key, KIND_TO_CLIENT, datagram)?;
+                let (proof, payload) = plain.split_first()?;
+                // A reordered answer must not undo a newer one.
+                let newest = pn >= s.window.top;
                 if !s.window.accept(pn) {
                     return None;
                 }
                 if current {
+                    match *proof {
+                        PROOF_WANTED if newest => s.proven = false,
+                        PROOF_HELD if newest => s.proven = true,
+                        _ => {}
+                    }
                     self.previous = None;
                 }
-                Some(payload)
+                Some(payload.to_vec())
             }
             _ => None,
         }
@@ -1147,6 +1181,58 @@ mod tests {
         let moved = seal_data(&second, KIND_TO_SERVER, 2, 0, &plain).unwrap();
         let (opened, _) = server.open(&moved, || unreachable!()).unwrap();
         assert!(opened.carries_proof() && !opened.proven_by(device_pk.as_ref()));
+    }
+
+    #[test]
+    fn a_client_proves_until_the_server_says_the_session_is_proven() {
+        let (mut client, server, key_id) = established();
+        let proves = |client: &mut ClientSeal| {
+            let data = client.seal(b"r").unwrap();
+            let (opened, _) = server.open(&data, || unreachable!()).unwrap();
+            assert_eq!(opened.payload, b"r");
+            opened.carries_proof()
+        };
+        let mut pn = 0;
+        let mut answer = |client: &mut ClientSeal, proven: Option<bool>| {
+            let mut reply = Reply::push(key_id);
+            if let Some(proven) = proven {
+                reply.set_proven(proven);
+            }
+            pn += 1;
+            let down = server.seal(&mut reply, 0, b"ok", || pn).unwrap();
+            assert_eq!(client.open(&down).unwrap(), b"ok");
+        };
+        assert!(proves(&mut client));
+        answer(&mut client, Some(false));
+        assert!(proves(&mut client));
+        answer(&mut client, Some(true));
+        assert!(!proves(&mut client));
+        answer(&mut client, None);
+        assert!(!proves(&mut client), "a push says nothing of the proof");
+        answer(&mut client, Some(false));
+        assert!(proves(&mut client), "the server lost the proof");
+        let mut late = Reply::push(key_id);
+        late.set_proven(true);
+        let down = server.seal(&mut late, 0, b"ok", || 0).unwrap();
+        assert_eq!(client.open(&down).unwrap(), b"ok");
+        assert!(
+            proves(&mut client),
+            "a late answer does not undo a newer one"
+        );
+        answer(&mut client, Some(true));
+        let session = session_key(&server.master, key_id).unwrap();
+        let later = seal_data(&session, KIND_TO_CLIENT, key_id, pn + 1, &[9, b'o', b'k']).unwrap();
+        assert_eq!(client.open(&later).unwrap(), b"ok");
+        assert!(
+            !proves(&mut client),
+            "a value from a later version says nothing"
+        );
+        let (_, mut reply) = server
+            .open(&client.hello(b"").unwrap(), || key_id + 1)
+            .unwrap();
+        let welcome = server.seal(&mut reply, 0, b"", || unreachable!()).unwrap();
+        client.open(&welcome).unwrap();
+        assert!(proves(&mut client), "a new session is proven anew");
     }
 
     #[test]
