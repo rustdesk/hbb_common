@@ -757,15 +757,13 @@ impl ClientSeal {
                 };
                 let (pn, plain) = open_data(&s.key, KIND_TO_CLIENT, datagram)?;
                 let (proof, payload) = plain.split_first()?;
-                // A reordered answer must not undo a newer one.
-                let newest = pn >= s.window.top;
                 if !s.window.accept(pn) {
                     return None;
                 }
                 if current {
                     match *proof {
-                        PROOF_WANTED if newest => s.proven = false,
-                        PROOF_HELD if newest => s.proven = true,
+                        PROOF_WANTED => s.proven = false,
+                        PROOF_HELD => s.proven = true,
                         _ => {}
                     }
                     self.previous = None;
@@ -1211,13 +1209,17 @@ mod tests {
         assert!(!proves(&mut client), "a push says nothing of the proof");
         answer(&mut client, Some(false));
         assert!(proves(&mut client), "the server lost the proof");
-        let mut late = Reply::push(key_id);
-        late.set_proven(true);
-        let down = server.seal(&mut late, 0, b"ok", || 0).unwrap();
+        let push = server
+            .seal(&mut Reply::push(key_id), 0, b"ok", || 100)
+            .unwrap();
+        assert_eq!(client.open(&push).unwrap(), b"ok");
+        let mut overtaken = Reply::push(key_id);
+        overtaken.set_proven(true);
+        let down = server.seal(&mut overtaken, 0, b"ok", || 50).unwrap();
         assert_eq!(client.open(&down).unwrap(), b"ok");
         assert!(
-            proves(&mut client),
-            "a late answer does not undo a newer one"
+            !proves(&mut client),
+            "an answer a push overtook still counts"
         );
         answer(&mut client, Some(true));
         let session = session_key(&server.master, key_id).unwrap();
