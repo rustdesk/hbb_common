@@ -1262,4 +1262,84 @@ mod tests {
         assert_eq!(pns, [0, 1, 2, 3]);
         assert!(!opened[1].carries_proof() && opened[1].payload == b"p");
     }
+
+    // Datagrams recorded with these keys. The tests above still pass when both ends change
+    // together, and a build already released would then drop every hello and stay in plaintext.
+    #[test]
+    fn recorded_datagrams_still_open_and_seal_the_same() {
+        let (server_pk, server_sk) = sign::keypair_from_seed(&sign::Seed([1; 32]));
+        let (device_pk, device) = sign::keypair_from_seed(&sign::Seed([3; 32]));
+        let server = ServerKey::new(&server_sk, [2; 32]).unwrap();
+        let mut client = ClientSeal::new(&server_pk, Some(device)).unwrap();
+        let hello = hex(
+            "00525a0101ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369\
+             617fecf10b4216fee9656e146e570df8e254e08f655a3c",
+        );
+        assert_eq!(server.open(&hello, || 7).unwrap().0.payload, b"hi");
+        let cookie = cookie_reply(&hello, [9; COOKIE]).unwrap();
+        assert_eq!(
+            cookie,
+            hex("00525a0105ac01b2209e86354fb853237b5de0f4fa09090909090909090909090909090909")
+        );
+
+        // `hello()` draws its own ephemeral, so the client that sent this one is put together.
+        let sk = [4u8; 32];
+        let enc: [u8; ENC] = array(&hello[HDR..HDR + ENC]).unwrap();
+        client.hello = Some(Hello {
+            sk,
+            enc,
+            hpke: Hpke::new(
+                &dh(&sk, &client.pk).unwrap(),
+                &enc,
+                &client.pk,
+                &hello_info(),
+            ),
+            body: hello[HDR..].to_vec(),
+            retried: false,
+        });
+        assert_eq!(
+            client.on_cookie(&cookie).unwrap(),
+            [&hex("00525a0106")[..], &[9; COOKIE], &hello[HDR..]].concat()
+        );
+        let welcome = hex(
+            "00525a010200000000000000070d0a5ee649268ce4bcaf4f9e18f0348a65e8c8\
+             9824ef75c530c96f0f586a3accc91a7125a46b9bf9eff43832735d68506bd3c5\
+             61cb2c7fc3007474e6554f354036fa368a1562c77746335167fb41af7ffa05ff\
+             44b0890000d19da52606afd3dee93f3dbf219c86e95d13f20fe0cad874a252da",
+        );
+        assert_eq!(client.open(&welcome).unwrap(), b"ok");
+        assert!(client.pushes_sealed());
+
+        let data = client.seal(b"reg").unwrap();
+        assert_eq!(
+            data,
+            hex(
+                "00525a01030000000000000007000000000000000027b111b6121a5c8a90d6b5\
+                 89ace65f01372717f19aef97a93f51b21dc1a635dcefee335c89dbfcc9d051fd\
+                 9a2e8993d8895b561c9dffc0f0553c42e429735d4497eeb95f446ed875b11a25\
+                 50b817b89fd8e0187f",
+            )
+        );
+        let (opened, _) = server.open(&data, || unreachable!()).unwrap();
+        assert!(opened.proven_by(device_pk.as_ref()) && opened.payload == b"reg");
+        assert_eq!(
+            client.one_shot().unwrap().seal(b"p").unwrap(),
+            hex(
+                "00525a010300000000000000070000000000000001d16cfd8e3c7138ae6f4ee7\
+                 6c3c487a20b55a",
+            )
+        );
+
+        let mut push = Reply::push(7);
+        push.set_proven(true);
+        let down = server.seal(&mut push, 0, b"ok", || 5).unwrap();
+        assert_eq!(
+            down,
+            hex(
+                "00525a010400000000000000070000000000000005e05c30e6d7b82cdeeedf47\
+                 a8f0b70a7f9864fc",
+            )
+        );
+        assert_eq!(client.open(&down).unwrap(), b"ok");
+    }
 }
