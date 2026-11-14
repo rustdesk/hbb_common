@@ -1063,7 +1063,7 @@ impl Config {
                 .next()
                 .unwrap_or_default();
         }
-        if rendezvous_server.parse::<Ipv6Addr>().is_ok() {
+        if format!("[{rendezvous_server}]:0").parse::<std::net::SocketAddrV6>().is_ok() {
             return format!("[{rendezvous_server}]:{RENDEZVOUS_PORT}");
         }
         if !rendezvous_server.contains(':') {

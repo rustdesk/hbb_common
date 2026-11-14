@@ -396,7 +396,9 @@ pub fn is_ipv4_str(id: &str) -> bool {
 
 #[inline]
 pub fn is_ipv6_str(id: &str) -> bool {
-    if id.parse::<std::net::Ipv6Addr>().is_ok() || id.parse::<std::net::SocketAddrV6>().is_ok() {
+    if id.parse::<std::net::SocketAddrV6>().is_ok()
+        || format!("[{id}]:0").parse::<std::net::SocketAddrV6>().is_ok()
+    {
         return true;
     }
     if let Ok(reg) = regex::Regex::new(
@@ -577,6 +579,7 @@ mod test {
         assert_eq!(socket_client::check_port("::1", 21116), "[::1]:21116");
         assert!(is_ipv6_str("[::1]:21116"));
         assert_eq!(socket_client::increase_port("[::1]:21116", -1), "[::1]:21115");
+        assert_eq!(socket_client::check_port("fe80::1%3", 21116), "[fe80::1%3]:21116");
         assert!(is_ipv6_str("1:2:3"));
         assert!(is_ipv6_str("[ab:2:3]:12"));
         assert!(is_ipv6_str("[ABEF:2a:3]:12"));
