@@ -3100,6 +3100,7 @@ mod tests {
         test: impl FnOnce() -> R,
     ) -> R {
         let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
         let _state_guard = ConfigStateTestGuard::new(config, hard_settings);
         test()
     }
