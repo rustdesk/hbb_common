@@ -1063,6 +1063,9 @@ impl Config {
                 .next()
                 .unwrap_or_default();
         }
+        if rendezvous_server.parse::<Ipv6Addr>().is_ok() {
+            return format!("[{rendezvous_server}]:{RENDEZVOUS_PORT}");
+        }
         if !rendezvous_server.contains(':') {
             rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
         }
