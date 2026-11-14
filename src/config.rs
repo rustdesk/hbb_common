@@ -916,6 +916,12 @@ impl Config {
         }
     }
 
+    #[cfg(test)]
+    pub fn path<P: AsRef<Path>>(p: P) -> PathBuf {
+        tests::CONFIG_DIR.join(p)
+    }
+
+    #[cfg(not(test))]
     pub fn path<P: AsRef<Path>>(p: P) -> PathBuf {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
@@ -3039,6 +3045,14 @@ impl Status {
 mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
 
+    lazy_static::lazy_static! {
+        pub(super) static ref CONFIG_DIR: PathBuf = {
+            let path = std::env::temp_dir().join(format!("hbb-common-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).expect("create isolated test config directory");
+            path
+        };
+    }
+
     static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct ConfigStateTestGuard {
@@ -3102,6 +3116,34 @@ mod tests {
         let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
         let _state_guard = ConfigStateTestGuard::new(config, hard_settings);
         test()
+    }
+
+    #[test]
+    fn test_config_files_use_isolated_temporary_paths() {
+        let root = Config::path("");
+        assert!(root.starts_with(std::env::temp_dir()));
+        assert_ne!(root, std::env::temp_dir());
+        assert_eq!(
+            std::thread::spawn(|| Config::path("")).join().unwrap(),
+            root
+        );
+        for path in [
+            Config::file(),
+            Config2::file(),
+            Config::file_("_local"),
+            Config::file_("_default"),
+            PeerConfig::path("isolated-peer"),
+        ] {
+            assert!(path.starts_with(&root));
+        }
+
+        let config = Config {
+            id: "isolated-test-id".to_owned(),
+            ..Default::default()
+        };
+        Config::store_(&config, "_isolation_test");
+        assert_eq!(Config::load_::<Config>("_isolation_test"), config);
+        fs::remove_file(Config::file_("_isolation_test")).unwrap();
     }
 
     #[test]
