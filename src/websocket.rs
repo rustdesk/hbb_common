@@ -625,6 +625,7 @@ mod tests {
 
     #[test]
     fn test_check_ws() {
+        crate::test::init_config();
         let options = Config::get_options();
         // enable websocket
         Config::set_option(keys::OPTION_ALLOW_WEBSOCKET.to_string(), "Y".to_string());
