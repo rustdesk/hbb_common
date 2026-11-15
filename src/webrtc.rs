@@ -1554,6 +1554,7 @@ mod tests {
 
     #[test]
     fn test_webrtc_ice_url() {
+        crate::test::init_config();
         let turn = WebRTCStream::get_ice_server_from_url("turn://123:321@example.com:3478")
             .expect("credentialed turn is usable");
         assert_eq!(turn.urls[0], "turn:example.com:3478");
@@ -1649,6 +1650,7 @@ mod tests {
     // one process, so mutating it raced every peer connection the loopback tests were building.
     #[test]
     fn test_webrtc_ice_server_list() {
+        crate::test::init_config();
         assert_eq!(
             WebRTCStream::parse_ice_servers("")[0].urls[0],
             DEFAULT_ICE_SERVERS[0].to_string()
@@ -1670,6 +1672,7 @@ mod tests {
 
     #[test]
     fn test_endpoint_ice_policy_declaration() {
+        crate::test::init_config();
         // An envelope with the marker declares full ICE; everything else — no marker,
         // wrong value, foreign scheme, garbage — reads as the old Relay-only semantics.
         let marked =
@@ -1727,6 +1730,7 @@ mod tests {
     /// and a fragmented one is dropped without a trace on paths that discard fragments.
     #[tokio::test]
     async fn test_stored_endpoint_does_not_grow_with_the_live_description() {
+        crate::test::init_config();
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
         let live = first_gathered_description(&offerer).await;
         let endpoint = offerer.local_endpoint().to_owned();
@@ -1753,6 +1757,7 @@ mod tests {
     /// endpoint the peer cannot consume would trade a silent drop for a silent failure.
     #[tokio::test]
     async fn test_trickle_endpoint_splits_candidates_off() {
+        crate::test::init_config();
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
         let gathered = first_gathered_description(&offerer).await;
         offerer.close().await;
@@ -1803,6 +1808,7 @@ mod tests {
 
     #[test]
     fn test_webrtc_session_key() {
+        crate::test::init_config();
         let mut sdp_str = "".to_owned();
         assert_eq!(
             WebRTCStream::get_key_for_sdp(
@@ -1944,6 +1950,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
     #[tokio::test]
     async fn test_webrtc_new_stream() {
+        crate::test::init_config();
         let mut endpoint = "webrtc://sdfsdf".to_owned();
         assert!(
             WebRTCStream::new(&endpoint, false, 10000).await.is_err(),
@@ -1981,6 +1988,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
     #[tokio::test]
     async fn test_session_cleanup_only_removes_matching_peer() {
+        crate::test::init_config();
         let key = "test-session-cleanup".to_owned();
         let old_key = "test-session-cleanup-old".to_owned();
         let old = new_test_stream().await;
@@ -2017,6 +2025,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
     #[tokio::test]
     async fn test_webrtc_wait_connected_timeout() {
+        crate::test::init_config();
         let mut stream = WebRTCStream::new("", false, 100).await.unwrap();
         let err = stream.wait_connected(10).await.unwrap_err();
         assert!(err.to_string().contains("timeout"));
@@ -2057,6 +2066,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // entry. `close_detached` is non-async, so what needs proving is that the handoff completes.
     #[tokio::test]
     async fn test_close_detached_completes_without_the_caller() {
+        crate::test::init_config();
         let (offerer, answerer) = connect_loopback().await;
         let key = format!("offer:{}", offerer.session_key());
         assert!(
@@ -2083,6 +2093,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // exercises the refill itself — a boundary the fixed-size buffer never had.
     #[tokio::test]
     async fn test_webrtc_mixed_message_sizes_survive_scratch_refill() {
+        crate::test::init_config();
         let (mut offerer, mut answerer) = connect_loopback().await;
 
         // Sized either side of MAX_FRAGMENT_PAYLOAD, and enough rounds to consume several
@@ -2116,6 +2127,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // obligation, and the controlled side never honoured it.
     #[tokio::test]
     async fn dropping_the_stream_closes_the_peer_connection() {
+        crate::test::init_config();
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
         let key = format!("offer:{}", offerer.session_key());
         assert!(
@@ -2142,6 +2154,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // code: the lookup rejected the entry, and the insert handed back the very same one.
     #[tokio::test]
     async fn test_cached_peer_is_not_reused_across_ice_policies() {
+        crate::test::init_config();
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
         let offer = offerer.local_endpoint().to_owned();
 
@@ -2167,6 +2180,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // has only the teardown, which is what this pins.
     #[tokio::test]
     async fn test_local_ice_channel_closes_with_the_peer_connection() {
+        crate::test::init_config();
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
         let mut ice_rx = offerer.take_local_ice_rx().unwrap();
 
@@ -2193,6 +2207,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // left in CLOSE_WAIT.
     #[tokio::test]
     async fn test_local_ice_channel_closes_when_gathering_completes() {
+        crate::test::init_config();
         let offerer = WebRTCStream::new("", false, 20000).await.unwrap();
         let mut ice_rx = offerer.take_local_ice_rx().unwrap();
         let drained = timeout(Duration::from_secs(20), async {
@@ -2210,6 +2225,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // bind-once guard is exercised; the ordered+reliable check cannot decide anything here.
     #[tokio::test]
     async fn test_webrtc_answerer_binds_only_the_first_data_channel() {
+        crate::test::init_config();
         use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 
         let mut offerer = WebRTCStream::new("", false, 20000).await.unwrap();
@@ -2274,6 +2290,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // One-shot callers exchange only the endpoints and never consume `take_local_ice_rx`.
     #[tokio::test]
     async fn test_webrtc_loopback_gathered_endpoints() {
+        crate::test::init_config();
         let connect = async {
             let mut offerer = WebRTCStream::new("", false, 20000).await.unwrap();
             let offer = offerer.get_local_endpoint().await.unwrap();
@@ -2296,6 +2313,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // directly; the loopback test below covers the wiring from the flag out to callers.
     #[test]
     fn test_note_health_maps_only_the_transient_states() {
+        crate::test::init_config();
         use crate::webrtc::RTCPeerConnectionState;
         use std::sync::atomic::{AtomicBool, Ordering};
         let flag = AtomicBool::new(false);
@@ -2326,6 +2344,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // look suspect.
     #[tokio::test]
     async fn test_webrtc_disconnected_is_false_on_a_live_pair() {
+        crate::test::init_config();
         let body = async {
             let (offerer, answerer) = connect_loopback().await;
             assert!(!offerer.is_disconnected());
@@ -2343,6 +2362,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // messages cannot tell a peer mid-transfer from one that died.
     #[tokio::test]
     async fn test_webrtc_rx_progress_moves_before_a_large_message_completes() {
+        crate::test::init_config();
         let body = async {
             let (mut offerer, mut answerer) = connect_loopback().await;
 
@@ -2399,6 +2419,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // so the sender still puts it on the wire, exactly as an unauthenticated peer would.
     #[tokio::test]
     async fn test_webrtc_max_packet_length_bounds_reassembly() {
+        crate::test::init_config();
         let body = async {
             let (mut offerer, mut answerer) = connect_loopback().await;
             answerer.set_max_packet_length(16 * 1024);
@@ -2431,6 +2452,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // it is lifted, which is what authorization does on the server.
     #[tokio::test]
     async fn test_webrtc_max_packet_length_restores() {
+        crate::test::init_config();
         let body = async {
             let (mut offerer, mut answerer) = connect_loopback().await;
             answerer.set_max_packet_length(16 * 1024);
@@ -2461,6 +2483,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // configured/default STUN just fails in the background without blocking the host pair).
     #[tokio::test]
     async fn test_webrtc_loopback_roundtrip() {
+        crate::test::init_config();
         let connect = async {
             let (mut offerer, mut answerer) = connect_loopback().await;
 
@@ -2514,6 +2537,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // peer must still see EOF — the closer thread, not any caller runtime, delivers it.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_session_end_close_reaches_the_peer() {
+        crate::test::init_config();
         let (offerer, mut answerer) = connect_loopback().await;
         let stream = crate::Stream::WebRTC(offerer);
         tokio::task::spawn_blocking(move || {
@@ -2536,6 +2560,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // the last must close it — an unanswered offerer never reaches a terminal ICE state itself.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_last_abandoned_claim_closes_an_unadopted_pc() {
+        crate::test::init_config();
         let builder = WEBRTC_RT
             .as_ref()
             .expect("WebRTC I/O runtime")
@@ -2574,6 +2599,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // abandonment has to be a property of the pc, not of one handoff.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_abandoned_builder_handoff_spares_an_adopted_pc() {
+        crate::test::init_config();
         // Exactly what `new()` does, minus the adoption: the setup task runs on WEBRTC_RT and
         // hands back a fresh, still-unadopted handoff.
         let builder = WEBRTC_RT
@@ -2621,6 +2647,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // the whole wait while the other keeps starting sessions.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cancelled_new_does_not_leak_the_pc() {
+        crate::test::init_config();
         use std::collections::HashSet;
         let before: HashSet<String> = SESSIONS.lock().await.keys().cloned().collect();
         // Zero timeout: polls the future exactly once (spawning new_inner), then cancels it —
@@ -2678,6 +2705,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // (non-trickle) endpoints keep the cross-runtime signaling to two string handoffs.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_close_survives_creator_runtime_destruction() {
+        crate::test::init_config();
         // tokio oneshots for every handoff: their sends are synchronous, and the session side
         // awaits them INSIDE block_on — a current_thread runtime only drives its tasks while
         // being block_on-driven, and the offerer's SCTP/ICE pumps must stay live until the
@@ -2732,6 +2760,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // must end up closed and evicted, never stranded by one closer cancelling the other.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_eof_close_then_drop_still_evicts() {
+        crate::test::init_config();
         let (mut offerer, answerer) = connect_loopback().await;
         let key = format!("offer:{}", offerer.session_key());
         answerer.close().await;
@@ -2757,6 +2786,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
     // The bad frame is injected mid-message so the branch's `acc` reset is exercised too.
     #[tokio::test]
     async fn test_webrtc_rejects_bad_fragment_framing() {
+        crate::test::init_config();
         // (raw frame, expected substring)
         let cases: [(&[u8], &str); 2] = [
             (&[0x2A, b'x'], "fragment header 42"),
@@ -2797,6 +2827,7 @@ IHR5cCBzcmZseCByYWRkciAwLjAuMC4wIHJwb3J0IDY0MDA4XHJcbmE9ZW5kLW9mLWNhbmRpZGF0ZXNc
 
     #[tokio::test]
     async fn test_webrtc_concurrent_large_sends_preserve_boundaries() {
+        crate::test::init_config();
         let connect = async {
             let (offerer, mut answerer) = connect_loopback().await;
             let mut sender_a = offerer.clone();

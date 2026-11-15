@@ -547,6 +547,21 @@ pub fn time_based_rand() -> u32 {
 mod test {
     use super::*;
 
+    pub(crate) static CONFIG_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn init_config() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let app_name = format!("RustDesk-test-{}", uuid::Uuid::new_v4());
+            // Mobile config paths use APP_DIR rather than APP_NAME.
+            *config::APP_DIR.write().unwrap() = std::env::temp_dir()
+                .join(&app_name)
+                .to_string_lossy()
+                .into_owned();
+            *config::APP_NAME.write().unwrap() = app_name;
+        });
+    }
+
     #[test]
     fn test_mangle() {
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 16, 32), 21116));

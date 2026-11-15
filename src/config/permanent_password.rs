@@ -215,6 +215,7 @@ mod tests {
 
     #[test]
     fn test_permanent_password_h1_storage_roundtrip() {
+        crate::test::init_config();
         let salt = "salt123";
         let password = "p@ssw0rd";
         let h1 = compute_permanent_password_h1(password, salt);
@@ -227,6 +228,7 @@ mod tests {
 
     #[test]
     fn test_permanent_password_encrypted_storage_uses_01_outer_and_00_inner() {
+        crate::test::init_config();
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let storage = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
 
@@ -245,6 +247,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_hashed_password_storage_matches_plain_with_salt() {
+        crate::test::init_config();
         let salt = "salt123";
         let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
         let storage = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
@@ -262,6 +265,7 @@ mod tests {
 
     #[test]
     fn test_hbbs_00_hashed_preset_password_storage_is_decoded_for_preset_auth() {
+        crate::test::init_config();
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let storage = encode_hbbs_preset_password_storage_from_h1(&h1);
 
@@ -270,6 +274,7 @@ mod tests {
 
     #[test]
     fn test_hbbs_00_hashed_preset_password_storage_matches_plain_with_salt() {
+        crate::test::init_config();
         let salt = "salt123";
         let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
         let storage = encode_hbbs_preset_password_storage_from_h1(&h1);
@@ -287,6 +292,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_hash_storage_is_not_accepted_as_preset_storage() {
+        crate::test::init_config();
         let salt = "salt123";
         let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
         let storage = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
@@ -301,6 +307,7 @@ mod tests {
 
     #[test]
     fn test_hbbs_00_shaped_preset_password_without_salt_stays_plaintext() {
+        crate::test::init_config();
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let storage = encode_hbbs_preset_password_storage_from_h1(&h1);
 
@@ -317,6 +324,7 @@ mod tests {
 
     #[test]
     fn test_hashed_preset_password_storage_without_salt_is_not_usable() {
+        crate::test::init_config();
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let storage = encode_permanent_password_storage_from_h1(&h1);
 
@@ -330,6 +338,7 @@ mod tests {
 
     #[test]
     fn test_legacy_plain_preset_password_without_salt_keeps_old_behavior() {
+        crate::test::init_config();
         let storage = "01not-a-valid-hash";
 
         assert!(preset_permanent_password_storage_is_usable_for_auth(
@@ -344,6 +353,7 @@ mod tests {
 
     #[test]
     fn test_malformed_preset_password_with_salt_is_not_usable_for_auth() {
+        crate::test::init_config();
         for storage in ["01not-a-valid-hash", "00not-a-valid-hash"] {
             assert!(!preset_permanent_password_storage_is_usable_for_auth(
                 storage,
@@ -359,6 +369,7 @@ mod tests {
 
     #[test]
     fn test_invalid_current_version_storage_is_not_usable_for_auth() {
+        crate::test::init_config();
         let encrypted = symmetric_crypt(b"not-a-hash", true).unwrap();
         let encrypted_non_hash = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
             + &base64::encode(encrypted, base64::Variant::Original);
@@ -376,6 +387,7 @@ mod tests {
 
     #[test]
     fn test_legacy_plain_preset_password_that_decodes_as_hash_requires_salt() {
+        crate::test::init_config();
         let h1 = compute_permanent_password_h1("plain-looking-hash", "salt123");
         let storage = encode_permanent_password_storage_from_h1(&h1);
 
@@ -389,6 +401,7 @@ mod tests {
 
     #[test]
     fn test_password_is_empty_or_not_hashed_accepts_plaintext_and_decryptable_legacy_plaintext() {
+        crate::test::init_config();
         let storage =
             encrypt_str_or_original("legacy-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
 
@@ -398,6 +411,7 @@ mod tests {
 
     #[test]
     fn test_password_is_empty_or_not_hashed_treats_locked_00_storage_as_hashed() {
+        crate::test::init_config();
         let invalid_payload = vec![42u8; sodiumoxide::crypto::secretbox::MACBYTES + 1];
         let locked_storage = PASSWORD_ENC_VERSION.to_owned()
             + &base64::encode(invalid_payload, base64::Variant::Original);
@@ -407,6 +421,7 @@ mod tests {
 
     #[test]
     fn test_password_is_empty_or_not_hashed_treats_invalid_01_storage_as_hashed() {
+        crate::test::init_config();
         assert!(!password_is_empty_or_not_hashed("01not-a-valid-hash"));
     }
 }

@@ -265,6 +265,7 @@ mod test {
 
     #[test]
     fn test() {
+        crate::test::init_config();
         use super::*;
         use rand::{thread_rng, Rng};
         use std::time::Instant;
@@ -396,6 +397,7 @@ mod test {
 
     #[test]
     fn test_is_encrypted() {
+        crate::test::init_config();
         use super::*;
         use sodiumoxide::base64::{encode, Variant};
         use sodiumoxide::crypto::secretbox;
@@ -439,6 +441,7 @@ mod test {
 
     #[test]
     fn test_encrypted_payload_min_len_macbytes() {
+        crate::test::init_config();
         use super::*;
         use sodiumoxide::base64::{decode, Variant};
         use sodiumoxide::crypto::secretbox;
@@ -463,6 +466,7 @@ mod test {
 
     #[test]
     fn test_encryption_uses_random_nonce() {
+        crate::test::init_config();
         use super::*;
 
         let data = b"test password 123";
@@ -482,6 +486,7 @@ mod test {
 
     #[test]
     fn test_decrypt_legacy_zero_nonce_payload() {
+        crate::test::init_config();
         use super::*;
         use std::convert::TryInto;
 
@@ -498,6 +503,7 @@ mod test {
 
     #[test]
     fn test_decrypt_legacy_payload_starting_with_v1_marker() {
+        crate::test::init_config();
         use super::*;
         use std::convert::TryInto;
 
@@ -520,6 +526,7 @@ mod test {
 
     #[test]
     fn test_invalid_short_v1_payload_returns_error() {
+        crate::test::init_config();
         use super::*;
 
         let encrypted = vec![FORMAT_V1];
@@ -529,6 +536,7 @@ mod test {
 
     #[test]
     fn test_decrypt_legacy_string_does_not_request_store() {
+        crate::test::init_config();
         use super::*;
         use sodiumoxide::base64::{encode, Variant};
         use std::convert::TryInto;
@@ -551,6 +559,7 @@ mod test {
 
     #[test]
     fn test_decrypt_legacy_vec_does_not_request_store() {
+        crate::test::init_config();
         use super::*;
         use sodiumoxide::base64::{encode, Variant};
         use std::convert::TryInto;
@@ -575,6 +584,8 @@ mod test {
     #[test]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn test_decrypt_with_pk_fallback() {
+        crate::test::init_config();
+        let _guard = crate::test::CONFIG_STATE_TEST_LOCK.lock().unwrap();
         use sodiumoxide::crypto::secretbox;
         use std::convert::TryInto;
 
@@ -608,6 +619,8 @@ mod test {
     #[test]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn test_decrypt_v1_with_pk_fallback() {
+        crate::test::init_config();
+        let _guard = crate::test::CONFIG_STATE_TEST_LOCK.lock().unwrap();
         use super::*;
         use sodiumoxide::base64::{encode, Variant};
         use sodiumoxide::crypto::secretbox;

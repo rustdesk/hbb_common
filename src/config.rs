@@ -916,12 +916,6 @@ impl Config {
         }
     }
 
-    #[cfg(test)]
-    pub fn path<P: AsRef<Path>>(p: P) -> PathBuf {
-        tests::CONFIG_DIR.join(p)
-    }
-
-    #[cfg(not(test))]
     pub fn path<P: AsRef<Path>>(p: P) -> PathBuf {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
@@ -3044,16 +3038,7 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
-
-    lazy_static::lazy_static! {
-        pub(super) static ref CONFIG_DIR: PathBuf = {
-            let path = std::env::temp_dir().join(format!("hbb-common-test-{}", uuid::Uuid::new_v4()));
-            fs::create_dir(&path).expect("create isolated test config directory");
-            path
-        };
-    }
-
-    static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test::CONFIG_STATE_TEST_LOCK;
 
     struct ConfigStateTestGuard {
         original_config: Config,
@@ -3119,12 +3104,21 @@ mod tests {
     }
 
     #[test]
-    fn test_config_files_use_isolated_temporary_paths() {
+    fn test_config_files_use_isolated_application_paths() {
+        crate::test::init_config();
+        let app_name = APP_NAME.read().unwrap().clone();
+        assert!(app_name.starts_with("RustDesk-test-"));
+        let identifier = app_name.strip_prefix("RustDesk-test-").unwrap();
+        assert!(uuid::Uuid::parse_str(identifier).is_ok());
         let root = Config::path("");
-        assert!(root.starts_with(std::env::temp_dir()));
-        assert_ne!(root, std::env::temp_dir());
+        assert!(root.to_string_lossy().contains(identifier));
         assert_eq!(
-            std::thread::spawn(|| Config::path("")).join().unwrap(),
+            std::thread::spawn(|| {
+                crate::test::init_config();
+                Config::path("")
+            })
+            .join()
+            .unwrap(),
             root
         );
         for path in [
@@ -3148,6 +3142,7 @@ mod tests {
 
     #[test]
     fn test_serialize() {
+        crate::test::init_config();
         let cfg: Config = Default::default();
         let res = toml::to_string_pretty(&cfg);
         assert!(res.is_ok());
@@ -3158,6 +3153,7 @@ mod tests {
 
     #[test]
     fn test_hbbs_00_hashed_preset_password_storage_matches_plain_with_salt() {
+        crate::test::init_config();
         let salt = "salt123";
         let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
         let storage = "00".to_owned() + &base64::encode(h1, base64::Variant::Original);
@@ -3176,6 +3172,7 @@ mod tests {
 
     #[test]
     fn test_legacy_plain_preset_password_with_00_hash_shape_without_salt_keeps_old_behavior() {
+        crate::test::init_config();
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let storage = "00".to_owned() + &base64::encode(h1, base64::Variant::Original);
         let hard_settings = HashMap::from([("password".to_owned(), storage.clone())]);
@@ -3193,6 +3190,7 @@ mod tests {
 
     #[test]
     fn test_local_hashed_permanent_password_without_salt_is_not_reported_as_set() {
+        crate::test::init_config();
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let mut config = Config::default();
         config.password = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
@@ -3206,6 +3204,7 @@ mod tests {
 
     #[test]
     fn test_invalid_local_hashed_password_does_not_generate_effective_salt() {
+        crate::test::init_config();
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let mut config = Config::default();
         config.password = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
@@ -3221,6 +3220,7 @@ mod tests {
 
     #[test]
     fn test_legacy_plain_preset_password_uses_local_salt_for_challenge() {
+        crate::test::init_config();
         let mut config = Config::default();
         config.salt = "local1".to_owned();
         let hard_settings = HashMap::from([("password".to_owned(), "legacy-password".to_owned())]);
@@ -3234,6 +3234,7 @@ mod tests {
 
     #[test]
     fn test_malformed_preset_password_with_salt_is_not_usable() {
+        crate::test::init_config();
         for storage in ["01secret", "00not-a-valid-hash"] {
             let hard_settings = HashMap::from([
                 ("password".to_owned(), storage.to_owned()),
@@ -3254,6 +3255,7 @@ mod tests {
 
     #[test]
     fn test_validate_or_decrypt_keeps_plaintext_permanent_password_unchanged() {
+        crate::test::init_config();
         let mut cfg = Config::default();
         cfg.password = "p@ssw0rd".to_owned();
         cfg.salt = "".to_owned();
@@ -3264,6 +3266,7 @@ mod tests {
 
     #[test]
     fn test_validate_or_decrypt_decrypts_00_permanent_password_without_forcing_store() {
+        crate::test::init_config();
         let mut cfg = Config::default();
         let legacy_storage =
             encrypt_str_or_original("legacy-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
@@ -3276,6 +3279,7 @@ mod tests {
 
     #[test]
     fn test_validate_or_decrypt_rejects_corrupted_00_permanent_password_storage() {
+        crate::test::init_config();
         let legacy_storage =
             encrypt_str_or_original("legacy-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
         let mut invalid_payload = base64::decode(
@@ -3295,6 +3299,7 @@ mod tests {
 
     #[test]
     fn test_validate_or_decrypt_rejects_encrypted_hashed_permanent_password_without_salt() {
+        crate::test::init_config();
         let mut cfg = Config::default();
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         cfg.password = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
@@ -3307,6 +3312,7 @@ mod tests {
 
     #[test]
     fn test_set_does_not_validate_or_decrypt_permanent_password_storage_in_memory() {
+        crate::test::init_config();
         let mut cfg = Config::default();
         let invalid_payload =
             crate::password_security::symmetric_crypt(b"not-a-hash", true).unwrap();
@@ -3327,6 +3333,7 @@ mod tests {
 
     #[test]
     fn test_store_keeps_existing_enc_id_when_id_is_unchanged() {
+        crate::test::init_config();
         let mut cfg = Config::default();
         cfg.id = "123456789".to_owned();
         cfg.enc_id = encrypt_str_or_original(&cfg.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
@@ -3342,6 +3349,7 @@ mod tests {
 
     #[test]
     fn test_store_rewrites_enc_id_when_id_changes() {
+        crate::test::init_config();
         let original_id = "123456789";
         let updated_id = "987654321";
         let mut cfg = Config::default();
@@ -3364,6 +3372,7 @@ mod tests {
 
     #[test]
     fn test_config2_store_keeps_existing_unlock_pin_when_pin_is_unchanged() {
+        crate::test::init_config();
         let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
         let _file_guard = ConfigFileRestoreGuard::new(Config::file_("2"));
         let pin = "123456";
@@ -3388,6 +3397,7 @@ mod tests {
 
     #[test]
     fn test_set_does_not_convert_plaintext_permanent_password_to_storage_format_in_memory() {
+        crate::test::init_config();
         let mut cfg = Config::default();
         cfg.password = "legacy-secret".to_owned();
         cfg.salt = "".to_owned();
@@ -3404,6 +3414,7 @@ mod tests {
 
     #[test]
     fn test_set_keeps_plaintext_permanent_password_with_current_prefix_in_memory() {
+        crate::test::init_config();
         let mut cfg = Config::default();
         cfg.password = "01legacy-secret".to_owned();
         cfg.salt = "".to_owned();
@@ -3420,6 +3431,7 @@ mod tests {
     #[test]
     fn test_validate_or_decrypt_keeps_plaintext_permanent_password_with_current_prefix_and_long_base64(
     ) {
+        crate::test::init_config();
         let mut cfg = Config::default();
         let plain = "01".to_owned() + &base64::encode([42u8; 24], base64::Variant::Original);
         cfg.password = plain.clone();
@@ -3432,6 +3444,7 @@ mod tests {
 
     #[test]
     fn test_permanent_password_sync_treats_same_encrypted_hash_as_unchanged() {
+        crate::test::init_config();
         let mut cfg = Config::default();
         cfg.salt = "salt123".to_owned();
         let h1 = compute_permanent_password_h1("p@ssw0rd", &cfg.salt);
@@ -3450,6 +3463,7 @@ mod tests {
 
     #[test]
     fn test_permanent_password_sync_stores_incoming_encrypted_hash_when_local_empty() {
+        crate::test::init_config();
         let salt = "salt123";
         let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
         let incoming = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
@@ -3464,6 +3478,7 @@ mod tests {
 
     #[test]
     fn test_permanent_password_sync_rejects_non_current_storage_payloads() {
+        crate::test::init_config();
         let invalid_payload = vec![42u8; sodiumoxide::crypto::secretbox::MACBYTES + 1];
         let invalid_storage = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
             + &base64::encode(invalid_payload, base64::Variant::Original);
@@ -3504,6 +3519,7 @@ mod tests {
 
     #[test]
     fn test_permanent_password_sync_rejects_non_empty_storage_without_salt() {
+        crate::test::init_config();
         let mut cfg = Config::default();
         let h1 = compute_permanent_password_h1("p@ssw0rd", "salt123");
         let incoming = encode_permanent_password_encrypted_storage_from_h1(&h1).unwrap();
@@ -3517,6 +3533,7 @@ mod tests {
 
     #[test]
     fn test_permanent_password_sync_empty_storage_clears_existing_password() {
+        crate::test::init_config();
         let salt = "salt123";
         let h1 = compute_permanent_password_h1("p@ssw0rd", salt);
         let mut cfg = Config::default();
@@ -3530,6 +3547,7 @@ mod tests {
 
     #[test]
     fn test_permanent_password_sync_empty_storage_uses_incoming_salt() {
+        crate::test::init_config();
         let old_salt = "old-salt";
         let h1 = compute_permanent_password_h1("p@ssw0rd", old_salt);
         let mut cfg = Config::default();
@@ -3545,6 +3563,7 @@ mod tests {
 
     #[test]
     fn test_overwrite_settings() {
+        crate::test::init_config();
         DEFAULT_SETTINGS
             .write()
             .unwrap()
@@ -3699,6 +3718,7 @@ mod tests {
 
     #[test]
     fn test_config_deserialize() {
+        crate::test::init_config();
         let wrong_type_str = r#"
         id = true
         enc_id = []
@@ -3733,6 +3753,7 @@ mod tests {
 
     #[test]
     fn test_peer_config_deserialize() {
+        crate::test::init_config();
         let default_peer_config = toml::from_str::<PeerConfig>("").unwrap();
         // test custom_resolution
         {
@@ -3777,6 +3798,7 @@ mod tests {
 
     #[test]
     fn test_store_load() {
+        crate::test::init_config();
         let peerconfig_id = "123456789";
         let cfg: PeerConfig = Default::default();
         cfg.store(&peerconfig_id);
@@ -3800,6 +3822,7 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_uinput_ipc_path_is_shared_across_uids() {
+        crate::test::init_config();
         const ROOT_UID: u32 = 0;
         const USER_UID: u32 = 1000;
 
