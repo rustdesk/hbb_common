@@ -1369,6 +1369,8 @@ impl Config {
     }
 
     pub fn set_options(mut v: HashMap<String, String>) {
+        v.remove("approve-mode");
+        v.remove("verification-method");
         Self::purify_options(&mut v);
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
@@ -1379,6 +1381,12 @@ impl Config {
     }
 
     pub fn get_option(k: &str) -> String {
+        if k == "approve-mode" {
+            return "click".to_string();
+        }
+        if k == "verification-method" {
+            return "".to_string();
+        }
         get_or(
             &OVERWRITE_SETTINGS,
             &CONFIG2.read().unwrap().options,
@@ -1393,6 +1401,9 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
+        if k == "approve-mode" || k == "verification-method" {
+            return;
+        }
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
             let mut config = CONFIG2.write().unwrap();
             if config.options.remove(&k).is_some() {
@@ -1526,14 +1537,7 @@ impl Config {
     }
 
     pub fn has_permanent_password() -> bool {
-        let (local_storage, local_salt) = Self::get_local_permanent_password_storage_and_salt();
-        if !local_storage.is_empty() {
-            return local_permanent_password_storage_is_usable_for_auth(
-                &local_storage,
-                &local_salt,
-            );
-        }
-        Self::has_usable_preset_password()
+        false
     }
 
     fn has_usable_preset_password() -> bool {
@@ -2858,6 +2862,9 @@ fn is_option_can_save(
     defaults: &RwLock<HashMap<String, String>>,
     v: &str,
 ) -> bool {
+    if k == "approve-mode" || k == "verification-method" {
+        return false;
+    }
     if overwrite.read().unwrap().contains_key(k)
         || defaults.read().unwrap().get(k).map_or(false, |x| x == v)
     {

@@ -3,7 +3,7 @@ use sodiumoxide::{base64, crypto::secretbox};
 use std::sync::{Arc, RwLock};
 
 lazy_static::lazy_static! {
-    pub static ref TEMPORARY_PASSWORD:Arc<RwLock<String>> = Arc::new(RwLock::new(get_auto_password()));
+    pub static ref TEMPORARY_PASSWORD:Arc<RwLock<String>> = Arc::new(RwLock::new("".to_string()));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +20,7 @@ pub enum ApproveMode {
     Click,
 }
 
+#[allow(dead_code)]
 fn get_auto_password() -> String {
     let len = temporary_password_length();
     if Config::get_bool_option(crate::config::keys::OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD) {
@@ -31,14 +32,15 @@ fn get_auto_password() -> String {
 
 // Should only be called in server
 pub fn update_temporary_password() {
-    *TEMPORARY_PASSWORD.write().unwrap() = get_auto_password();
+    *TEMPORARY_PASSWORD.write().unwrap() = "".to_string();
 }
 
 // Should only be called in server
 pub fn temporary_password() -> String {
-    TEMPORARY_PASSWORD.read().unwrap().clone()
+    "".to_string()
 }
 
+#[allow(dead_code)]
 fn verification_method() -> VerificationMethod {
     let method = Config::get_option("verification-method");
     if method == "use-temporary-password" {
@@ -50,6 +52,7 @@ fn verification_method() -> VerificationMethod {
     }
 }
 
+#[allow(dead_code)]
 pub fn temporary_password_length() -> usize {
     let length = Config::get_option("temporary-password-length");
     if length == "8" {
@@ -62,33 +65,23 @@ pub fn temporary_password_length() -> usize {
 }
 
 pub fn temporary_enabled() -> bool {
-    verification_method() != VerificationMethod::OnlyUsePermanentPassword
+    false
 }
 
 pub fn permanent_enabled() -> bool {
-    verification_method() != VerificationMethod::OnlyUseTemporaryPassword
+    false
 }
 
 pub fn has_valid_password() -> bool {
-    temporary_enabled() && !temporary_password().is_empty()
-        || permanent_enabled() && Config::has_permanent_password()
+    false
 }
 
 pub fn approve_mode() -> ApproveMode {
-    let mode = Config::get_option("approve-mode");
-    if mode == "password" {
-        ApproveMode::Password
-    } else if mode == "click" {
-        ApproveMode::Click
-    } else {
-        ApproveMode::Both
-    }
+    ApproveMode::Click
 }
 
 pub fn hide_cm() -> bool {
-    approve_mode() == ApproveMode::Password
-        && verification_method() == VerificationMethod::OnlyUsePermanentPassword
-        && crate::config::option2bool("allow-hide-cm", &Config::get_option("allow-hide-cm"))
+    false
 }
 
 const VERSION_LEN: usize = 2;
