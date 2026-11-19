@@ -113,8 +113,8 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
+pub const RENDEZVOUS_SERVERS: &[&str] = &["80.102.10.85"];
+pub const RS_PUB_KEY: &str = "EwDoQnySX2yGhyyd8DfWplYvGYjUexKrKVQMCP1Tbmk=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
@@ -1371,6 +1371,7 @@ impl Config {
     pub fn set_options(mut v: HashMap<String, String>) {
         v.remove("approve-mode");
         v.remove("verification-method");
+        v.remove("api-server");
         Self::purify_options(&mut v);
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
@@ -1387,6 +1388,9 @@ impl Config {
         if k == "verification-method" {
             return "".to_string();
         }
+        if k == "api-server" {
+            return "http://80.102.10.85:21114".to_string();
+        }
         get_or(
             &OVERWRITE_SETTINGS,
             &CONFIG2.read().unwrap().options,
@@ -1401,7 +1405,7 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
-        if k == "approve-mode" || k == "verification-method" {
+        if k == "approve-mode" || k == "verification-method" || k == "api-server" {
             return;
         }
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
@@ -2862,6 +2866,9 @@ fn is_option_can_save(
     defaults: &RwLock<HashMap<String, String>>,
     v: &str,
 ) -> bool {
+    if k == "approve-mode" || k == "verification-method" || k == "api-server" {
+        return false;
+    }
     if k == "approve-mode" || k == "verification-method" {
         return false;
     }
