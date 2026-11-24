@@ -19,6 +19,8 @@ use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
 
 mod permanent_password;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod unix_unlock_pin;
 
 pub use permanent_password::{
     compute_permanent_password_h1, decode_permanent_password_h1_from_storage,
@@ -244,6 +246,10 @@ pub struct Config2 {
     #[serde(default, deserialize_with = "deserialize_i32")]
     serial: i32,
     #[serde(default, deserialize_with = "deserialize_string")]
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "macos"),
+        serde(skip_serializing_if = "String::is_empty")
+    )]
     unlock_pin: String,
     // Imported by clients that support legacy trusted-device compatibility.
     #[serde(
@@ -496,6 +502,12 @@ fn patch(path: PathBuf) -> PathBuf {
 }
 
 impl Config2 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn without_unlock_pin(mut self) -> Self {
+        self.unlock_pin.clear();
+        self
+    }
+
     fn load() -> Config2 {
         let mut config = Config::load_::<Config2>("2");
         let mut store = false;
@@ -3318,6 +3330,20 @@ mod tests {
             assert_eq!(stored_id, updated_id);
             assert_eq!(Config::get().id, updated_id);
         });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unlock_pin_is_excluded_from_unix_sync_snapshots() {
+        let original = Config2 {
+            unlock_pin: "fixture-pin".into(),
+            nat_type: 3,
+            ..Default::default()
+        };
+        let snapshot = original.clone().without_unlock_pin();
+        assert_eq!(snapshot.nat_type, original.nat_type);
+        assert!(snapshot.unlock_pin.is_empty());
+        assert_eq!(original.unlock_pin, "fixture-pin");
     }
 
     #[test]
