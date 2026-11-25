@@ -2050,7 +2050,13 @@ impl PeerConfig {
     serde_field_string!(
         default_keyboard_mode,
         deserialize_keyboard_mode,
-        UserDefaultConfig::read(keys::OPTION_KEYBOARD_MODE)
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            // Mobile clients cannot encode physical keyboard events in Legacy mode.
+            // The `keyboard-mode` display setting is unsupported on mobile controllers.
+            String::new()
+        } else {
+            UserDefaultConfig::read(keys::OPTION_KEYBOARD_MODE)
+        }
     );
     serde_field_string!(
         default_scroll_style,
@@ -3790,17 +3796,22 @@ mod tests {
     }
 
     #[test]
-    fn peer_keyboard_mode_inherits_the_display_default() {
+    fn peer_keyboard_mode_with_display_override() {
         let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
         let key = keys::OPTION_KEYBOARD_MODE;
         OVERWRITE_DISPLAY_SETTINGS
             .write()
             .unwrap()
-            .insert(key.into(), "translate".into());
-        assert_eq!(PeerConfig::default().keyboard_mode, "translate");
+            .insert(key.into(), "legacy".into());
+        let expected_default = if cfg!(any(target_os = "android", target_os = "ios")) {
+            ""
+        } else {
+            "legacy"
+        };
+        assert_eq!(PeerConfig::default().keyboard_mode, expected_default);
         for (toml, expected) in [
-            ("", "translate"),
-            (r#"keyboard_mode = """#, "translate"),
+            ("", expected_default),
+            (r#"keyboard_mode = """#, expected_default),
             (r#"keyboard_mode = "map""#, "map"),
         ] {
             assert_eq!(
