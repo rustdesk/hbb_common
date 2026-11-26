@@ -338,8 +338,8 @@ pub struct PeerConfig {
     #[serde(flatten)]
     pub follow_remote_window: FollowRemoteWindow,
     #[serde(
-        default,
-        deserialize_with = "deserialize_string",
+        default = "PeerConfig::default_keyboard_mode",
+        deserialize_with = "PeerConfig::deserialize_keyboard_mode",
         skip_serializing_if = "String::is_empty"
     )]
     pub keyboard_mode: String,
@@ -424,7 +424,7 @@ impl Default for PeerConfig {
             show_quality_monitor: Default::default(),
             follow_remote_cursor: Default::default(),
             follow_remote_window: Default::default(),
-            keyboard_mode: Default::default(),
+            keyboard_mode: Self::default_keyboard_mode(),
             view_only: Default::default(),
             show_my_cursor: Default::default(),
             reverse_mouse_wheel: Self::default_reverse_mouse_wheel(),
@@ -2048,6 +2048,17 @@ impl PeerConfig {
         UserDefaultConfig::read(keys::OPTION_VIEW_STYLE)
     );
     serde_field_string!(
+        default_keyboard_mode,
+        deserialize_keyboard_mode,
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            // Mobile clients cannot encode physical keyboard events in Legacy mode.
+            // The `keyboard-mode` display setting is unsupported on mobile controllers.
+            String::new()
+        } else {
+            UserDefaultConfig::read(keys::OPTION_KEYBOARD_MODE)
+        }
+    );
+    serde_field_string!(
         default_scroll_style,
         deserialize_scroll_style,
         UserDefaultConfig::read(keys::OPTION_SCROLL_STYLE)
@@ -2477,6 +2488,9 @@ impl UserDefaultConfig {
             keys::OPTION_VIEW_STYLE => self.get_string(key, "adaptive", vec!["original"]),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             keys::OPTION_VIEW_STYLE => self.get_string(key, "original", vec!["adaptive"]),
+            keys::OPTION_KEYBOARD_MODE => {
+                self.get_string(key, "map", vec!["legacy", "translate"])
+            }
             keys::OPTION_SCROLL_STYLE => {
                 self.get_string(key, "scrollauto", vec!["scrolledge", "scrollbar"])
             }
@@ -2957,6 +2971,7 @@ pub mod keys {
     pub const OPTION_USE_ALL_MY_DISPLAYS_FOR_THE_REMOTE_SESSION: &str =
         "use_all_my_displays_for_the_remote_session";
     pub const OPTION_VIEW_STYLE: &str = "view_style";
+    pub const OPTION_KEYBOARD_MODE: &str = "keyboard_mode";
     pub const OPTION_SCROLL_STYLE: &str = "scroll_style";
     pub const OPTION_EDGE_SCROLL_EDGE_THICKNESS: &str = "edge-scroll-edge-thickness";
     pub const OPTION_IMAGE_QUALITY: &str = "image_quality";
@@ -3503,6 +3518,7 @@ mod tests {
 
     #[test]
     fn test_overwrite_settings() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
         DEFAULT_SETTINGS
             .write()
             .unwrap()
@@ -3691,6 +3707,7 @@ mod tests {
 
     #[test]
     fn test_peer_config_deserialize() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
         let default_peer_config = toml::from_str::<PeerConfig>("").unwrap();
         // test custom_resolution
         {
@@ -3735,6 +3752,7 @@ mod tests {
 
     #[test]
     fn test_store_load() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
         let peerconfig_id = "123456789";
         let cfg: PeerConfig = Default::default();
         cfg.store(&peerconfig_id);
@@ -3775,5 +3793,41 @@ mod tests {
         let non_service_root = Config::ipc_path_for_uid(ROOT_UID, "");
         let non_service_user = Config::ipc_path_for_uid(USER_UID, "");
         assert_ne!(non_service_root, non_service_user);
+    }
+
+    #[test]
+    fn peer_keyboard_mode_with_display_override() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let key = keys::OPTION_KEYBOARD_MODE;
+        OVERWRITE_DISPLAY_SETTINGS
+            .write()
+            .unwrap()
+            .insert(key.into(), "legacy".into());
+        let expected_default = if cfg!(any(target_os = "android", target_os = "ios")) {
+            ""
+        } else {
+            "legacy"
+        };
+        assert_eq!(PeerConfig::default().keyboard_mode, expected_default);
+        for (toml, expected) in [
+            ("", expected_default),
+            (r#"keyboard_mode = """#, expected_default),
+            (r#"keyboard_mode = "map""#, "map"),
+        ] {
+            assert_eq!(
+                toml::from_str::<PeerConfig>(toml).unwrap().keyboard_mode,
+                expected
+            );
+        }
+        OVERWRITE_DISPLAY_SETTINGS.write().unwrap().remove(key);
+    }
+
+    #[test]
+    fn keyboard_mode_defaults_to_map() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        assert_eq!(
+            UserDefaultConfig::default().get(keys::OPTION_KEYBOARD_MODE),
+            "map"
+        );
     }
 }
