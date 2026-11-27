@@ -640,6 +640,28 @@ impl Config2 {
         lock.store();
         true
     }
+
+    /// Replaces the configuration while keeping each preserved key's stored value or absence.
+    pub fn set_preserving_keys(mut incoming: Self, preserved_keys: &[&str]) -> bool {
+        let mut current = CONFIG2.write().unwrap();
+        current.preserve_keys(&mut incoming.options, preserved_keys);
+        if *current == incoming {
+            return false;
+        }
+        *current = incoming;
+        current.store();
+        true
+    }
+
+    fn preserve_keys(&self, options: &mut HashMap<String, String>, preserved_keys: &[&str]) {
+        for &key in preserved_keys {
+            if let Some(value) = self.options.get(key) {
+                options.insert(key.to_owned(), value.clone());
+            } else {
+                options.remove(key);
+            }
+        }
+    }
 }
 
 fn keep_encrypted_storage_if_plaintext_unchanged(plain: &str, stored: &str) -> String {
@@ -1376,6 +1398,20 @@ impl Config {
         }
         config.options = v;
         config.store();
+    }
+
+    /// Replaces the options while keeping each preserved key's stored value or absence.
+    pub fn set_options_preserving_keys(
+        mut options: HashMap<String, String>,
+        preserved_keys: &[&str],
+    ) {
+        Self::purify_options(&mut options);
+        let mut current = CONFIG2.write().unwrap();
+        current.preserve_keys(&mut options, preserved_keys);
+        if current.options != options {
+            current.options = options;
+            current.store();
+        }
     }
 
     pub fn get_option(k: &str) -> String {
@@ -3514,6 +3550,21 @@ mod tests {
         );
         assert!(cfg.password.is_empty());
         assert_eq!(cfg.salt, "new-salt");
+    }
+
+    #[test]
+    fn preserves_multiple_option_keys() {
+        let mut stored = Config2::default();
+        stored.options.insert("present".into(), "local".into());
+        let mut incoming = HashMap::from([
+            ("present".into(), "replacement".into()),
+            ("absent".into(), "new".into()),
+            ("editable".into(), "changed".into()),
+        ]);
+        stored.preserve_keys(&mut incoming, &["present", "absent"]);
+        assert_eq!(incoming["present"], "local");
+        assert!(!incoming.contains_key("absent"));
+        assert_eq!(incoming["editable"], "changed");
     }
 
     #[test]
