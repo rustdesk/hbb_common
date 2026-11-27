@@ -14,6 +14,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod legacy;
+
 #[derive(Default, Deserialize, Serialize)]
 pub struct RootPin {
     unlock_pin: String,
@@ -107,13 +109,6 @@ fn read_legacy(path: &Path) -> ResultType<Config2> {
     try_load_path(path.to_path_buf())
 }
 
-fn clear_legacy(path: &Path, stored: Config2) -> ResultType<()> {
-    if !stored.unlock_pin.is_empty() {
-        store_path(path.to_path_buf(), stored.without_unlock_pin())?;
-    }
-    Ok(())
-}
-
 fn load_or_migrate(file: &Path, legacy: &Path) -> ResultType<RootPin> {
     if file.try_exists()? {
         return try_load_path(file.to_path_buf());
@@ -128,7 +123,7 @@ fn load_or_migrate(file: &Path, legacy: &Path) -> ResultType<RootPin> {
     let value = RootPin::from_pin(&pin)?;
     // An empty authority file also marks migration complete after removal or a fresh install.
     store_path(file.to_path_buf(), &value)?;
-    clear_legacy(legacy, stored)?;
+    legacy::clear(legacy, stored)?;
     Ok(value)
 }
 
@@ -139,14 +134,94 @@ pub fn discard_user_copy() -> ResultType<()> {
     );
     let mut current = CONFIG2.write().unwrap();
     let path = Config2::file();
-    clear_legacy(&path, read_legacy(&path)?)?;
+    legacy::clear(&path, read_legacy(&path)?)?;
     current.unlock_pin.clear();
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn install_daemon_config(read_settings: impl FnOnce() -> ResultType<String>) -> ResultType<()> {
+    let (file, legacy) = root_paths()?;
+    install_config(&file, &legacy, read_settings)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn install_config(
+    file: &Path,
+    legacy: &Path,
+    read_settings: impl FnOnce() -> ResultType<String>,
+) -> ResultType<()> {
+    load_or_migrate(file, legacy)?;
+    let settings = read_settings()?;
+    if settings.is_empty() {
+        return Ok(());
+    }
+    let mut settings: toml::Table =
+        toml::from_str(&settings).map_err(|_| anyhow!("Invalid user configuration"))?;
+    settings.remove("unlock_pin");
+    store_path(legacy.to_path_buf(), toml::Value::Table(settings))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_a_legacy_pin_preserves_a_newer_device_revocation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("rd-pin-cleanup-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("Config2.toml");
+        let old = Config2 {
+            unlock_pin: "old-pin".into(),
+            trusted_devices_v2: Some("device-grant".into()),
+            ..Default::default()
+        };
+        store_path(path.clone(), &old).unwrap();
+        let snapshot = read_legacy(&path).unwrap();
+        let updated = Config2 {
+            trusted_devices_v2: None,
+            options: [("unlock_pin".into(), "option-value".into())].into(),
+            ..old
+        };
+        store_path(path.clone(), &updated).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        legacy::clear(&path, snapshot).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions(), permissions);
+        assert_eq!(read_legacy(&path).unwrap(), updated.without_unlock_pin());
+        assert!(!fs::read_to_string(&path).unwrap().contains("old-pin"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_install_keeps_the_root_pin_and_imports_user_settings() {
+        let dir = std::env::temp_dir().join(format!("rd-pin-install-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let authority = dir.join("root-pin.toml");
+        let legacy = dir.join("root-config.toml");
+        let import = |settings: &str| install_config(&authority, &legacy, || Ok(settings.into()));
+        import("unlock_pin = 'user-pin'\nserial = 7\n[options]\nserver = 'custom'\n").unwrap();
+        assert!(!load_or_migrate(&authority, &legacy).unwrap().configured());
+        let imported = read_legacy(&legacy).unwrap();
+        assert!(imported.unlock_pin.is_empty());
+        assert_eq!(imported.serial, 7);
+        assert_eq!(imported.options["server"], "custom");
+
+        fs::remove_file(&authority).unwrap();
+        fs::write(&legacy, "unlock_pin = 'old-root'\n").unwrap();
+        import("serial = 8\n").unwrap();
+        assert!(load_or_migrate(&authority, &legacy)
+            .unwrap()
+            .matches("old-root")
+            .unwrap());
+        import("").unwrap();
+        assert!(import("[").is_err());
+        assert!(install_config(&authority, &legacy, || Err(anyhow!("read failed"))).is_err());
+        assert_eq!(read_legacy(&legacy).unwrap().serial, 8);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn only_the_root_profile_supplies_the_initial_pin() {
