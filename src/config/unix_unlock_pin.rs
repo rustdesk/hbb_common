@@ -15,7 +15,7 @@ use std::{
 };
 
 mod legacy;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 mod offline;
 
 #[derive(Default, Deserialize, Serialize)]
