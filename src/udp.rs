@@ -17,6 +17,22 @@ pub enum FramedSocket {
 #[cfg(test)]
 mod send_recovery_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn send_bytes_puts_exactly_those_bytes_on_the_wire() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sender = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        sender
+            .send_bytes(
+                Bytes::from_static(b"\x00RZ\x01\x01"),
+                receiver.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut bytes = [0; 16];
+        let length = crate::timeout(1000, receiver.recv(&mut bytes)).await.unwrap().unwrap();
+        assert_eq!(&bytes[..length], b"\x00RZ\x01\x01");
+    }
     use crate::rendezvous_proto::{RegisterPeerResponse, RendezvousMessage};
 
     /// Checks typed and raw UDP recovery after an incompatible destination.
@@ -158,6 +174,26 @@ impl FramedSocket {
                 }
             }
             Self::ProxySocks(f) => f.send((Bytes::from(msg), addr)).await?,
+        };
+        Ok(())
+    }
+
+    /// Sends bytes built outside protobuf, such as a sealed datagram.
+    #[inline]
+    pub async fn send_bytes(
+        &mut self,
+        bytes: Bytes,
+        addr: impl IntoTargetAddr<'static>,
+    ) -> ResultType<()> {
+        let addr = addr.into_target_addr()?.to_owned();
+
+        match self {
+            Self::Direct(f) => {
+                if let TargetAddr::Ip(addr) = addr {
+                    f.get_ref().send_to(&bytes, addr).await?;
+                }
+            }
+            Self::ProxySocks(f) => f.send((bytes, addr)).await?,
         };
         Ok(())
     }
