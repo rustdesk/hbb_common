@@ -15,6 +15,8 @@ use std::{
 };
 
 mod legacy;
+#[cfg(any(target_os = "macos", test))]
+mod offline;
 
 #[derive(Default, Deserialize, Serialize)]
 pub struct RootPin {
