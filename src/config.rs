@@ -641,10 +641,10 @@ impl Config2 {
         true
     }
 
-    /// Replaces the configuration while retaining the locally stored entry for `key`.
-    pub fn set_preserving_option(mut incoming: Self, key: &str) -> bool {
+    /// Replaces the configuration while keeping each preserved key's stored value or absence.
+    pub fn set_preserving_keys(mut incoming: Self, preserved_keys: &[&str]) -> bool {
         let mut current = CONFIG2.write().unwrap();
-        current.preserve_option(&mut incoming.options, key);
+        current.preserve_keys(&mut incoming.options, preserved_keys);
         if *current == incoming {
             return false;
         }
@@ -653,11 +653,13 @@ impl Config2 {
         true
     }
 
-    fn preserve_option(&self, options: &mut HashMap<String, String>, key: &str) {
-        if let Some(value) = self.options.get(key) {
-            options.insert(key.to_owned(), value.clone());
-        } else {
-            options.remove(key);
+    fn preserve_keys(&self, options: &mut HashMap<String, String>, preserved_keys: &[&str]) {
+        for &key in preserved_keys {
+            if let Some(value) = self.options.get(key) {
+                options.insert(key.to_owned(), value.clone());
+            } else {
+                options.remove(key);
+            }
         }
     }
 }
@@ -1398,11 +1400,14 @@ impl Config {
         config.store();
     }
 
-    /// Replaces the options while retaining the locally stored entry for `key`.
-    pub fn set_options_preserving_option(mut options: HashMap<String, String>, key: &str) {
+    /// Replaces the options while keeping each preserved key's stored value or absence.
+    pub fn set_options_preserving_keys(
+        mut options: HashMap<String, String>,
+        preserved_keys: &[&str],
+    ) {
         Self::purify_options(&mut options);
         let mut current = CONFIG2.write().unwrap();
-        current.preserve_option(&mut options, key);
+        current.preserve_keys(&mut options, preserved_keys);
         if current.options != options {
             current.options = options;
             current.store();
@@ -3530,6 +3535,21 @@ mod tests {
         );
         assert!(cfg.password.is_empty());
         assert_eq!(cfg.salt, "new-salt");
+    }
+
+    #[test]
+    fn preserves_multiple_option_keys() {
+        let mut stored = Config2::default();
+        stored.options.insert("present".into(), "local".into());
+        let mut incoming = HashMap::from([
+            ("present".into(), "replacement".into()),
+            ("absent".into(), "new".into()),
+            ("editable".into(), "changed".into()),
+        ]);
+        stored.preserve_keys(&mut incoming, &["present", "absent"]);
+        assert_eq!(incoming["present"], "local");
+        assert!(!incoming.contains_key("absent"));
+        assert_eq!(incoming["editable"], "changed");
     }
 
     #[test]
